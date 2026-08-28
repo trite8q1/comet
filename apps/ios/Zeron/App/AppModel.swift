@@ -224,6 +224,27 @@ final class AppModel {
                 tokens: nil, devBearer: devBearer(userId: userId, orgId: orgId))
     }
 
+    /// Deep link `zeron://dev?edge=<url>&user=<id>&org=<id>` — enters dev-mode
+    /// (self-hosted / local-mesh) sign-in on installs where launch args are not
+    /// available: SideStore, ad-hoc, TestFlight. `scripts/local-mesh.sh` prints
+    /// a ready-made link/QR. The WorkOS callback (`zeron://callback`) is consumed
+    /// by ASWebAuthenticationSession and never reaches here, so only the `dev`
+    /// host is handled.
+    func handleDeepLink(_ url: URL) {
+        guard url.scheme == "zeron", url.host == "dev" else { return }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> String {
+            (items.first { $0.name == name }?.value ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let user = value("user")
+        let org = value("org")
+        guard let edge = URL(string: value("edge")), edge.scheme != nil,
+              !user.isEmpty, !org.isEmpty else { return }
+        workspace?.stop()
+        signInDev(edgeURL: edge, userId: user, orgId: org)
+    }
+
     func enterDemoMode() {
         demo = DemoDataset.standard()
         phase = .ready

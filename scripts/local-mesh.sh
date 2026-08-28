@@ -64,6 +64,7 @@ if [[ -t 1 ]]; then B="$(tput bold)"; D="$(tput dim)"; G="$(tput setaf 2)"; Y="$
 say()  { printf '%s\n' "${B}▸ $*${R}"; }
 warn() { printf '%s\n' "${Y}!  $*${R}" >&2; }
 die()  { printf '%s\n' "${Y}✗  $*${R}" >&2; exit 1; }
+urlenc() { python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
 
 # ── auto-detect the address the phone should dial ──────────────────────────
 tailscale_ip() {
@@ -87,6 +88,9 @@ if [[ -z "${MESH_HOST:-}" ]]; then
   fi
 fi
 PHONE_EDGE_URL="${MESH_EDGE_SCHEME}://${MESH_HOST}:${MESH_ADVERTISED_PORT}"
+# One-tap dev sign-in for the app (handled by AppModel.handleDeepLink). Scan the
+# QR with the Camera app, or open the link on the device — no typing, no cable.
+DEEPLINK="zeron://dev?edge=$(urlenc "$PHONE_EDGE_URL")&user=$(urlenc "$MESH_USER")&org=$(urlenc "$MESH_ORG")"
 
 # ── preflight ──────────────────────────────────────────────────────────────
 command -v npx >/dev/null 2>&1 || die "npx/node not found — needed to run the edge (\`wrangler dev\`)."
@@ -172,11 +176,13 @@ ${G}${B}  Local mesh is up.${R}
       User id  : ${B}${MESH_USER}${R}
       Org id   : ${B}${MESH_ORG}${R}
 
-  ${D}The dev sign-in is reached via launch args (there is no dev button in the UI).${R}
-  ${D}• Real device: in Xcode → Product → Scheme → Edit Scheme → Run → Arguments,${R}
-  ${D}  add:  -setmode dev  -setedge ${PHONE_EDGE_URL}  -setuser ${MESH_USER}  -setorg ${MESH_ORG}${R}
-  ${D}  Run once with those; the app persists them and reconnects on every launch.${R}
-  ${D}• Simulator: scripts/build-ios.sh sim  (auto-launches against http://127.0.0.1:${MESH_PORT}).${R}
+  ${B}Easiest (any install — SideStore / ad-hoc / TestFlight):${R}
+  ${D}• Scan the QR below with the Camera app, or open this link on the device:${R}
+      ${B}${DEEPLINK}${R}
+  ${D}• Or in the app tap "Use a self-hosted server" and enter the three values.${R}
+  ${D}• Or, when launching from Xcode/Simulator, pass the launch args instead:${R}
+  ${D}    -setmode dev  -setedge ${PHONE_EDGE_URL}  -setuser ${MESH_USER}  -setorg ${MESH_ORG}${R}
+  ${D}  (scripts/build-ios.sh sim wires these up automatically against loopback.)${R}
 
   ${B}Attach the desktop UI to this same engine${R} (optional):
       ZERON_IPC_PORT=${MESH_IPC_PORT} ${ZERON}
@@ -190,6 +196,13 @@ ${G}${B}  Local mesh is up.${R}
 
   Press ${B}Ctrl-C${R} to stop the mesh.
 EOF
+
+if command -v qrencode >/dev/null 2>&1; then
+  qrencode -t ANSIUTF8 "$DEEPLINK" | sed 's/^/    /'
+  echo
+else
+  printf '  %s\n\n' "${D}(install qrencode for a scannable QR of the link above: brew install qrencode)${R}"
+fi
 
 # Keep the mesh alive; surface a crash of a process we own instead of hanging.
 # (A reused external edge has no EDGE_PID — only the engine is monitored then.)

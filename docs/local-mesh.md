@@ -97,7 +97,7 @@ loopback automatically):
 scripts/build-ios.sh sim
 ```
 
-**Real iPhone** — needs your own Apple Team (the bundled `sh.zeron.ios` /
+**Real iPhone/iPad** — needs your own Apple Team (the bundled `sh.zeron.ios` /
 team belongs to the upstream project, so pick a unique bundle id):
 
 ```sh
@@ -105,16 +105,20 @@ DEVELOPMENT_TEAM=YOURTEAMID BUNDLE_ID=com.you.zeron scripts/build-ios.sh device
 xcrun devicectl device install app --device <name> target/ios-build/export/Zeron.ipa
 ```
 
-The app has **no dev-mode button** — dev sign-in is driven by launch arguments,
-which the app then persists (`AppModel.restore`). Set them once in Xcode
-(*Product → Scheme → Edit Scheme → Run → Arguments*):
+For a **cable-free** install without TestFlight (SideStore, ad-hoc OTA), see
+[`sidestore-install.md`](sidestore-install.md).
 
-```
--setmode dev  -setedge http://<mac-tailscale-ip>:27640  -setuser <user>  -setorg <org>
-```
+**Point the app at your mesh** — three ways, no launch args required:
 
-Run once from Xcode with those; afterwards a normal tap on the icon reconnects
-on its own. `local-mesh.sh` prints the precise values for your machine.
+- **Scan the QR / open the link** that `local-mesh.sh` prints
+  (`zeron://dev?edge=…&user=…&org=…`) — handled by `AppModel.handleDeepLink`.
+- Tap **“Use a self-hosted server”** on the sign-in screen and enter Edge URL,
+  User id, Org id by hand.
+- When launching from **Xcode/Simulator**, pass the launch args instead
+  (*Product → Scheme → Edit Scheme → Run → Arguments*), which the app persists:
+  `-setmode dev  -setedge http://<mac-tailscale-ip>:27640  -setuser <user>  -setorg <org>`.
+
+`local-mesh.sh` prints the precise values (and the QR) for your machine.
 
 ## Tailscale HTTPS (if plain http is refused)
 

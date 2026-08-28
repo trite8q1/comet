@@ -33,6 +33,7 @@ struct SignInView: View {
     @State private var busy = false
     @State private var error: String?
     @State private var authSession = AuthSessionCoordinator()
+    @State private var showDevSignIn = false
 
     var body: some View {
         ZStack {
@@ -83,6 +84,12 @@ struct SignInView: View {
                             .foregroundStyle(Theme.danger)
                             .multilineTextAlignment(.center)
                     }
+
+                    Button("Use a self-hosted server") { showDevSignIn = true }
+                        .font(Theme.sans(13))
+                        .foregroundStyle(Theme.textMuted)
+                        .buttonStyle(.plain)
+                        .padding(.top, 4)
                 }
 
                 Spacer()
@@ -90,6 +97,7 @@ struct SignInView: View {
             .padding(.horizontal, 32)
             .frame(maxWidth: 480)
         }
+        .sheet(isPresented: $showDevSignIn) { DevSignInView() }
     }
 
     /// The AuthKit code flow: system browser session → zeron://callback with
@@ -126,6 +134,106 @@ struct SignInView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Self-hosted / dev sign-in
+
+/// Point the app at a local-mesh edge running in dev mode (edge AUTH_MODE=dev,
+/// bearer == "user@org"). This is the in-app equivalent of the `-setmode dev`
+/// launch args, so it works on any install — SideStore, ad-hoc, TestFlight —
+/// where launch arguments aren't available. `scripts/local-mesh.sh` prints the
+/// exact values (and a `zeron://dev?…` link/QR that fills this in for you).
+struct DevSignInView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var edge: String
+    @State private var user: String
+    @State private var org: String
+
+    init() {
+        // Prefill from the last dev connection (never from a prod WorkOS one).
+        let d = UserDefaults.standard
+        let isDev = d.string(forKey: "authMode") == AppConfig.Mode.dev.rawValue
+        _edge = State(initialValue: isDev ? (d.string(forKey: "edgeURL") ?? "") : "")
+        _user = State(initialValue: isDev ? (d.string(forKey: "userId") ?? "") : "")
+        _org = State(initialValue: isDev ? (d.string(forKey: "orgId") ?? "") : "")
+    }
+
+    private var isValid: Bool {
+        guard let u = URL(string: edge.trimmingCharacters(in: .whitespaces)),
+              u.scheme != nil else { return false }
+        return !user.trimmingCharacters(in: .whitespaces).isEmpty
+            && !org.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        ZStack {
+            Theme.bg.ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Self-hosted server")
+                        .font(Theme.sans(18, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                    Text("Connect to a local mesh edge in dev mode (bearer = user@org).")
+                        .font(Theme.sans(13))
+                        .foregroundStyle(Theme.textMuted)
+                }
+
+                field("Edge URL", text: $edge, placeholder: "http://100.x.y.z:27640", url: true)
+                field("User id", text: $user, placeholder: "you")
+                field("Org id", text: $org, placeholder: "personal")
+
+                Button { connect() } label: {
+                    Text("Connect")
+                        .font(Theme.sans(15, weight: .semibold))
+                        .foregroundStyle(Theme.bg)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 50)
+                        .background(Theme.text, in: RoundedRectangle(cornerRadius: 16))
+                }
+                .buttonStyle(.plain)
+                .disabled(!isValid)
+                .opacity(isValid ? 1 : 0.5)
+
+                Button("Cancel") { dismiss() }
+                    .font(Theme.sans(13))
+                    .foregroundStyle(Theme.textMuted)
+                    .frame(maxWidth: .infinity)
+
+                Spacer()
+            }
+            .padding(24)
+            .frame(maxWidth: 480)
+        }
+    }
+
+    @ViewBuilder
+    private func field(_ label: String, text: Binding<String>,
+                       placeholder: String, url: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
+                .font(Theme.sans(12, weight: .medium))
+                .foregroundStyle(Theme.textMuted)
+            TextField(placeholder, text: text)
+                .font(Theme.sans(15))
+                .foregroundStyle(Theme.text)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(url ? .URL : .default)
+                .padding(.horizontal, 14)
+                .frame(height: 46)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    private func connect() {
+        let e = edge.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: e) else { return }
+        model.signInDev(edgeURL: url,
+                        userId: user.trimmingCharacters(in: .whitespacesAndNewlines),
+                        orgId: org.trimmingCharacters(in: .whitespacesAndNewlines))
+        dismiss()
     }
 }
 
