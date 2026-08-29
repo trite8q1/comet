@@ -8,5 +8,9 @@
 .env.local
 node_modules
 .wrangler
+.dev.vars
 build/
 edge/dist/
+xcuserdata/
+apps/ios/Config.xcconfig
+apps/ios/Local.xcconfig
