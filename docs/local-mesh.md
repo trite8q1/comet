@@ -1,19 +1,20 @@
 # Running the whole stack locally (Mac + iPhone over Tailscale)
 
 Run every part of Zeron on one Mac and continue your sessions from the iOS app
-over your private network. No Cloudflare account, no WorkOS — the edge runs
+over HTTPS on your tailnet. No Cloudflare account, no WorkOS. The edge runs
 locally in **dev auth** (bearer == `user@org`), exactly like `scripts/e2e-smoke.sh`.
 
 ```
- iPhone (Zeron.app, dev mode)                          MacBook
-        │                                    ┌───────────────────────────────┐
-        │  Tailscale (100.x)                 │  wrangler dev  ── Durable      │
-        └──────────────►  edge :27640  ◄─────┤     (edge/)       Objects     │
-                              ▲              │        ▲                       │
-                         loopback            │        │ loopback              │
-                              └──────────────┤  zeron headless  ── claude CLI │
-                                             │   (host device, runs agents)   │
-                                             └───────────────────────────────┘
+ iPhone (Zeron.app, dev mode)                           MacBook
+        │                                    ┌────────────────────────────────┐
+        │  HTTPS / WSS                       │  tailscale serve :443          │
+        └──────────────►  *.ts.net  ────────►│       │                        │
+                                             │       ▼ loopback               │
+                                             │  wrangler dev :27640 ── DOs    │
+                                             │       ▲                        │
+                                             │       │ loopback               │
+                                             │  zeron headless ── claude CLI  │
+                                             └────────────────────────────────┘
 ```
 
 The phone is a **viewport**: it queues commands into the session docs; the Mac
@@ -24,8 +25,9 @@ host device drains them and runs the agent. No engine runs on the phone.
 - **Rust** (`cargo`) — builds the engine/desktop binary.
 - **Node** — runs the edge: `cd edge && npm ci`.
 - **Xcode 26+** (iOS 26 SDK) — builds the iOS app.
-- **Tailscale** on both the Mac and the iPhone, same tailnet (LAN also works if
-  both are on the same Wi‑Fi).
+- **Tailscale** on both the Mac and the iPhone, on the same tailnet. Enable
+  **MagicDNS**, **HTTPS Certificates**, and Tailscale Serve for the Mac. If Serve
+  still needs approval, the script prints the tailnet authorization URL.
 - **`claude` CLI** signed in on the Mac (for the default `claude-code` harness).
 
 ## 1. Bring up the mesh
@@ -34,17 +36,19 @@ host device drains them and runs the agent. No engine runs on the phone.
 scripts/local-mesh.sh
 ```
 
-First run builds the release engine (a few minutes) and starts the edge + a
-headless host device. It prints the exact **Edge URL / User id / Org id** to
-enter on the phone. Leave it running; `Ctrl-C` tears it down. Durable Object
-state persists under `edge/.wrangler/state`, so your sessions survive restarts.
+First run builds the release engine (a few minutes), starts the loopback-only
+edge and a headless host device, then exposes the edge at the Mac's trusted
+`https://<host>.<tailnet>.ts.net` URL with `tailscale serve`. It prints the exact
+**Edge URL / User id / Org id** to enter on the phone. Leave it running;
+`Ctrl-C` tears down the processes and the Serve handler. Durable Object state
+persists under `edge/.wrangler/state`, so your sessions survive restarts.
 
 Useful overrides:
 
 ```sh
 MESH_USER=nico MESH_ORG=personal MESH_HARNESS=claude-code scripts/local-mesh.sh
 SKIP_BUILD=1 scripts/local-mesh.sh          # reuse target/release/zeron
-MESH_HOST=100.101.102.103 scripts/local-mesh.sh   # pin the advertised address
+TAILSCALE_BIN=/path/to/tailscale scripts/local-mesh.sh
 ```
 
 It uses a dedicated data dir (`~/.zeron-mesh`) so it never touches your normal
@@ -105,6 +109,11 @@ IPA and serve it over your tailnet. Needs your own Apple Team (the bundled
 DEVELOPMENT_TEAM=YOURTEAMID BUNDLE_ID=de.you.zeron scripts/ota-serve.sh
 ```
 
+The installer and runtime both use Tailscale HTTPS port 443. Stop
+`local-mesh.sh` before running the installer, stop the installer after the app
+is installed, then restart `local-mesh.sh`. Mesh state persists across the
+restart.
+
 See [`ota-install.md`](ota-install.md) for prerequisites (tailnet HTTPS, UDID
 registration) and the full walkthrough.
 
@@ -116,32 +125,23 @@ registration) and the full walkthrough.
   User id, Org id by hand.
 - When launching from **Xcode/Simulator**, pass the launch args instead
   (*Product → Scheme → Edit Scheme → Run → Arguments*), which the app persists:
-  `-setmode dev  -setedge http://<mac-tailscale-ip>:27640  -setuser <user>  -setorg <org>`.
+  `-setmode dev  -setedge https://<host>.<tailnet>.ts.net  -setuser <user>  -setorg <org>`.
 
-`local-mesh.sh` prints the precise values (and the QR) for your machine.
+`local-mesh.sh` prints the precise values (and the QR) for your machine. The app
+uses `wss://` for live room traffic and its HTTPS pull fallback when a network
+strips WebSocket upgrades.
 
-## Tailscale HTTPS (if plain http is refused)
+## Network path
 
-iOS App Transport Security allows the app's cleartext `http://` to private
-addresses (`NSAllowsLocalNetworking`), which covers LAN ranges. If your device
-refuses the Tailscale (`100.64/10`) address over http, terminate TLS with a
-Tailscale proxy and dial `https://` instead:
+The phone never dials Wrangler or a `100.x` address directly. `local-mesh.sh`
+binds Wrangler to `127.0.0.1:27640`, detects the Mac's MagicDNS name, and runs:
 
 ```sh
-# on the Mac (MagicDNS + HTTPS must be enabled for the tailnet)
 tailscale serve --bg --https=443 http://127.0.0.1:27640
 ```
 
-Then point the app at your MagicDNS name and re-run the mesh advertising https:
-
-```sh
-MESH_HOST=<your-host>.<tailnet>.ts.net MESH_EDGE_SCHEME=https MESH_ADVERTISED_PORT=443 \
-  scripts/local-mesh.sh
-```
-
-The app already prefers `wss://` for a `https` edge and has a plain‑HTTPS pull
-fallback for networks that strip WebSocket upgrades, so this path is the most
-robust.
+The script refuses to replace an existing Serve handler on HTTPS port 443 and
+removes only the handler it started when it exits.
 
 ## Troubleshooting
 
@@ -150,8 +150,11 @@ robust.
   (`-setuser` / `-setorg`). Check `edge.log` / `engine.log` (paths printed on
   startup), or run the desktop app with `ZERON_IPC_PORT=27654 … zeron sync` for
   per-room connection state.
-- **`wrangler dev` not reachable from the phone** — it must bind a routable
-  interface; the script passes `--ip 0.0.0.0`. Confirm the Mac's firewall
-  allows the port, and that you used the Tailscale IP, not `127.0.0.1`.
+- **HTTPS edge not reachable from the phone** — confirm both devices are on the
+  same tailnet, MagicDNS and HTTPS certificates are enabled, and the printed
+  `*.ts.net` URL opens in Safari. `tailscale serve status` should show the
+  loopback proxy on port 443.
+- **HTTPS port 443 is already in use** — stop `ota-serve.sh` or the other Serve
+  handler before starting the mesh. The script will not replace it.
 - **Host never runs a turn** — the `claude` CLI must be installed and signed in
   on the Mac; `MESH_HARNESS=mock` is a no-CLI smoke alternative.

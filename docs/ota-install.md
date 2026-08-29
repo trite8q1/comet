@@ -50,15 +50,17 @@ All served by a tiny local static server (correct MIME types for `.plist` and
 
 ## Connecting the installed app to your mesh
 
-OTA only installs the app. To point it at your local engine, bring the mesh up
-and use the in-app dev sign-in (see [`local-mesh.md`](local-mesh.md)):
+OTA only installs the app. After installation, stop `ota-serve.sh` so it
+releases Tailscale HTTPS port 443, then bring the mesh up and use the in-app dev
+sign-in (see [`local-mesh.md`](local-mesh.md)):
 
 ```sh
-scripts/local-mesh.sh     # prints a zeron://dev?… link + QR
+scripts/local-mesh.sh     # serves the runtime over HTTPS and prints a dev QR
 ```
 
 Scan that QR (or tap **“Use a self-hosted server”** in the app) and you're on
-your Mac's sessions.
+your Mac's sessions. Both installation and runtime use `tailscale serve`, one at
+a time on port 443.
 
 ## Troubleshooting
 
