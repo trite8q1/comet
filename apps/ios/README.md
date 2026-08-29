@@ -12,6 +12,7 @@ Requires Xcode 26+ (iOS 26 SDK — Liquid Glass APIs).
 
 ```sh
 cd apps/ios
+cp Config.xcconfig.example Config.xcconfig   # set DEVELOPMENT_TEAM
 xcodebuild -project Zeron.xcodeproj -scheme Zeron \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 ```
