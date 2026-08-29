@@ -1882,15 +1882,18 @@ impl Pickers {
                                 this.pick_device(pick_id.clone(), cx);
                             }))
                             .child(div().flex_1().min_w_0().truncate().child(label))
-                            // The local device wears a muted right-aligned "You"
-                            // instead of a "(this device)" suffix in the name.
-                            .when(is_local, |el| {
+                            // The local device wears a muted right-aligned
+                            // "Local" tag instead of a "(this device)" suffix in
+                            // the name, matching the composer device chip. Skip
+                            // it when the name is already "Local" (local-only
+                            // sentinel) to avoid a redundant "Local Local".
+                            .when(is_local && device.name != "Local", |el| {
                                 el.child(
                                     div()
                                         .flex_none()
                                         .text_size(crate::typography::ui_rems(10.0))
                                         .text_color(theme.text_muted.opacity(0.45))
-                                        .child(SharedString::from("You")),
+                                        .child(SharedString::from("Local")),
                                 )
                             })
                             // Disconnected glyph, not the word (user request).
@@ -2222,6 +2225,7 @@ impl Pickers {
         id: &'static str,
         icon_path: &'static str,
         label: SharedString,
+        tag: Option<SharedString>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -2263,6 +2267,15 @@ impl Pickers {
                     .text_color(theme.text_muted.opacity(0.7)),
             )
             .child(div().min_w_0().truncate().child(label))
+            .when_some(tag, |el, tag| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(tag),
+                )
+            })
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(12.0))
@@ -2315,7 +2328,7 @@ impl Pickers {
             }
             _ => None,
         };
-        let (device_label, project_label, offline) = {
+        let (device_label, project_label, offline, device_is_local) = {
             let state = self.state.read(cx);
             let device_id = state.effective_device_id();
             let device_label: SharedString = device_id
@@ -2327,19 +2340,28 @@ impl Pickers {
             let offline = device_id
                 .as_deref()
                 .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
+            let device_is_local =
+                device_id.is_some() && device_id.as_deref() == state.local_device_id.as_deref();
             let project_label: SharedString = state
                 .selected_space_row()
                 .map(|s| s.display_name().to_string())
                 .unwrap_or_else(|| "No project".to_string())
                 .into();
-            (device_label, project_label, offline)
+            (device_label, project_label, offline, device_is_local)
         };
+        // The current machine keeps its real name and gains a muted "Local" tag,
+        // so a run's target reads as local vs. remote at a glance. Skip it when
+        // the name is already "Local" (the local-only sentinel) to avoid a
+        // redundant "Local Local".
+        let device_tag = (device_is_local && device_label.as_ref() != "Local")
+            .then(|| SharedString::from("Local"));
         let device_chip = self
             .footer_chip(
                 PickerKind::Device,
                 "picker-device",
                 crate::icons::MONITOR,
                 device_label,
+                device_tag,
                 &theme,
                 cx,
             )
@@ -2349,6 +2371,7 @@ impl Pickers {
             "picker-project",
             crate::icons::FOLDER,
             project_label,
+            None,
             &theme,
             cx,
         );
@@ -2500,6 +2523,7 @@ impl Pickers {
             "picker-branch",
             crate::icons::GIT_BRANCH,
             ref_label,
+            None,
             &theme,
             cx,
         );
@@ -2512,6 +2536,7 @@ impl Pickers {
             "picker-checkout",
             kind_icon,
             SharedString::from(self.checkout_label()),
+            None,
             &theme,
             cx,
         );

@@ -959,7 +959,23 @@ struct OrgGateUi {
     submitting: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
+    /// The gate auto-provisions once per mount (create default / enter a lone
+    /// membership). Set the first time it fires so a reload can't repeat it.
+    auto_started: bool,
     _events: Subscription,
+}
+
+/// Name for the auto-provisioned workspace. A workspace is an invisible
+/// container — its name is shown nowhere in the UI — so a fresh account gets
+/// this without being asked to name one.
+const DEFAULT_WORKSPACE_NAME: &str = "workspace";
+
+/// What the gate does once memberships load, without asking the user.
+enum AutoProvision {
+    /// No workspace yet — create the default and scope into it.
+    Create,
+    /// Exactly one — enter it outright.
+    Select(String),
 }
 
 /// One right-pane subagent tab: the doc it shows, its strip title, and the
@@ -3101,6 +3117,7 @@ impl Shell {
             submitting: false,
             error: None,
             task: None,
+            auto_started: false,
             _events: events,
         });
         self.load_orgs(cx);
@@ -3118,11 +3135,39 @@ impl Shell {
                 .call(methods::LIST_ORGS, serde_json::json!({}))
                 .await;
             this.update(cx, |shell, cx| {
+                // Provision without bothering the user: a fresh account (no
+                // workspaces) gets the default created; a single membership is
+                // entered outright. Only an ambiguous account (2+ workspaces) or
+                // an error falls through to the gate's picker/form. Fires at most
+                // once per gate mount (`auto_started`).
+                let mut auto = None;
                 if let Some(org) = shell.org.as_mut() {
-                    org.orgs = match result {
-                        Ok(value) => Loadable::Ready(sort_memberships(parse_orgs(&value))),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    };
+                    match result {
+                        Ok(value) => {
+                            let rows = sort_memberships(parse_orgs(&value));
+                            if !org.auto_started {
+                                auto = match rows.len() {
+                                    0 => Some(AutoProvision::Create),
+                                    1 => Some(AutoProvision::Select(
+                                        rows[0].organization_id.clone(),
+                                    )),
+                                    _ => None,
+                                };
+                                if auto.is_some() {
+                                    org.auto_started = true;
+                                }
+                            }
+                            org.orgs = Loadable::Ready(rows);
+                        }
+                        Err(err) => org.orgs = Loadable::Error(err.to_string()),
+                    }
+                }
+                match auto {
+                    Some(AutoProvision::Create) => {
+                        shell.submit_create_org(DEFAULT_WORKSPACE_NAME.to_string(), cx)
+                    }
+                    Some(AutoProvision::Select(id)) => shell.select_org(id, cx),
+                    None => {}
                 }
                 cx.notify();
             })
@@ -3132,17 +3177,28 @@ impl Shell {
     }
 
     fn create_org(&mut self, cx: &mut Context<Self>) {
+        let name = match self.org.as_ref() {
+            Some(org) => org.name_input.read(cx).text().trim().to_string(),
+            None => return,
+        };
+        if !org_name_valid(&name) {
+            if let Some(org) = self.org.as_mut() {
+                org.error = Some("Enter a workspace name".into());
+            }
+            cx.notify();
+            return;
+        }
+        self.submit_create_org(name, cx);
+    }
+
+    /// Create a workspace with an explicit name and scope into it. Shared by the
+    /// manual naming form and the auto-provision path (default name).
+    fn submit_create_org(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         let Some(org) = self.org.as_mut() else { return };
         if org.submitting {
-            return;
-        }
-        let name = org.name_input.read(cx).text().trim().to_string();
-        if !org_name_valid(&name) {
-            org.error = Some("Enter a workspace name".into());
-            cx.notify();
             return;
         }
         org.submitting = true;
@@ -5517,6 +5573,7 @@ impl Shell {
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
         let no_project = self.state.read(cx).no_project;
+        let local_only = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
 
         // Content outlet: selected chat → transcript; nothing selected → a
         // bare canvas (the composer stack carries the affordances); no spaces
@@ -5568,6 +5625,56 @@ impl Shell {
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
                                 .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
+                        ),
+                ))
+                .into_any_element()
+        } else if local_only {
+            // Signed out: the new-chat canvas explains sync instead of sitting
+            // bare, so the point of signing in is clear before the first
+            // prompt. Signed in, the canvas stays bare (the else branch below).
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(motion::fade_in(
+                    "sync-nudge-canvas",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .max_w(px(340.0))
+                        .child(
+                            icon(icons::ZERON_LOGO)
+                                .w(px(41.9))
+                                .h(px(48.0))
+                                .text_color(theme.text.opacity(0.09)),
+                        )
+                        .child(
+                            div()
+                                .mt(px(24.0))
+                                .text_size(crate::typography::ui_rems(16.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from("You're working locally")),
+                        )
+                        .child(
+                            div()
+                                .mt(px(6.0))
+                                .text_center()
+                                .text_size(crate::typography::ui_rems(13.0))
+                                .line_height(px(19.0))
+                                .text_color(theme.text_muted.opacity(0.7))
+                                .child(SharedString::from(
+                                    "Sign in to sync your devices, projects, and chats across everything you use.",
+                                )),
+                        )
+                        .child(
+                            popover::btn_primary(&theme_owned, "Enable sync")
+                                .id("sync-nudge-enable")
+                                .mt(px(20.0))
+                                .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx))),
                         ),
                 ))
                 .into_any_element()
@@ -6773,6 +6880,89 @@ impl Shell {
         let name_input = org.name_input.clone();
         let orgs = org.orgs.clone();
 
+        // Auto-provision in flight (or about to fire): show a quiet "setting up"
+        // state instead of the naming form. The form/picker is the fallback —
+        // reached only for an ambiguous account (2+ workspaces) or after an error.
+        let provisioning = error.is_none()
+            && match &orgs {
+                Loadable::Idle | Loadable::Loading => true,
+                Loadable::Ready(rows) => rows.len() <= 1,
+                Loadable::Error(_) => false,
+            };
+        if provisioning {
+            let card = div()
+                .w(px(400.0))
+                .px(px(32.0))
+                .py(px(36.0))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface_card)
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .items_start()
+                .child(
+                    icon(icons::ZERON_LOGO)
+                        .w(px(24.4))
+                        .h(px(28.0))
+                        .text_color(theme.text),
+                )
+                .child(
+                    div()
+                        .mt(px(22.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(crate::loaders::mini_mono_spinner(
+                            "org-provisioning",
+                            5.0,
+                            theme.text_muted,
+                            cx.entity_id(),
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(14.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from("Setting up your workspace…")),
+                        ),
+                )
+                .child(
+                    div().mt(px(24.0)).flex().flex_row().child(
+                        div()
+                            .id("org-provisioning-cancel")
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.text))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_auth_setup(cx)))
+                            .child(SharedString::from(if local_setup {
+                                "Cancel sync setup"
+                            } else {
+                                "Use a different account"
+                            })),
+                    ),
+                );
+            return div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(theme.bg)
+                .child(grid_backdrop(&theme))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(motion::fade_in("org-provisioning-card", card)),
+                )
+                .into_any_element();
+        }
+
         let email: Option<SharedString> = self
             .state
             .read(cx)
@@ -6853,16 +7043,75 @@ impl Shell {
         // zeron App.tsx OrgGate: w-400 card on the grid — logo, headline,
         // explainer (+ signed-in email), name form with a white Create button,
         // then existing memberships and the account escape hatch.
-        let blurb: SharedString = match email {
-            Some(email) => format!(
-                "Zeron is organized around workspaces — create one for yourself or your team. Signed in as {email}."
-            )
-            .into(),
-            None => {
-                "Zeron is organized around workspaces — create one for yourself or your team."
-                    .into()
-            }
+        // A workspace is a small enumeration: one account holds your devices,
+        // projects and chats, kept in sync everywhere you sign in. Show that as
+        // a lead line plus a compact list built from the app's own concept icons
+        // (Monitor/Folder/Chat), so the meaning reads at a glance instead of as a
+        // paragraph.
+        let feature_row = |icon_path: &'static str, label: &'static str| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(24.0))
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(crate::theme::ink(0.03))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            icon(icon_path)
+                                .size(px(13.0))
+                                .text_color(theme.text_muted),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(label)),
+                )
         };
+        let explainer = div()
+            .mt(px(6.0))
+            .mb(px(24.0))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .line_height(px(19.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        "One account, one workspace, synced across every device you sign in on.",
+                    )),
+            )
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(feature_row(icons::MONITOR, "Your devices"))
+                    .child(feature_row(icons::FOLDER, "Your projects"))
+                    .child(feature_row(icons::CHAT_ROUND_LINE, "Your chats")),
+            )
+            .when_some(email, |el, email| {
+                el.child(
+                    div()
+                        .mt(px(16.0))
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(theme.text_muted.opacity(0.7))
+                        .child(SharedString::from(format!("Signed in as {email}"))),
+                )
+            })
+            .into_any_element();
         let card = div()
             .w(px(400.0))
             .px(px(32.0))
@@ -6888,15 +7137,7 @@ impl Shell {
                     .text_color(theme.text)
                     .child(SharedString::from("Create your workspace")),
             )
-            .child(
-                div()
-                    .mt(px(6.0))
-                    .mb(px(24.0))
-                    .text_size(crate::typography::ui_rems(13.0))
-                    .line_height(px(19.0))
-                    .text_color(theme.text_muted)
-                    .child(blurb),
-            )
+            .child(explainer)
             .child(
                 div()
                     .flex()
