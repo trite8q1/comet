@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Render the Zeron app-icon rasters from the mark vector (dist/zeron.svg).
+"""Render the Comet app-icon rasters from the mark vector (dist/comet.svg).
 
-dist/zeron.svg is the single source of truth: a black rounded-rect "squircle"
-plus the 34 white cells of the Zeron pixel mark, positioned by a translate +
+dist/comet.svg is the single source of truth: a black rounded-rect "squircle"
+plus the 34 white cells of the Comet pixel mark, positioned by a translate +
 scale transform. This script parses that geometry (it never hardcodes the
 cells) and paints it with Pillow — the mark is only rounded rectangles, so no
 SVG rasterizer is needed.
 
 Outputs (all committed so CI never needs Pillow — rerun only when the mark in
-dist/zeron.svg changes):
+dist/comet.svg changes):
   dist/macos/icon-1024.png    macOS .icns source: RGBA, squircle + margins,
                               subtle baked drop shadow (sips + iconutil turn
-                              this into zeron.icns in scripts/package-macos.sh)
-  dist/zeron.png              Linux icon: RGBA, same squircle, no shadow
-  apps/ios/Zeron/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png
+                              this into comet.icns in scripts/package-macos.sh)
+  dist/comet.png              Linux icon: RGBA, same squircle, no shadow
+  apps/ios/Comet/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png
                               iOS app icon: RGB, full-bleed, NO alpha and NO
                               rounded corners (iOS masks/rounds it itself)
 
@@ -29,7 +29,7 @@ import sys
 from PIL import Image, ImageDraw, ImageFilter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SVG = os.path.join(ROOT, "dist/zeron.svg")
+SVG = os.path.join(ROOT, "dist/comet.svg")
 
 SS = 4  # supersample: ImageDraw has no anti-aliasing, so render at 4x then
 SIZE = 1024  # Lanczos-downscale to this edge. Radii scale with SS too.
@@ -56,7 +56,7 @@ def _attrs(rect):
 
 
 def parse_mark():
-    """Parse dist/zeron.svg into (squircle, cells, transform, bbox).
+    """Parse dist/comet.svg into (squircle, cells, transform, bbox).
 
     squircle = (x, y, w, h, rx); cells = [(x, y, w, h, rx), ...] in the glyph's
     local coordinates; transform = (tx, ty, scale) placing the glyph on the
@@ -94,9 +94,9 @@ def parse_mark():
         max(y + h for x, y, w, h, rx in cells),
     )
 
-    # Drift alarms: if the mark in dist/zeron.svg is ever edited, these fire so
+    # Drift alarms: if the mark in dist/comet.svg is ever edited, these fire so
     # the renderer is never silently wrong.
-    assert squircle is not None, "no black squircle rect in dist/zeron.svg"
+    assert squircle is not None, "no black squircle rect in dist/comet.svg"
     assert len(cells) == 34, f"expected 34 glyph cells, found {len(cells)}"
     assert bbox == (0.0, 0.0, 820.0, 940.0), f"unexpected glyph bbox {bbox}"
     assert abs(squircle[4] / squircle[2] - 0.225) < 1e-3, "bad squircle rx ratio"
@@ -117,7 +117,7 @@ def _glyph(draw, cells, tx, ty, scale):
 
 
 def render_squircle(squircle, cells, transform, shadow):
-    """dist/zeron.svg reproduced faithfully on a transparent canvas (macOS /
+    """dist/comet.svg reproduced faithfully on a transparent canvas (macOS /
     Linux). With `shadow`, a subtle drop shadow is baked into the margin."""
     tx, ty, scale = transform
     sx, sy, sw, sh, srx = squircle
@@ -162,9 +162,9 @@ def main():
     _save(render_squircle(squircle, cells, transform, shadow),
           "dist/macos/icon-1024.png")
     _save(render_squircle(squircle, cells, transform, False),
-          "dist/zeron.png")
+          "dist/comet.png")
     _save(render_fullbleed(cells, bbox, IOS_SCALE).convert("RGB"),
-          "apps/ios/Zeron/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png")
+          "apps/ios/Comet/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png")
 
 
 if __name__ == "__main__":

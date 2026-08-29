@@ -949,8 +949,8 @@ mod tests {
         let theme = Theme::for_selection(
             Appearance::Dark,
             "dracula",
-            zeron_theme::AccentSelection::ThemeDefault,
-            zeron_theme::SurfacePreference::ThemeDefault,
+            comet_theme::AccentSelection::ThemeDefault,
+            comet_theme::SurfacePreference::ThemeDefault,
         );
         assert_eq!(terminal_panel_bg(&theme), theme.terminal.background);
         assert_eq!(
@@ -970,20 +970,20 @@ mod tests {
 
     #[test]
     fn every_registered_variant_resolves_all_ansi_slots_from_its_theme() {
-        for variant in zeron_theme::ThemeRegistry::builtin()
+        for variant in comet_theme::ThemeRegistry::builtin()
             .families
             .iter()
             .flat_map(|family| &family.variants)
         {
             let appearance = match variant.appearance {
-                zeron_theme::Appearance::Dark => Appearance::Dark,
-                zeron_theme::Appearance::Light => Appearance::Light,
+                comet_theme::Appearance::Dark => Appearance::Dark,
+                comet_theme::Appearance::Light => Appearance::Light,
             };
             let theme = Theme::for_selection(
                 appearance,
                 &variant.id,
-                zeron_theme::AccentSelection::ThemeDefault,
-                zeron_theme::SurfacePreference::ThemeDefault,
+                comet_theme::AccentSelection::ThemeDefault,
+                comet_theme::SurfacePreference::ThemeDefault,
             );
             for index in 0..16 {
                 assert_eq!(

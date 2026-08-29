@@ -42,7 +42,7 @@ Make adding a custom theme feel like a short settings task rather than a command
 
 - Update `crates/ui/src/settings/appearance.rs` to simplify the import dialog layout, make import errors visible in the body/footer, collapse technical mapping by default, and restyle installed-theme actions.
 - Add or adjust focused unit coverage for any extracted presentation helpers where practical.
-- Run `cargo fmt --check`, the relevant `zeron-ui` tests/checks, and a local app build.
+- Run `cargo fmt --check`, the relevant `comet-ui` tests/checks, and a local app build.
 - Verify the settings page and both import states in the local app browser/UI at the desktop viewport shown in the supplied screenshots.
 
 ### Verification tier
@@ -52,7 +52,7 @@ Tier 2: compile and test the affected Rust UI crate, then visually inspect the s
 ### Verification result
 
 - `cargo fmt --check` passes.
-- `cargo check -p zeron-ui` passes with existing workspace warnings.
-- `cargo test -p zeron-ui --lib settings::appearance` passes (4 tests).
+- `cargo check -p comet-ui` passes with existing workspace warnings.
+- `cargo test -p comet-ui --lib settings::appearance` passes (4 tests).
 - A packaged debug build was opened on macOS and the Appearance page, installed-theme row, and empty import state were visually inspected at 1365 × 768.
 - The final visual pass found and removed a remaining overflowing helper sentence; long error paths are now explicitly truncated within the dialog.

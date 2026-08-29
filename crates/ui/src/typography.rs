@@ -380,8 +380,8 @@ pub fn set_family(family: UiFontFamily, cx: &mut App) -> bool {
         crate::theme::Theme::install_selection(
             appearance,
             themes.variant_id(match appearance {
-                crate::theme::Appearance::Dark => zeron_theme::Appearance::Dark,
-                crate::theme::Appearance::Light => zeron_theme::Appearance::Light,
+                crate::theme::Appearance::Dark => comet_theme::Appearance::Dark,
+                crate::theme::Appearance::Light => comet_theme::Appearance::Light,
             }),
             crate::appearance::accent(cx),
             crate::appearance::surface(cx),

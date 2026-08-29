@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use zeron_syntax::{HighlightKind, HighlightRequest, highlight};
+use comet_syntax::{HighlightKind, HighlightRequest, highlight};
 
 fn snapshot(source: &str, path: &str) -> Vec<String> {
     let document = highlight(HighlightRequest {

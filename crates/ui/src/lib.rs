@@ -1,4 +1,4 @@
-//! zeron-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
+//! comet-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
 //! diff pane.
 //!
 //! Design: ARCHITECTURE.md §4; animation catalog docs/research/feature-inventory.md
@@ -6,11 +6,11 @@
 //!
 //! M3a foundation:
 //! - [`theme`] — always-dark monochrome theme (oklch-derived neutrals), a gpui Global;
-//! - [`motion`] — the zeron animation catalog over gpui `Animation` + cubic-bezier;
+//! - [`motion`] — the comet animation catalog over gpui `Animation` + cubic-bezier;
 //! - [`state`] — `AppState` entity + `EngineHandle` (connect-or-embed engine);
 //! - [`settings`] — persisted pane widths/collapse flags;
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
-//! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
+//! - [`loaders`] — comet pulse loader, gradient spinner, boot splash.
 
 pub mod app_menus;
 pub mod appearance;
@@ -49,10 +49,10 @@ use futures::StreamExt as _;
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 pub use state::EngineBootConfig;
-pub use zeron_proto::HarnessId;
+pub use comet_proto::HarnessId;
 
 /// Everything the headed binary passes in (config/env resolution lives in
-/// `apps/zeron`, not here).
+/// `apps/comet`, not here).
 #[derive(Debug, Clone)]
 pub struct UiConfig {
     /// Data directory — engine stores + `ui-settings.json`.
@@ -149,7 +149,7 @@ pub fn run_app(config: UiConfig) {
         composer::init(cx);
         terminal::panel::init(cx);
         app_menus::init(cx);
-        cx.register_url_scheme("zeron").detach();
+        cx.register_url_scheme("comet").detach();
 
         let state = cx.new(|_| state::AppState::new());
         let url_state = state.clone();
@@ -199,7 +199,7 @@ pub fn run_app(config: UiConfig) {
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
 fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
-    // zeron window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
+    // comet window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
     cx.open_window(
         WindowOptions {
@@ -230,7 +230,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // Drag + start_window_move) — mark the content view app-owned
             // so AppKit neither dead-zones the strip nor delays clicks.
             app_owns_titlebar_drag: true,
-            // Linux: request client-side decorations — zeron draws its own
+            // Linux: request client-side decorations — comet draws its own
             // unified titlebar and (under CSD) its own caption buttons
             // (shell.rs `render_linux_caption_controls`). Leaving this unset
             // requests SERVER decorations, which stacked a compositor
@@ -250,7 +250,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // — if these two ever disagree, vibrancy dies on the first theme
             // change and never comes back.
             window_background: theme::Theme::of(cx).window_background_appearance(),
-            app_id: Some("zeron".into()),
+            app_id: Some("comet".into()),
             ..Default::default()
         },
         move |window, cx| {
