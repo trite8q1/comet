@@ -32,8 +32,8 @@ struct ZeronApp: App {
                     }
                 }
                 // `zeron://dev?edge=&user=&org=` — self-hosted/local-mesh sign-in
-                // on installs that can't pass launch args (SideStore/ad-hoc/
-                // TestFlight). The WorkOS `zeron://callback` is captured by
+                // on an over-the-air (ad-hoc) install, which can't pass launch
+                // args. The WorkOS `zeron://callback` is captured by
                 // ASWebAuthenticationSession and never routed here.
                 .onOpenURL { model.handleDeepLink($0) }
         }

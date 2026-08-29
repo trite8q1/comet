@@ -225,9 +225,9 @@ final class AppModel {
     }
 
     /// Deep link `zeron://dev?edge=<url>&user=<id>&org=<id>` — enters dev-mode
-    /// (self-hosted / local-mesh) sign-in on installs where launch args are not
-    /// available: SideStore, ad-hoc, TestFlight. `scripts/local-mesh.sh` prints
-    /// a ready-made link/QR. The WorkOS callback (`zeron://callback`) is consumed
+    /// (self-hosted / local-mesh) sign-in on an over-the-air (ad-hoc) install,
+    /// where launch args aren't available. `scripts/local-mesh.sh` prints a
+    /// ready-made link/QR. The WorkOS callback (`zeron://callback`) is consumed
     /// by ASWebAuthenticationSession and never reaches here, so only the `dev`
     /// host is handled.
     func handleDeepLink(_ url: URL) {

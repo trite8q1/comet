@@ -141,8 +141,8 @@ struct SignInView: View {
 
 /// Point the app at a local-mesh edge running in dev mode (edge AUTH_MODE=dev,
 /// bearer == "user@org"). This is the in-app equivalent of the `-setmode dev`
-/// launch args, so it works on any install — SideStore, ad-hoc, TestFlight —
-/// where launch arguments aren't available. `scripts/local-mesh.sh` prints the
+/// launch args, so it works on an over-the-air (ad-hoc) install, where launch
+/// arguments aren't available. `scripts/local-mesh.sh` prints the
 /// exact values (and a `zeron://dev?…` link/QR that fills this in for you).
 struct DevSignInView: View {
     @Environment(AppModel.self) private var model
