@@ -3,6 +3,9 @@
 # — the app uses Liquid Glass APIs). This is a thin, opinionated wrapper around
 # `xcodebuild`; for day-to-day work you can still just open Zeron.xcodeproj.
 #
+# For a cable-free install over your tailnet, build an ad-hoc IPA here and serve
+# it with scripts/ota-serve.sh (see docs/ota-install.md).
+#
 # Subcommands:
 #   sim       Build for the iOS Simulator and (RUN=1, the default) boot it,
 #             install, and launch straight against your local mesh edge in dev

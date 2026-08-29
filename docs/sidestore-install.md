@@ -87,3 +87,7 @@ and re-run the mesh with `MESH_EDGE_SCHEME=https`.
   hands-off OTA for several people, the TestFlight workflow
   (`.github/workflows/testflight.yml`) is still there; SideStore is the
   no-TestFlight route for yourself and a couple of devices.
+- Prefer a pure-Apple path with no third-party tooling? See
+  [`ota-install.md`](ota-install.md): serve the ad-hoc `.ipa` over an HTTPS
+  `tailscale serve` link and install via Safari. It needs each device's UDID
+  registered but no SideStore.

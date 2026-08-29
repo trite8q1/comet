@@ -105,8 +105,9 @@ DEVELOPMENT_TEAM=YOURTEAMID BUNDLE_ID=com.you.zeron scripts/build-ios.sh device
 xcrun devicectl device install app --device <name> target/ios-build/export/Zeron.ipa
 ```
 
-For a **cable-free** install without TestFlight (SideStore, ad-hoc OTA), see
-[`sidestore-install.md`](sidestore-install.md).
+For a **cable-free** install without TestFlight, see
+[`ota-install.md`](ota-install.md) (HTTPS link over Tailscale) or
+[`sidestore-install.md`](sidestore-install.md) (SideStore auto-refresh).
 
 **Point the app at your mesh** — three ways, no launch args required:
 
