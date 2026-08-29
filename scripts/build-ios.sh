@@ -1,36 +1,32 @@
 #!/usr/bin/env bash
 # Build the Zeron iOS app (apps/ios). Requires macOS with Xcode 26+ (iOS 26 SDK
-# — the app uses Liquid Glass APIs). This is a thin, opinionated wrapper around
-# `xcodebuild`; for day-to-day work you can still just open Zeron.xcodeproj.
+# — the app uses Liquid Glass APIs). A thin wrapper around `xcodebuild`; for
+# day-to-day work you can still just open Zeron.xcodeproj.
 #
-# For a cable-free install over your tailnet, build an ad-hoc IPA here and serve
-# it with scripts/ota-serve.sh (see docs/ota-install.md).
+# On-device install is over-the-air only (no cable): this produces the ad-hoc
+# .ipa, scripts/ota-serve.sh serves it over your tailnet. See docs/ota-install.md.
 #
-# Subcommands:
-#   sim       Build for the iOS Simulator and (RUN=1, the default) boot it,
-#             install, and launch straight against your local mesh edge in dev
-#             mode — the fastest way to see it working, no code signing needed.
-#   device    Archive and export a signed .ipa for a real iPhone. Needs your
-#             own Apple Team: set DEVELOPMENT_TEAM (and usually a unique
-#             BUNDLE_ID, since the default sh.zeron.ios belongs to another team).
-#   archive   Just produce the .xcarchive (no export).
-#   test      Run ZeronTests on the simulator.
+# Modes:
+#   ipa   Archive + export an ad-hoc .ipa for OTA install (default). Needs your
+#         own Apple Team; pick a unique bundle id (the default sh.zeron.ios
+#         belongs to the upstream project). → target/ios-build/export/*.ipa
+#   sim   Build and launch in the iOS Simulator against your local mesh edge in
+#         dev mode (no signing) — the fast on-Mac smoke test.
 #
 # Usage:
+#   DEVELOPMENT_TEAM=ABCDE12345 BUNDLE_ID=de.you.zeron scripts/build-ios.sh ipa
 #   scripts/build-ios.sh sim
-#   RUN=0 scripts/build-ios.sh sim
-#   DEVELOPMENT_TEAM=ABCDE12345 BUNDLE_ID=com.you.zeron scripts/build-ios.sh device
 #
 # Env:
-#   CONFIG           Debug | Release           (default: Release; sim uses Debug)
-#   SIMULATOR        simulator device name     (default: iPhone 17 Pro)
-#   DERIVED          derived-data / output dir (default: target/ios-build)
-#   RUN              sim: 1 = boot+launch, 0 = build only   (default: 1)
-#   MESH_PORT        edge port the sim connects to          (default: 27640)
-#   MESH_USER/ORG    dev identity the sim signs in with     (default: login/personal)
-#   DEVELOPMENT_TEAM Apple Developer Team ID   (device/archive; required)
-#   BUNDLE_ID        product bundle id override (device/archive)
-#   EXPORT_METHOD    development | ad-hoc | app-store        (default: development)
+#   DEVELOPMENT_TEAM  Apple Developer Team ID   (ipa: required)
+#   BUNDLE_ID         product bundle id          (default: sh.zeron.ios)
+#   CONFIG            Debug | Release            (default: Release; sim: Debug)
+#   DERIVED           derived-data / output dir  (default: target/ios-build)
+#   EXPORT_METHOD     ipa export method          (default: release-testing, the
+#                     Xcode 15.3+ name for ad-hoc; older Xcode uses "ad-hoc")
+#   SIMULATOR         simulator device name      (sim; default: iPhone 17 Pro)
+#   RUN               sim: 1 = boot+launch, 0 = build only  (default: 1)
+#   MESH_PORT/USER/ORG  sim dev-mode target      (defaults: 27640 / login / personal)
 
 set -euo pipefail
 
@@ -40,13 +36,12 @@ command -v xcodebuild >/dev/null 2>&1 || { echo "xcodebuild not found — instal
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="$ROOT/apps/ios/Zeron.xcodeproj"
 SCHEME="Zeron"
-CMD="${1:-sim}"
-SIMULATOR="${SIMULATOR:-iPhone 17 Pro}"
+CMD="${1:-ipa}"
 DERIVED="${DERIVED:-$ROOT/target/ios-build}"
 BUNDLE_ID="${BUNDLE_ID:-sh.zeron.ios}"
 
 # Route xcodebuild through xcbeautify/xcpretty when present, preserving its exit
-# code (never the formatter's) via PIPESTATUS.
+# code (never the formatter's) via pipefail.
 xcb() {
   if command -v xcbeautify >/dev/null 2>&1; then
     set -o pipefail; xcodebuild "$@" | xcbeautify
@@ -58,8 +53,45 @@ xcb() {
 }
 
 case "$CMD" in
+  ipa)
+    CONFIG="${CONFIG:-Release}"
+    [[ -n "${DEVELOPMENT_TEAM:-}" ]] || { echo "set DEVELOPMENT_TEAM=<your Apple Team ID> to sign the IPA." >&2; exit 1; }
+    ARCHIVE="$DERIVED/$SCHEME.xcarchive"
+    echo "▸ archiving $SCHEME ($CONFIG) team=$DEVELOPMENT_TEAM bundle=$BUNDLE_ID"
+    xcb -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIG" \
+      -destination "generic/platform=iOS" \
+      -archivePath "$ARCHIVE" \
+      DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+      PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+      CODE_SIGN_STYLE=Automatic \
+      archive
+
+    METHOD="${EXPORT_METHOD:-release-testing}"
+    OPTS="$DERIVED/ExportOptions.plist"
+    cat >"$OPTS" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>method</key><string>$METHOD</string>
+  <key>teamID</key><string>$DEVELOPMENT_TEAM</string>
+  <key>signingStyle</key><string>automatic</string>
+  <key>stripSwiftSymbols</key><true/>
+  <key>destination</key><string>export</string>
+</dict>
+</plist>
+PLIST
+    echo "▸ exporting ad-hoc .ipa (method=$METHOD)"
+    xcb -exportArchive -archivePath "$ARCHIVE" \
+      -exportOptionsPlist "$OPTS" -exportPath "$DERIVED/export"
+    IPA="$(/usr/bin/find "$DERIVED/export" -name '*.ipa' | head -1)"
+    echo "✓ ipa: ${IPA:-$DERIVED/export}"
+    echo "  next: scripts/ota-serve.sh   (serve it over Tailscale; see docs/ota-install.md)"
+    ;;
+
   sim)
     CONFIG="${CONFIG:-Debug}"
+    SIMULATOR="${SIMULATOR:-iPhone 17 Pro}"
     echo "▸ building $SCHEME ($CONFIG) for Simulator: $SIMULATOR"
     xcb -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIG" \
       -destination "platform=iOS Simulator,name=$SIMULATOR" \
@@ -89,65 +121,8 @@ case "$CMD" in
       -setmode dev -setedge "$EDGE" -setuser "$MESH_USER" -setorg "$MESH_ORG"
     ;;
 
-  archive|device)
-    CONFIG="${CONFIG:-Release}"
-    [[ -n "${DEVELOPMENT_TEAM:-}" ]] || { echo "set DEVELOPMENT_TEAM=<your Apple Team ID> for a signed build." >&2; exit 1; }
-    ARCHIVE="$DERIVED/$SCHEME.xcarchive"
-    echo "▸ archiving $SCHEME ($CONFIG) team=$DEVELOPMENT_TEAM bundle=$BUNDLE_ID"
-    xcb -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIG" \
-      -destination "generic/platform=iOS" \
-      -archivePath "$ARCHIVE" \
-      DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
-      PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-      CODE_SIGN_STYLE=Automatic \
-      archive
-    echo "✓ archive: $ARCHIVE"
-    [[ "$CMD" == "archive" ]] && exit 0
-
-    METHOD="${EXPORT_METHOD:-development}"
-    OPTS="$DERIVED/ExportOptions.plist"
-    cat >"$OPTS" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>method</key><string>$METHOD</string>
-  <key>teamID</key><string>$DEVELOPMENT_TEAM</string>
-  <key>signingStyle</key><string>automatic</string>
-  <key>stripSwiftSymbols</key><true/>
-  <key>destination</key><string>export</string>
-</dict>
-</plist>
-PLIST
-    echo "▸ exporting .ipa (method=$METHOD)"
-    xcb -exportArchive -archivePath "$ARCHIVE" \
-      -exportOptionsPlist "$OPTS" -exportPath "$DERIVED/export"
-    IPA="$(/usr/bin/find "$DERIVED/export" -name '*.ipa' | head -1)"
-    echo "✓ ipa: ${IPA:-$DERIVED/export}"
-    cat <<EOF
-
-  Install on a connected iPhone (iOS 17+):
-      xcrun devicectl device install app --device <name-or-udid> "$IPA"
-  or drag it onto the device in Xcode → Window → Devices and Simulators.
-
-  Then connect it to your mesh: in Xcode edit the Run scheme's launch arguments
-  once (Product → Scheme → Edit Scheme → Run → Arguments):
-      -setmode dev  -setedge http://<mac-tailscale-ip>:${MESH_PORT:-27640}  -setuser <user>  -setorg <org>
-  Run once with those; the app persists them. (scripts/local-mesh.sh prints the
-  exact values for your machine.)
-EOF
-    ;;
-
-  test)
-    CONFIG="${CONFIG:-Debug}"
-    echo "▸ testing $SCHEME on Simulator: $SIMULATOR"
-    xcb -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIG" \
-      -destination "platform=iOS Simulator,name=$SIMULATOR" \
-      -derivedDataPath "$DERIVED" test
-    ;;
-
   *)
-    echo "usage: scripts/build-ios.sh [sim|device|archive|test]" >&2
+    echo "usage: scripts/build-ios.sh [ipa|sim]" >&2
     exit 1
     ;;
 esac

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Over-the-air install of the Zeron iOS app over your tailnet — no cable, no
-# SideStore, no TestFlight. The Mac serves a signed .ipa + manifest.plist over a
-# real HTTPS URL (`tailscale serve` terminates TLS with a valid *.ts.net cert),
-# and the device installs by opening an itms-services link / scanning a QR.
+# store. The Mac serves a signed .ipa + manifest.plist over a real HTTPS URL
+# (`tailscale serve` terminates TLS with a valid *.ts.net cert, which is exactly
+# what iOS requires for itms-services://), and the device installs by opening an
+# install link / scanning a QR. This is the only on-device install path.
 #
 # Requires macOS + Xcode, a paid Apple Developer account, and Tailscale with
 # HTTPS certificates enabled for your tailnet (admin console → DNS → MagicDNS +
@@ -63,7 +64,7 @@ if [[ -z "$IPA" ]]; then
   else
     [[ -n "${DEVELOPMENT_TEAM:-}" ]] || die "set DEVELOPMENT_TEAM (and usually BUNDLE_ID) to build the ad-hoc IPA, or pass IPA=<path>."
     say "building ad-hoc IPA via build-ios.sh…"
-    EXPORT_METHOD=ad-hoc "$ROOT/scripts/build-ios.sh" device
+    "$ROOT/scripts/build-ios.sh" ipa
     IPA="$(ls -t "$ROOT/target/ios-build/export/"*.ipa | head -1)"
   fi
 fi
@@ -71,12 +72,28 @@ fi
 
 # ── stage the OTA payload ──────────────────────────────────────────────────
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/zeron-ota.XXXXXX")"
+PY_PID=""
+cleanup() {
+  say "stopping OTA server…"
+  # Remove only our HTTPS handler; never auto-`reset` (that would wipe other
+  # serve config the user may have).
+  if ! "$TS" serve --https=443 off >/dev/null 2>&1; then
+    warn "couldn't auto-remove the serve handler — run: $TS serve reset"
+  fi
+  [[ -n "$PY_PID" ]] && kill "$PY_PID" 2>/dev/null || true
+  rm -rf "$STAGE"
+}
+trap cleanup EXIT INT TERM
+
 cp "$IPA" "$STAGE/Zeron.ipa"
 
 # Read the shipped identifiers straight from the IPA so the manifest matches
-# exactly (a bundle-id/version mismatch makes iOS reject the install).
-unzip -p "$IPA" 'Payload/*.app/Info.plist' > "$STAGE/app.plist" 2>/dev/null || die "couldn't read Info.plist from the IPA."
-plx() { plutil -extract "$1" raw -o - "$STAGE/app.plist" 2>/dev/null; }
+# exactly (a bundle-id/version mismatch makes iOS reject the install). Resolve
+# the top-level app's Info.plist precisely rather than globbing.
+APP_PLIST="$(unzip -Z1 "$IPA" | grep -m1 -E '^Payload/[^/]+\.app/Info\.plist$' || true)"
+[[ -n "$APP_PLIST" ]] || die "couldn't locate Payload/*.app/Info.plist in the IPA."
+unzip -p "$IPA" "$APP_PLIST" > "$STAGE/app.plist" 2>/dev/null || die "couldn't read Info.plist from the IPA."
+plx() { plutil -extract "$1" raw -o - "$STAGE/app.plist" 2>/dev/null || true; }
 APP_BUNDLE_ID="$(plx CFBundleIdentifier)"; [[ -n "$APP_BUNDLE_ID" ]] || die "IPA has no CFBundleIdentifier."
 APP_VERSION="$(plx CFBundleShortVersionString)"; APP_VERSION="${APP_VERSION:-1.0}"
 APP_TITLE="$(plx CFBundleDisplayName)"; [[ -n "$APP_TITLE" ]] || APP_TITLE="$(plx CFBundleName)"; APP_TITLE="${APP_TITLE:-Zeron}"
@@ -118,6 +135,7 @@ cat >"$STAGE/manifest.plist" <<PLIST
 PLIST
 
 ITMS="itms-services://?action=download-manifest&url=$(urlenc "$BASE/manifest.plist")"
+ITMS_HTML="${ITMS//&/&amp;}" # the query separator must survive as &amp; in HTML
 
 cat >"$STAGE/index.html" <<HTML
 <!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -138,7 +156,7 @@ cat >"$STAGE/index.html" <<HTML
 <body><div class="card">
   <h1>$APP_TITLE</h1>
   <p>Version $APP_VERSION</p>
-  <a class="btn" href="$ITMS">Install on this device</a>
+  <a class="btn" href="$ITMS_HTML">Install on this device</a>
   <p style="margin-top:20px">Open this page in <b>Safari</b>, then tap Install and
      confirm. After it installs, open $APP_TITLE and connect it to your mesh
      (scan the QR from <code>scripts/local-mesh.sh</code>).</p>
@@ -159,19 +177,6 @@ class H(http.server.SimpleHTTPRequestHandler):
 with socketserver.TCPServer(("127.0.0.1", port), H) as s:
     s.serve_forever()
 PY
-
-PY_PID=""
-cleanup() {
-  say "stopping OTA server…"
-  # Remove only our HTTPS handler; never auto-`reset` (that would wipe other
-  # serve config the user may have).
-  if ! "$TS" serve --https=443 off >/dev/null 2>&1; then
-    warn "couldn't auto-remove the serve handler — run: $TS serve reset"
-  fi
-  [[ -n "$PY_PID" ]] && kill "$PY_PID" 2>/dev/null || true
-  rm -rf "$STAGE"
-}
-trap cleanup EXIT INT TERM
 
 python3 "$STAGE/serve.py" "$OTA_PORT" "$STAGE" &
 PY_PID=$!
@@ -217,4 +222,4 @@ fi
 
 # Block until the static server dies or the user interrupts.
 while [[ -n "$PY_PID" ]] && kill -0 "$PY_PID" 2>/dev/null; do sleep 2; done
-warn "static server exited — see $STAGE (if still present)"
+warn "static server exited unexpectedly."

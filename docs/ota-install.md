@@ -1,4 +1,4 @@
-# Over-the-air install over Tailscale (no cable, no SideStore, no TestFlight)
+# Over-the-air install over Tailscale (no cable, no store)
 
 Install the Zeron app on your iPhone/iPad straight from your Mac over an HTTPS
 link served on your tailnet. `tailscale serve` gives you a real, trusted
@@ -77,10 +77,8 @@ your Mac's sessions.
 - **Left something serving** — the script removes its handler on exit; to clear
   everything manually: `tailscale serve reset`.
 
-## OTA vs SideStore
+## Updating the app
 
-Both are cable-free and TestFlight-free. OTA (this doc) is a pure Apple path:
-one HTTPS link, apps valid ~1 year, but you must register each device's UDID and
-re-serve to update. [SideStore](sidestore-install.md) avoids UDID registration
-and auto-refreshes over Wi‑Fi, at the cost of third-party tooling and a one-time
-USB pairing. Pick whichever fits; the scripts share the same `.ipa`.
+When you rebuild (a new app version, or the profile changed), re-run
+`REBUILD=1 scripts/ota-serve.sh` and open the link again on each device. The
+signature is valid for ~1 year, so between rebuilds nothing expires.

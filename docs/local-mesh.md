@@ -97,17 +97,16 @@ loopback automatically):
 scripts/build-ios.sh sim
 ```
 
-**Real iPhone/iPad** — needs your own Apple Team (the bundled `sh.zeron.ios` /
-team belongs to the upstream project, so pick a unique bundle id):
+**Real iPhone/iPad** — installed **over the air** (no cable): build the ad-hoc
+IPA and serve it over your tailnet. Needs your own Apple Team (the bundled
+`sh.zeron.ios` belongs to the upstream project, so pick a unique bundle id):
 
 ```sh
-DEVELOPMENT_TEAM=YOURTEAMID BUNDLE_ID=com.you.zeron scripts/build-ios.sh device
-xcrun devicectl device install app --device <name> target/ios-build/export/Zeron.ipa
+DEVELOPMENT_TEAM=YOURTEAMID BUNDLE_ID=de.you.zeron scripts/ota-serve.sh
 ```
 
-For a **cable-free** install without TestFlight, see
-[`ota-install.md`](ota-install.md) (HTTPS link over Tailscale) or
-[`sidestore-install.md`](sidestore-install.md) (SideStore auto-refresh).
+See [`ota-install.md`](ota-install.md) for prerequisites (tailnet HTTPS, UDID
+registration) and the full walkthrough.
 
 **Point the app at your mesh** — three ways, no launch args required:
 

@@ -176,11 +176,11 @@ ${G}${B}  Local mesh is up.${R}
       User id  : ${B}${MESH_USER}${R}
       Org id   : ${B}${MESH_ORG}${R}
 
-  ${B}Easiest (any install — SideStore / ad-hoc / TestFlight):${R}
+  ${B}Point the app at this mesh${R} (works on the OTA-installed app):
   ${D}• Scan the QR below with the Camera app, or open this link on the device:${R}
       ${B}${DEEPLINK}${R}
   ${D}• Or in the app tap "Use a self-hosted server" and enter the three values.${R}
-  ${D}• Or, when launching from Xcode/Simulator, pass the launch args instead:${R}
+  ${D}• Or, when running in the Simulator, pass the launch args instead:${R}
   ${D}    -setmode dev  -setedge ${PHONE_EDGE_URL}  -setuser ${MESH_USER}  -setorg ${MESH_ORG}${R}
   ${D}  (scripts/build-ios.sh sim wires these up automatically against loopback.)${R}
 
