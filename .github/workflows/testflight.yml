@@ -30,8 +30,14 @@ jobs:
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
       AUDIENCE: ${{ inputs.audience || 'internal' }}
+      IOS_BUNDLE_ID: com.comet
+      IOS_TEAM_ID: 5XY3M483YQ
     steps:
       - uses: actions/checkout@v4
+
+      - name: Write Config.xcconfig
+        working-directory: apps/ios
+        run: printf 'DEVELOPMENT_TEAM = %s\n' "$IOS_TEAM_ID" > Config.xcconfig
 
       - name: Prepare App Store Connect credentials and build number
         shell: bash
@@ -76,10 +82,10 @@ jobs:
           }
 
           apps="$RUNNER_TEMP/apps.json"
-          api 'https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=sh.zeron.ios&fields[apps]=name,bundleId&limit=10' > "$apps"
+          api "https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=${IOS_BUNDLE_ID}&fields[apps]=name,bundleId&limit=10" > "$apps"
           app_count="$(jq '.data | length' "$apps")"
           if [ "$app_count" -ne 1 ]; then
-            echo "Expected exactly one App Store Connect app for sh.zeron.ios; found $app_count." >&2
+            echo "Expected exactly one App Store Connect app for ${IOS_BUNDLE_ID}; found $app_count." >&2
             exit 3
           fi
           app_id="$(jq -r '.data[0].id' "$apps")"
@@ -124,7 +130,7 @@ jobs:
           plutil -insert method -string app-store-connect "$options"
           plutil -insert destination -string upload "$options"
           plutil -insert signingStyle -string automatic "$options"
-          plutil -insert teamID -string 5XY3M483YQ "$options"
+          plutil -insert teamID -string "$IOS_TEAM_ID" "$options"
           plutil -insert manageAppVersionAndBuildNumber -bool false "$options"
           if [ "$AUDIENCE" = "internal" ]; then
             plutil -insert testFlightInternalTestingOnly -bool true "$options"
