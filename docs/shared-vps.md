@@ -1,6 +1,6 @@
 # Two workspaces on one VPS (Nico and Marc)
 
-One `zeron headless` process is one signed-in workspace. Nico and Marc cannot
+One `comet headless` process is one signed-in workspace. Nico and Marc cannot
 share a single engine: the data-dir lock, `device-id`, and `session.json` all
 belong to one account.
 
@@ -11,23 +11,23 @@ They do not see each other's chats, spaces, or sessions.
 Two Unix users is the cleaner split. This note is the same-user setup: one
 Linux account, two isolated engines.
 
-`zeron daemon install` is **not** used here. It writes a single user unit
-(`zeron.service` / `sh.zeron.app`) and would overwrite the other person.
+`comet daemon install` is **not** used here. It writes a single user unit
+(`comet.service` / `sh.comet.app`) and would overwrite the other person.
 
 ## Layout
 
 | | Nico | Marc |
 |---|---|---|
-| Data dir | `~/.zeron-nico` | `~/.zeron-marc` |
+| Data dir | `~/.comet-nico` | `~/.comet-marc` |
 | IPC | `27654` | `28654` |
 | OAuth callback | `27641` | `28641` |
-| Worktrees | `~/.zeron-nico/worktrees` | `~/.zeron-marc/worktrees` |
+| Worktrees | `~/.comet-nico/worktrees` | `~/.comet-marc/worktrees` |
 | Device name | `vps-nico` | `vps-marc` |
 | Claude config | `~/.claude-nico` | `~/.claude-marc` |
 | Codex home | `~/.codex-nico` | `~/.codex-marc` |
-| systemd unit | `zeron-nico.service` | `zeron-marc.service` |
+| systemd unit | `comet-nico.service` | `comet-marc.service` |
 
-`ZERON_DATA_DIR` isolates the engine lock, device id, WorkOS session, registry
+`COMET_DATA_DIR` isolates the engine lock, device id, WorkOS session, registry
 snapshots, journals, uploads, and `{data_dir}/agent-accounts` slots.
 
 Claude and Codex still default to `~/.claude` and `~/.codex`. Without
@@ -40,34 +40,34 @@ at the same working tree.
 ## Env files
 
 ```bash
-# ~/.config/zeron/nico.env
-export ZERON_DATA_DIR=$HOME/.zeron-nico
-export ZERON_IPC_PORT=27654
-export ZERON_CALLBACK_PORT=27641
-export ZERON_WORKTREES_DIR=$HOME/.zeron-nico/worktrees
-export ZERON_DEVICE_NAME=vps-nico
+# ~/.config/comet/nico.env
+export COMET_DATA_DIR=$HOME/.comet-nico
+export COMET_IPC_PORT=27654
+export COMET_CALLBACK_PORT=27641
+export COMET_WORKTREES_DIR=$HOME/.comet-nico/worktrees
+export COMET_DEVICE_NAME=vps-nico
 export CLAUDE_CONFIG_DIR=$HOME/.claude-nico
 export CODEX_HOME=$HOME/.codex-nico
 ```
 
 ```bash
-# ~/.config/zeron/marc.env
-export ZERON_DATA_DIR=$HOME/.zeron-marc
-export ZERON_IPC_PORT=28654
-export ZERON_CALLBACK_PORT=28641
-export ZERON_WORKTREES_DIR=$HOME/.zeron-marc/worktrees
-export ZERON_DEVICE_NAME=vps-marc
+# ~/.config/comet/marc.env
+export COMET_DATA_DIR=$HOME/.comet-marc
+export COMET_IPC_PORT=28654
+export COMET_CALLBACK_PORT=28641
+export COMET_WORKTREES_DIR=$HOME/.comet-marc/worktrees
+export COMET_DEVICE_NAME=vps-marc
 export CLAUDE_CONFIG_DIR=$HOME/.claude-marc
 export CODEX_HOME=$HOME/.codex-marc
 ```
 
-`zeron login`, `logout`, `status`, and `headless` must all be run with the
-same env file as the daemon. Otherwise they touch `~/.zeron` and fight the
+`comet login`, `logout`, `status`, and `headless` must all be run with the
+same env file as the daemon. Otherwise they touch `~/.comet` and fight the
 default lock.
 
 ```bash
-set -a && source ~/.config/zeron/nico.env && set +a
-zeron login          # Nico's WorkOS account
+set -a && source ~/.config/comet/nico.env && set +a
+comet login          # Nico's WorkOS account
 # then the same for marc.env / Marc's account
 ```
 
@@ -76,17 +76,17 @@ change `session.json` while an engine holds the data dir.
 
 ## systemd user units
 
-`~/.config/systemd/user/zeron-nico.service`:
+`~/.config/systemd/user/comet-nico.service`:
 
 ```ini
 [Unit]
-Description=Zeron engine (Nico)
+Description=Comet engine (Nico)
 After=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=%h/.config/zeron/nico.env
-ExecStart=/usr/local/bin/zeron headless
+EnvironmentFile=%h/.config/comet/nico.env
+ExecStart=/usr/local/bin/comet headless
 Restart=on-failure
 RestartSec=2
 
@@ -94,16 +94,16 @@ RestartSec=2
 WantedBy=default.target
 ```
 
-Copy to `zeron-marc.service` with `marc.env`. Point `ExecStart` at the real
-binary (`command -v zeron`).
+Copy to `comet-marc.service` with `marc.env`. Point `ExecStart` at the real
+binary (`command -v comet`).
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now zeron-nico.service zeron-marc.service
+systemctl --user enable --now comet-nico.service comet-marc.service
 loginctl enable-linger $USER
 ```
 
-Logs: `journalctl --user -u zeron-nico.service -f` (same for marc).
+Logs: `journalctl --user -u comet-nico.service -f` (same for marc).
 
 ## After it is up
 

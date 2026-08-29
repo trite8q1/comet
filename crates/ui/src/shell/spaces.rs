@@ -11,21 +11,21 @@
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use gpui::FocusHandle;
-use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
+use comet_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 
 struct ActiveChatRow {
     status: ChatIndicator,
-    chat: zeron_proto::Chat,
+    chat: comet_proto::Chat,
     folder: String,
     branch: Option<String>,
-    change_request: Option<zeron_proto::ChangeRequestSummary>,
+    change_request: Option<comet_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
 }
 
 fn compare_sidebar_chats(
     sort: SidebarSort,
-    left: &zeron_proto::Chat,
-    right: &zeron_proto::Chat,
+    left: &comet_proto::Chat,
+    right: &comet_proto::Chat,
 ) -> std::cmp::Ordering {
     let primary = match sort {
         SidebarSort::Created => right.created_at.cmp(&left.created_at),
@@ -1061,7 +1061,7 @@ impl Shell {
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
         let filter = self.settings.space_filter.clone();
         let state = self.state.read(cx);
-        let mut chats: Vec<zeron_proto::Chat> = state
+        let mut chats: Vec<comet_proto::Chat> = state
             .sidebar_chats(Utc::now(), filter.as_deref())
             .into_iter()
             .map(|(_, chat)| chat.clone())
@@ -1070,7 +1070,7 @@ impl Shell {
         if self.settings.sidebar_organization != SidebarOrganization::ByDevice {
             return chats.into_iter().map(|chat| chat.id).collect();
         }
-        let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
+        let mut groups: Vec<(Option<(String, String)>, Vec<comet_proto::Chat>)> = Vec::new();
         for chat in chats {
             let key = Some((chat.device_id.clone(), String::new()));
             if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
@@ -1319,7 +1319,7 @@ impl Shell {
         const PAGE: usize = 25;
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let mut rows: Vec<zeron_proto::Chat> = {
+        let mut rows: Vec<comet_proto::Chat> = {
             let state = self.state.read(cx);
             state
                 .chats
@@ -1697,7 +1697,7 @@ impl Shell {
 
     /// The current listing's folder rows filtered by the search query
     /// (prefix matches first — `popover::filter_indices`).
-    fn add_space_filtered(&self, cx: &App) -> Vec<zeron_proto::FolderEntry> {
+    fn add_space_filtered(&self, cx: &App) -> Vec<comet_proto::FolderEntry> {
         let Some(flow) = self.add_space.as_ref() else {
             return Vec::new();
         };
@@ -2282,7 +2282,7 @@ impl Shell {
                     .child(SharedString::from("esc")),
             );
 
-        // ── breadcrumbs ("MacBook Pro / Projects / zeron"): the quiet mono
+        // ── breadcrumbs ("MacBook Pro / Projects / comet"): the quiet mono
         //    path voice, `/` separators. The device crumb stands in for home —
         //    everything up to the resolved home path folds into it; below
         //    home the full path shows. Ancestors (device crumb included) are
@@ -3049,8 +3049,8 @@ mod tests {
         (Some((device.into(), device.into())), vec![value])
     }
 
-    fn chat(id: &str) -> zeron_proto::Chat {
-        zeron_proto::Chat {
+    fn chat(id: &str) -> comet_proto::Chat {
+        comet_proto::Chat {
             id: id.into(),
             device_id: "device".into(),
             title: None,
