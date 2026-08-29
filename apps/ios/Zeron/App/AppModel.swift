@@ -165,10 +165,18 @@ final class AppModel {
             return
         }
         startPathMonitor()
+        let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .workos
+        // Drop leftover AUTH_MODE=dev from the removed self-hosted form.
+        if mode == .dev && !args.contains("-setmode") {
+            authModeRaw = AppConfig.Mode.workos.rawValue
+            edgeURLString = "https://edge.zeron.sh"
+            storedUserId = ""
+            storedOrgId = ""
+            return
+        }
         guard let url = URL(string: edgeURLString), !storedUserId.isEmpty, !storedOrgId.isEmpty else {
             return
         }
-        let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .workos
         switch mode {
         case .dev:
             connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,
@@ -222,27 +230,6 @@ final class AppModel {
         storedOrgId = orgId
         connect(url: edgeURL, mode: .dev, userId: userId, orgId: orgId,
                 tokens: nil, devBearer: devBearer(userId: userId, orgId: orgId))
-    }
-
-    /// Deep link `zeron://dev?edge=<url>&user=<id>&org=<id>` — enters dev-mode
-    /// (self-hosted / local-mesh) sign-in on an over-the-air (ad-hoc) install,
-    /// where launch args aren't available. `scripts/local-mesh.sh` prints a
-    /// ready-made link/QR. The WorkOS callback (`zeron://callback`) is consumed
-    /// by ASWebAuthenticationSession and never reaches here, so only the `dev`
-    /// host is handled.
-    func handleDeepLink(_ url: URL) {
-        guard url.scheme == "zeron", url.host == "dev" else { return }
-        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        func value(_ name: String) -> String {
-            (items.first { $0.name == name }?.value ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        let user = value("user")
-        let org = value("org")
-        guard let edge = URL(string: value("edge")), edge.scheme != nil,
-              !user.isEmpty, !org.isEmpty else { return }
-        workspace?.stop()
-        signInDev(edgeURL: edge, userId: user, orgId: org)
     }
 
     func enterDemoMode() {
