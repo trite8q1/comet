@@ -165,18 +165,10 @@ final class AppModel {
             return
         }
         startPathMonitor()
-        let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .workos
-        // Drop leftover AUTH_MODE=dev from the removed self-hosted form.
-        if mode == .dev && !args.contains("-setmode") {
-            authModeRaw = AppConfig.Mode.workos.rawValue
-            edgeURLString = "https://edge.zeron.sh"
-            storedUserId = ""
-            storedOrgId = ""
-            return
-        }
         guard let url = URL(string: edgeURLString), !storedUserId.isEmpty, !storedOrgId.isEmpty else {
             return
         }
+        let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .workos
         switch mode {
         case .dev:
             connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,

@@ -13,4 +13,3 @@ build/
 edge/dist/
 xcuserdata/
 apps/ios/Config.xcconfig
-apps/ios/Local.xcconfig
