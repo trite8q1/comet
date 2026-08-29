@@ -13,23 +13,23 @@
   "name": "comet-native-edge",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
-  "account_id": "b57dde68ee5964dccc025437b5478a5b",
+  "account_id": "5b6252571013e413e2b7e033bfd2ec42",
   "workers_dev": true,
   // Public hostname on the zeron.sh zone, plus the install surface carved out
   // of the landing host: path routes beat the landing worker's custom
   // domain, so `curl -fsSL https://zeron.sh/install.sh | sh` installs Zeron
   // while the rest of zeron.sh serves the landing page.
-  "routes": [
-    { "pattern": "edge.zeron.sh", "custom_domain": true },
-    { "pattern": "zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "zeron.sh/releases/*", "zone_name": "zeron.sh" },
-    // Legacy comet hostnames — keep until 0.1.x clients are gone.
-    { "pattern": "edge.comet.zeron.sh", "custom_domain": true },
-    { "pattern": "comet.zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "comet.zeron.sh/releases/*", "zone_name": "zeron.sh" }
-  ],
+  "routes": [],
   // Serve src/install.sh as a string (the /install.sh route).
-  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  "rules": [
+    {
+      "type": "Text",
+      "globs": [
+        "**/*.sh"
+      ],
+      "fallthrough": true
+    }
+  ],
   // loro-crdt's default entry loads its WASM via URL fetch, which workerd
   // cannot do at runtime; the base64 entry inlines the module instead.
   "alias": {
@@ -37,28 +37,47 @@
   },
   "durable_objects": {
     "bindings": [
-      { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
-      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
-      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
-      { "name": "CHAT_ROOMS", "class_name": "ChatRoom" }
+      {
+        "name": "SESSION_ROOMS",
+        "class_name": "SessionRoom"
+      },
+      {
+        "name": "DEVICE_ROOMS",
+        "class_name": "DeviceRoom"
+      },
+      {
+        "name": "REGISTRY_ROOMS",
+        "class_name": "RegistryRoom"
+      },
+      {
+        "name": "CHAT_ROOMS",
+        "class_name": "ChatRoom"
+      }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["SessionRoom", "DeviceRoom"]
+      "new_sqlite_classes": [
+        "SessionRoom",
+        "DeviceRoom"
+      ]
     },
     {
       // Workspace registry (docs/registry-sync.md) — the row-table sidebar
       // sync that replaces the Loro workspace doc rooms.
       "tag": "v2",
-      "new_sqlite_classes": ["RegistryRoom"]
+      "new_sqlite_classes": [
+        "RegistryRoom"
+      ]
     },
     {
       // chat2 session rooms (docs/chat2-sync.md) — dumb log relays that
       // replace SessionRoom's loro-aware s2 rooms.
       "tag": "v3",
-      "new_sqlite_classes": ["ChatRoom"]
+      "new_sqlite_classes": [
+        "ChatRoom"
+      ]
     }
   ],
   "r2_buckets": [
@@ -77,7 +96,7 @@
     // set the real client id before deploying. Set AUTH_MODE=dev locally to
     // accept bearer==userId. WORKOS_API_KEY is a wrangler secret
     // (`wrangler secret put WORKOS_API_KEY`) powering the /auth/* routes.
-    "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",
+    "WORKOS_CLIENT_ID": "client_01M16XBSXH0J0KQG6XC1EF90YE",
     "AUTH_MODE": "workos"
   },
   "observability": {
