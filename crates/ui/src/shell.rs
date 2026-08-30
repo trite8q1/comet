@@ -4388,7 +4388,7 @@ impl Shell {
                     .as_ref()
                     .map(|u| SharedString::from(u.email.clone()))
                     .unwrap_or_else(|| line.clone());
-                (line, Some("Alpha".into()), email)
+                (line, Some("Synced".into()), email)
             }
         };
         let user_menu =
