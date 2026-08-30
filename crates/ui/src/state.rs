@@ -1256,6 +1256,27 @@ impl AppState {
         (format!("@ {device}"), offline)
     }
 
+    /// More than the local device is known — device labels add information and
+    /// should be shown. A lone local device needs no disambiguation, so the
+    /// folder sidebar stays clean for single-machine users.
+    pub fn has_multiple_devices(&self) -> bool {
+        self.devices.len() > 1
+    }
+
+    /// The device label for a folder/chat, matching the composer's device chip
+    /// ([`crate::pickers`]): the device's real name plus a `true` "show Local
+    /// tag" flag when it is this machine (suppressed when the name is already
+    /// the local-only "Local" sentinel, to avoid "Local Local"). Callers render
+    /// the flag as a muted trailing "Local".
+    pub fn device_label(&self, device_id: &str) -> (String, bool) {
+        let name = self
+            .device_name(device_id)
+            .unwrap_or("Unknown device")
+            .to_string();
+        let show_local_tag = self.local_device_id.as_deref() == Some(device_id) && name != "Local";
+        (name, show_local_tag)
+    }
+
     /// Does the selected space's folder have git? Drives the branch picker and
     /// the diff sidebar (owner-stamped, synced — no RPC).
     pub fn selected_space_git(&self) -> bool {

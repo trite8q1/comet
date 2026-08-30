@@ -81,6 +81,8 @@ impl Render for SidebarViewOptionsTooltip {
 
 #[derive(Clone, Copy)]
 enum SidebarViewRow {
+    ByProject,
+    ByProjectMerged,
     ByDevice,
     InOneList,
     LastUpdated,
@@ -96,12 +98,19 @@ impl SidebarViewRow {
     fn closes_menu(self) -> bool {
         matches!(
             self,
-            Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
+            Self::ByProject
+                | Self::ByProjectMerged
+                | Self::ByDevice
+                | Self::InOneList
+                | Self::LastUpdated
+                | Self::Created
         )
     }
 }
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 7] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 9] = [
+    SidebarViewRow::ByProject,
+    SidebarViewRow::ByProjectMerged,
     SidebarViewRow::ByDevice,
     SidebarViewRow::InOneList,
     SidebarViewRow::LastUpdated,
@@ -169,6 +178,73 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
         )
         .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
         .child(chevron)
+}
+
+/// A project-folder header (the Codex-style collapsible folder): a leading
+/// folder icon and a primary-weight name, an optional trailing device chip,
+/// then the rotating disclosure chevron. Unlike [`sidebar_disclosure_header`]
+/// there is no full-bleed hairline — folders are objects, not sections, so the
+/// 12px inter-section gap carries the separation and keeps the list uncluttered.
+fn sidebar_folder_header(
+    theme: &Theme,
+    label: SharedString,
+    device_chip: Option<AnyElement>,
+    chevron: AnyElement,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
+        .px(px(Theme::SPACE_SM))
+        .cursor_pointer()
+        .child(
+            icon(icons::FOLDER)
+                .size(px(16.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.7)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(crate::typography::ui_rems(13.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text.opacity(0.8))
+                .child(label),
+        )
+        .when_some(device_chip, |el, chip| el.child(chip))
+        .child(chevron)
+}
+
+/// Folder key + display label + no-project flag for a chat in the project
+/// folder views. The key is the space id (ByProject — device-scoped, so a repo
+/// on two machines reads as two folders) or the lowercased project name
+/// (ByProjectMerged — one folder per repo across devices); project-less or
+/// dangling chats share the `~no-project` bucket, labeled "No project".
+fn chat_folder_key(
+    state: &crate::state::AppState,
+    chat: &comet_proto::Chat,
+    merged: bool,
+) -> (String, String, bool) {
+    let space = state.space_for_chat(chat);
+    let no_project = space.is_none();
+    let label = match space {
+        Some(space) => space.display_name().to_string(),
+        None => "No project".to_string(),
+    };
+    let key = if no_project {
+        "~no-project".to_string()
+    } else if merged {
+        label.to_lowercase()
+    } else {
+        chat.space_id
+            .clone()
+            .unwrap_or_else(|| "~no-project".to_string())
+    };
+    (key, label, no_project)
 }
 
 /// One row of the open dropdown, in display order.
@@ -539,6 +615,12 @@ impl Shell {
 
     fn activate_sidebar_view_row(&mut self, row: SidebarViewRow, cx: &mut Context<Self>) {
         match row {
+            SidebarViewRow::ByProject => {
+                self.settings.sidebar_organization = SidebarOrganization::ByProject
+            }
+            SidebarViewRow::ByProjectMerged => {
+                self.settings.sidebar_organization = SidebarOrganization::ByProjectMerged
+            }
             SidebarViewRow::ByDevice => {
                 self.settings.sidebar_organization = SidebarOrganization::ByDevice
             }
@@ -612,6 +694,8 @@ impl Shell {
         let show_pr = self.settings.sidebar_show_pull_request;
 
         let labels = [
+            "Group by project",
+            "Group by project, all devices",
             "By device",
             "In one list",
             "Last updated",
@@ -621,6 +705,8 @@ impl Shell {
             "Harness",
         ];
         let icons = [
+            icons::FOLDER,
+            icons::FOLDER_WITH_FILES,
             icons::LAPTOP,
             icons::LIST,
             icons::CLOCK_CIRCLE,
@@ -630,6 +716,8 @@ impl Shell {
             icons::BOT,
         ];
         let selected = [
+            organization == SidebarOrganization::ByProject,
+            organization == SidebarOrganization::ByProjectMerged,
             organization == SidebarOrganization::ByDevice,
             organization == SidebarOrganization::InOneList,
             sort == SidebarSort::LastUpdated,
@@ -673,8 +761,8 @@ impl Shell {
                 .into_any_element()
             })
             .collect();
-        let show_rows = rows.split_off(4);
-        let sort_rows = rows.split_off(2);
+        let show_rows = rows.split_off(6);
+        let sort_rows = rows.split_off(4);
         let organization_rows = rows;
 
         popover::popover_card(theme)
@@ -1060,6 +1148,7 @@ impl Shell {
     /// the screen.
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
         let filter = self.settings.space_filter.clone();
+        let organization = self.settings.sidebar_organization;
         let state = self.state.read(cx);
         let mut chats: Vec<comet_proto::Chat> = state
             .sidebar_chats(Utc::now(), filter.as_deref())
@@ -1067,7 +1156,33 @@ impl Shell {
             .map(|(_, chat)| chat.clone())
             .collect();
         chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
-        if self.settings.sidebar_organization != SidebarOrganization::ByDevice {
+        // Project folders (the "All projects" view): flatten folder-by-folder
+        // in the exact order `render_folder_rows` draws them (No project last),
+        // so ⌘-jump and cycling never drift from the screen.
+        if filter.is_none()
+            && matches!(
+                organization,
+                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+            )
+        {
+            let merged = organization == SidebarOrganization::ByProjectMerged;
+            let mut folders: Vec<(String, bool, Vec<comet_proto::Chat>)> = Vec::new();
+            for chat in chats {
+                let (key, _label, no_project) = chat_folder_key(state, &chat, merged);
+                if let Some((_, _, rows)) = folders.iter_mut().find(|(k, _, _)| k == &key) {
+                    rows.push(chat);
+                } else {
+                    folders.push((key, no_project, vec![chat]));
+                }
+            }
+            folders.sort_by_key(|(_, no_project, _)| *no_project);
+            return folders
+                .into_iter()
+                .flat_map(|(_, _, rows)| rows)
+                .map(|chat| chat.id)
+                .collect();
+        }
+        if organization != SidebarOrganization::ByDevice {
             return chats.into_iter().map(|chat| chat.id).collect();
         }
         let mut groups: Vec<(Option<(String, String)>, Vec<comet_proto::Chat>)> = Vec::new();
@@ -1097,6 +1212,17 @@ impl Shell {
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
+        // Codex-style project folders replace the flat list on the "All
+        // projects" view; a single-project filter is already scoped, so it
+        // keeps the flat card list.
+        if filter.is_none()
+            && matches!(
+                self.settings.sidebar_organization,
+                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+            )
+        {
+            return self.render_folder_rows(theme, cx);
+        }
         let mut rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
             let mut chats: Vec<_> = state
@@ -1136,7 +1262,9 @@ impl Shell {
                     let change_request = state.change_request_for_chat(&chat).cloned();
                     let group = match self.settings.sidebar_organization {
                         SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
-                        SidebarOrganization::ByProject | SidebarOrganization::InOneList => None,
+                        SidebarOrganization::ByProject
+                        | SidebarOrganization::ByProjectMerged
+                        | SidebarOrganization::InOneList => None,
                     };
                     ActiveChatRow {
                         status,
@@ -1202,7 +1330,8 @@ impl Shell {
                     .sidebar_show_harness
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
-                let height = super::chat_row_height(branch.is_some(), change_request.is_some());
+                let height =
+                    super::chat_row_height(false, branch.is_some(), change_request.is_some());
                 // Only rows a jump slot can reach wear a chip; row 10 onward
                 // keeps its time-ago.
                 let jump_label: Option<SharedString> = if jump_hints {
@@ -1219,7 +1348,7 @@ impl Shell {
                     )
                     .into(),
                     time_ago,
-                    folder.into(),
+                    Some(folder.into()),
                     branch.map(SharedString::from),
                     change_request,
                     harness,
@@ -1239,7 +1368,9 @@ impl Shell {
             };
             let organization = match self.settings.sidebar_organization {
                 SidebarOrganization::ByDevice => "device",
-                SidebarOrganization::ByProject | SidebarOrganization::InOneList => "list",
+                SidebarOrganization::ByProject
+                | SidebarOrganization::ByProjectMerged
+                | SidebarOrganization::InOneList => "list",
             };
             let collapse_key = format!("{organization}:{key}");
             let motion_key = format!("group:{collapse_key}");
@@ -1299,6 +1430,289 @@ impl Shell {
                 .child(body)
                 .into_any_element();
             rendered.push((format!("g:{collapse_key}"), height, element));
+        }
+        rendered
+    }
+
+    /// The Codex-style project-folder list for the "All projects" view: one
+    /// collapsible folder per project, chats nested and recency-sorted, each
+    /// folder paging its tail behind "Show N more". Device is named in the
+    /// folder header (ByProject) or per chat (ByProjectMerged, only when a
+    /// folder actually spans devices), and only when more than one device is
+    /// known — a single-machine user sees a clean, deviceless list.
+    fn render_folder_rows(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<(String, f32, AnyElement)> {
+        const FOLDER_INITIAL: usize = 8;
+        const FOLDER_PAGE: usize = 25;
+        const PAGER_ROW_HEIGHT: f32 = 32.0;
+        let now = Utc::now();
+        let merged = self.settings.sidebar_organization == SidebarOrganization::ByProjectMerged;
+        let sort = self.settings.sidebar_sort;
+        let show_branch = self.settings.sidebar_show_branch;
+        let show_pr = self.settings.sidebar_show_pull_request;
+        let show_harness = self.settings.sidebar_show_harness;
+        let multiple_devices = self.state.read(cx).has_multiple_devices();
+        let selected = self.state.read(cx).selected_chat.clone();
+
+        struct FolderRow {
+            status: ChatIndicator,
+            chat: comet_proto::Chat,
+            branch: Option<String>,
+            change_request: Option<comet_proto::ChangeRequestSummary>,
+            device_id: String,
+        }
+        struct Folder {
+            key: String,
+            label: SharedString,
+            header_device: Option<(SharedString, bool)>,
+            no_project: bool,
+            rows: Vec<FolderRow>,
+        }
+
+        let mut folders: Vec<Folder> = Vec::new();
+        {
+            let state = self.state.read(cx);
+            let mut chats: Vec<(ChatIndicator, comet_proto::Chat)> = state
+                .sidebar_chats(now, None)
+                .into_iter()
+                .map(|(status, chat)| (status, chat.clone()))
+                .collect();
+            chats.sort_by(|left, right| compare_sidebar_chats(sort, &left.1, &right.1));
+            for (status, chat) in chats {
+                let (key, label, no_project) = chat_folder_key(state, &chat, merged);
+                let branch = if show_branch {
+                    crate::change_requests::conversation_branch(&chat, &state.spaces)
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                let change_request = if show_pr {
+                    state.change_request_for_chat(&chat).cloned()
+                } else {
+                    None
+                };
+                let device_id = chat.device_id.clone();
+                let row = FolderRow {
+                    status,
+                    chat,
+                    branch,
+                    change_request,
+                    device_id,
+                };
+                if let Some(folder) = folders.iter_mut().find(|f| f.key == key) {
+                    folder.rows.push(row);
+                } else {
+                    // ByProject folders name their owning device when more than
+                    // one device is known; merged folders show device per chat.
+                    let header_device = if merged || no_project || !multiple_devices {
+                        None
+                    } else {
+                        let (name, show_local) = state.device_label(&row.device_id);
+                        Some((SharedString::from(name), show_local))
+                    };
+                    folders.push(Folder {
+                        key,
+                        label: SharedString::from(label),
+                        header_device,
+                        no_project,
+                        rows: vec![row],
+                    });
+                }
+            }
+        }
+        // "No project" sinks to the bottom; the rest keep the recency/created
+        // order their top chat sorted into (stable — first appearance wins).
+        folders.sort_by_key(|folder| folder.no_project);
+
+        let mut rendered: Vec<(String, f32, AnyElement)> = Vec::new();
+        for folder in folders {
+            let collapse_key = format!("folder:{}", folder.key);
+            let motion_key = format!("group:{collapse_key}");
+            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+            let total = folder.rows.len();
+            let shown = self
+                .sidebar_folder_shown
+                .get(&collapse_key)
+                .copied()
+                .unwrap_or(FOLDER_INITIAL)
+                .max(FOLDER_INITIAL);
+            let visible_count = total.min(shown);
+            let has_more = total > visible_count;
+            // A merged folder that mixes devices tags each chat with its device.
+            let multi_device_folder = merged && {
+                let mut ids = folder.rows.iter().map(|r| r.device_id.as_str());
+                match ids.next() {
+                    Some(first) => ids.any(|d| d != first),
+                    None => false,
+                }
+            };
+
+            let mut row_elements: Vec<(f32, AnyElement)> = Vec::new();
+            for row in folder.rows.into_iter().take(visible_count) {
+                let FolderRow {
+                    status,
+                    chat,
+                    branch,
+                    change_request,
+                    device_id,
+                } = row;
+                let title: SharedString = transcript::single_line(
+                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                )
+                .into();
+                let time_ago: SharedString =
+                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+                let is_selected = selected.as_deref() == Some(chat.id.as_str());
+                let harness = show_harness
+                    .then(|| chat.config.as_ref().map(|c| c.harness))
+                    .flatten();
+                let context: Option<SharedString> = if multi_device_folder {
+                    let (name, show_local) = self.state.read(cx).device_label(&device_id);
+                    Some(if show_local {
+                        format!("{name} · Local").into()
+                    } else {
+                        SharedString::from(name)
+                    })
+                } else {
+                    None
+                };
+                let compact = context.is_none();
+                let height =
+                    super::chat_row_height(compact, branch.is_some(), change_request.is_some());
+                let element = self.render_chat_row(
+                    chat.id.clone(),
+                    title,
+                    time_ago,
+                    context,
+                    branch.map(SharedString::from),
+                    change_request,
+                    harness,
+                    status,
+                    is_selected,
+                    false,
+                    None,
+                    theme,
+                    cx,
+                );
+                row_elements.push((height, element));
+            }
+
+            let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
+                + row_elements.iter().map(|(h, _)| *h).sum::<f32>()
+                + SIDEBAR_LIST_GAP * visible_count.saturating_sub(1) as f32
+                + if has_more {
+                    PAGER_ROW_HEIGHT + SIDEBAR_LIST_GAP
+                } else {
+                    0.0
+                };
+
+            let rows_column = div()
+                .flex()
+                .flex_col()
+                .gap(px(SIDEBAR_LIST_GAP))
+                .children(row_elements.into_iter().map(|(_, el)| el));
+            let mut body_inner = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+                .child(rows_column);
+            if has_more {
+                let remaining = (total - visible_count).min(FOLDER_PAGE);
+                let more_key = collapse_key.clone();
+                body_inner = body_inner.child(
+                    div()
+                        .id(SharedString::from(format!("folder-more-{collapse_key}")))
+                        .mt(px(SIDEBAR_LIST_GAP))
+                        .h(px(PAGER_ROW_HEIGHT))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(Theme::SPACE_SM))
+                        .rounded(px(8.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let shown = this
+                                .sidebar_folder_shown
+                                .entry(more_key.clone())
+                                .or_insert(FOLDER_INITIAL);
+                            *shown = (*shown).max(FOLDER_INITIAL) + FOLDER_PAGE;
+                            cx.notify();
+                        }))
+                        .child(icon(icons::PLUS).size(px(12.0)).flex_none())
+                        .child(SharedString::from(format!("Show {remaining} more"))),
+                );
+            }
+
+            let visible_label: SharedString = if collapsed {
+                format!("{} ({total})", folder.label).into()
+            } else {
+                folder.label.clone()
+            };
+            let device_chip: Option<AnyElement> = folder.header_device.map(|(name, show_local)| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .text_size(crate::typography::ui_rems(10.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(name)
+                    .when(show_local, |el| {
+                        el.child(
+                            div()
+                                .text_color(theme.text_muted.opacity(0.45))
+                                .child(SharedString::from("Local")),
+                        )
+                    })
+                    .into_any_element()
+            });
+            let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
+            let toggle_key = collapse_key.clone();
+            let toggle_motion = motion_key.clone();
+            let header = sidebar_folder_header(theme, visible_label, device_chip, chevron)
+                .id(SharedString::from(format!("sidebar-folder-{collapse_key}")))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
+                    this.begin_sidebar_disclosure_motion(
+                        &toggle_motion,
+                        if was_open { body_height } else { 0.0 },
+                        if was_open { 0.0 } else { body_height },
+                    );
+                    if was_open {
+                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                    } else {
+                        this.sidebar_collapsed_groups.remove(&toggle_key);
+                    }
+                    cx.notify();
+                }));
+            let body = self.render_sidebar_disclosure_body(
+                &motion_key,
+                !collapsed,
+                body_height,
+                body_inner.into_any_element(),
+            );
+            let height =
+                SIDEBAR_DISCLOSURE_SECTION_HEIGHT + if collapsed { 0.0 } else { body_height };
+            let element = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_SECTION_GAP))
+                .child(header)
+                .child(body)
+                .into_any_element();
+            rendered.push((format!("folder:{}", folder.key), height, element));
         }
         rendered
     }
@@ -3042,11 +3456,36 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
+    use super::{chat_folder_key, compare_sidebar_chats, promote_local_device_group};
     use crate::settings::SidebarSort;
+    use crate::state::AppState;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])
+    }
+
+    fn space(id: &str, device_id: &str, path: &str, name: &str) -> comet_proto::Space {
+        comet_proto::Space {
+            id: id.into(),
+            device_id: device_id.into(),
+            path: path.into(),
+            name: Some(name.into()),
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc.timestamp_opt(1, 0).unwrap(),
+        }
+    }
+
+    fn device(id: &str, name: &str) -> comet_proto::Device {
+        comet_proto::Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
     }
 
     fn chat(id: &str) -> comet_proto::Chat {
@@ -3104,5 +3543,62 @@ mod tests {
         promote_local_device_group(&mut groups, Some("not-present"));
 
         assert_eq!(groups, before);
+    }
+
+    #[test]
+    fn folder_keys_group_by_space_or_project_name() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![
+            space("s1", "devA", "/home/maps", "gonzocity-maps"),
+            space("s2", "devB", "/home/maps", "gonzocity-maps"),
+            space("s3", "devA", "/home/skills", "skills"),
+        ]);
+        let mut a = chat("a");
+        a.space_id = Some("s1".into());
+        a.device_id = "devA".into();
+        let mut b = chat("b");
+        b.space_id = Some("s2".into());
+        b.device_id = "devB".into();
+        let mut loose = chat("loose");
+        loose.space_id = None;
+
+        // ByProject: the key is the space id (device-scoped), so the same repo
+        // on two machines reads as two folders that share a display label.
+        assert_eq!(
+            chat_folder_key(&state, &a, false),
+            ("s1".to_string(), "gonzocity-maps".to_string(), false)
+        );
+        assert_eq!(
+            chat_folder_key(&state, &b, false),
+            ("s2".to_string(), "gonzocity-maps".to_string(), false)
+        );
+        // Merged: the key is the lowercased project name, so both machines fall
+        // into one folder.
+        assert_eq!(chat_folder_key(&state, &a, true).0, "gonzocity-maps");
+        assert_eq!(chat_folder_key(&state, &b, true).0, "gonzocity-maps");
+        // Project-less chats share the "No project" bucket in either mode.
+        assert_eq!(
+            chat_folder_key(&state, &loose, false),
+            ("~no-project".to_string(), "No project".to_string(), true)
+        );
+        assert_eq!(
+            chat_folder_key(&state, &loose, true).0,
+            "~no-project".to_string()
+        );
+    }
+
+    #[test]
+    fn device_label_marks_local_and_gates_on_device_count() {
+        let mut state = AppState::new();
+        // A lone local device needs no disambiguation.
+        state.apply_devices(vec![device("devA", "Mac Studio")]);
+        state.local_device_id = Some("devA".into());
+        assert!(!state.has_multiple_devices());
+
+        // Two devices: labels add information, and the local one wears "Local".
+        state.apply_devices(vec![device("devA", "Mac Studio"), device("devB", "Air")]);
+        assert!(state.has_multiple_devices());
+        assert_eq!(state.device_label("devA"), ("Mac Studio".to_string(), true));
+        assert_eq!(state.device_label("devB"), ("Air".to_string(), false));
     }
 }

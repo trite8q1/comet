@@ -36,11 +36,14 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   DEV=$(probe LocalDevice '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["deviceId"])')
   # One space per demo folder, created up-front (chats join by space id).
   declare -A SPACES=()
-  for project in comet soccertcg comet aether; do
+  for project in comet soccertcg aether; do
     sid=$(uuidgen | tr 'A-Z' 'a-z')
     probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$HOME/github/$project\"}" >/dev/null
     SPACES[$project]="$sid"
   done
+  # Each probe is a fresh one-shot connection; let the space mutations commit
+  # before chats reference them, or createChat races to "no such space".
+  sleep 1
   seed() { # title project branch age_hours run
     local id; id=$(uuidgen | tr 'A-Z' 'a-z')
     local sid="${SPACES[$2]}"

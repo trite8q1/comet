@@ -170,11 +170,15 @@ fn flush_latest(cx: &mut App) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SidebarOrganization {
-    /// Legacy persisted value. Project scope now belongs exclusively to the
-    /// project selector and is normalized to [`Self::InOneList`] on load.
-    ByProject,
-    ByDevice,
+    /// Folders: one collapsible folder per project (a `Space`, which is
+    /// device-scoped). The same repo on two machines reads as two folders,
+    /// each labeled with its device.
     #[default]
+    ByProject,
+    /// Folders: one collapsible folder per project *name*, merging a repo
+    /// across devices; each chat carries its device.
+    ByProjectMerged,
+    ByDevice,
     InOneList,
 }
 
@@ -271,7 +275,7 @@ impl Default for UiSettings {
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             sidebar_grouped: false,
-            sidebar_organization: SidebarOrganization::InOneList,
+            sidebar_organization: SidebarOrganization::ByProject,
             sidebar_sort: SidebarSort::LastUpdated,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
@@ -677,9 +681,6 @@ pub fn badge_combo_on(mac: bool, combo: &str) -> String {
 impl UiSettings {
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
     pub fn clamped(mut self) -> Self {
-        if self.sidebar_organization == SidebarOrganization::ByProject {
-            self.sidebar_organization = SidebarOrganization::InOneList;
-        }
         self.sidebar_width = clamp_or(
             self.sidebar_width,
             SIDEBAR_MIN,
@@ -839,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_project_organization_normalizes_to_one_list() {
+    fn project_organization_loads_as_folders() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
@@ -849,7 +850,7 @@ mod tests {
 
         assert_eq!(
             UiSettings::load(dir.path()).sidebar_organization,
-            SidebarOrganization::InOneList
+            SidebarOrganization::ByProject
         );
     }
 
