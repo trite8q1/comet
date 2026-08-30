@@ -65,4 +65,7 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
 fi
 
 echo "▸ opening comet (composer is live — type into it; --slow shows streaming)"
-COMET_DATA_DIR="$UI_DIR" COMET_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/comet
+# COMET_DEMO_DEVICES augments the sidebar with two extra devices (Mac Studio,
+# Cloud VPS) plus spaces/chats on them, so the multi-device folder views are
+# visible locally. Client-side only — nothing syncs to the daemon.
+COMET_DATA_DIR="$UI_DIR" COMET_IPC_PORT=$IPC COMET_DEMO_DEVICES=1 RUST_LOG=warn ./target/debug/comet
