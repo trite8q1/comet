@@ -99,6 +99,8 @@ pub mod methods {
     pub const LIST_ORGS: &str = "ListOrgs";
     pub const CREATE_ORG: &str = "CreateOrg";
     pub const SELECT_ORG: &str = "SelectOrg";
+    /// Rename the signed-in user (`{ name }`); the new profile arrives over AuthStatus.
+    pub const UPDATE_PROFILE: &str = "UpdateProfile";
     /// One-time local→synced profile import: what's importable (unary).
     pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
     /// One-time local→synced profile import: run it (stream of progress items).

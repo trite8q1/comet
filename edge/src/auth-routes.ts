@@ -5,17 +5,19 @@
  *  - POST /auth/refresh      — WorkOS refresh → fresh tokens (org-scopable).
  *  - GET  /auth/orgs         — the caller's active org memberships.
  *  - POST /auth/orgs         — create an org + first (admin) membership.
+ *  - PATCH /auth/profile     — rename the caller's WorkOS user.
  *  - GET  /auth/cli/callback — headless sign-in: shows a paste-able code.
  *
  * Exchange/refresh/callback run BEFORE the bearer gate (the caller has no
- * access token yet); the org routes verify the bearer themselves — the user
- * id is ALWAYS the token's `sub`, never request input: users manage their own
- * memberships and no one else's. Error mapping matches the old server: bad
- * body 400, missing bearer 401, WorkOS-off 501, rejected exchange/refresh 401.
+ * access token yet); the org and profile routes verify the bearer themselves —
+ * the user id is ALWAYS the token's `sub`, never request input: users manage
+ * their own memberships and profile and no one else's. Error mapping matches
+ * the old server: bad body 400, missing bearer 401, WorkOS-off 501, rejected
+ * exchange/refresh 401.
  */
 import { bearerFromRequest, verifyToken } from "./auth";
 import type { Env } from "./env";
-import { WorkOsAuthFailed, createOrg, exchange, listOrgs, refresh } from "./workos";
+import { WorkOsAuthFailed, createOrg, exchange, listOrgs, refresh, updateUser } from "./workos";
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -105,6 +107,24 @@ export const handleAuthRoute = async (
       } catch (e) {
         return authFailed(e);
       }
+    }
+  }
+
+  if (parts[1] === "profile" && parts.length === 2 && request.method === "PATCH") {
+    if (!apiKey) return notConfigured();
+    const token = bearerFromRequest(request);
+    const caller = token ? await verifyToken(env, token) : undefined;
+    if (!caller) return json({ error: "invalid or missing bearer token" }, 401);
+    const body = await bodyJson<{ name?: string }>(request);
+    if (typeof body?.name !== "string") return json({ error: "missing name" }, 400);
+    const trimmed = body.name.trim();
+    if (trimmed.length === 0 || trimmed.length > 80) {
+      return json({ error: "name must be 1-80 characters" }, 400);
+    }
+    try {
+      return json({ user: await updateUser(apiKey, caller.userId, trimmed) });
+    } catch (e) {
+      return authFailed(e);
     }
   }
 

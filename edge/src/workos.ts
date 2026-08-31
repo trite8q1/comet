@@ -17,18 +17,23 @@ const API = "https://api.workos.com";
  * server's WorkOsAuthFailed). */
 export class WorkOsAuthFailed extends Error {}
 
+export interface AuthUser {
+  readonly id: string;
+  readonly email: string;
+  readonly firstName: string | null;
+  readonly lastName: string | null;
+}
+
 export interface ExchangeResult {
-  readonly user: {
-    readonly id: string;
-    readonly email: string;
-    readonly firstName: string | null;
-    readonly lastName: string | null;
-  };
+  readonly user: AuthUser;
   readonly accessToken: string;
   readonly refreshToken: string;
 }
 
 export interface RefreshResult {
+  /** The current profile — a device renamed elsewhere catches up at its
+   * next refresh. */
+  readonly user: AuthUser;
   readonly accessToken: string;
   readonly refreshToken: string;
 }
@@ -69,15 +74,40 @@ const failed = async (res: Response): Promise<never> => {
   throw new WorkOsAuthFailed(message);
 };
 
-const post = async (apiKey: string, path: string, body: unknown): Promise<Response> =>
+const send = async (
+  apiKey: string,
+  method: "POST" | "PUT",
+  path: string,
+  body: unknown
+): Promise<Response> =>
   fetch(`${API}${path}`, {
-    method: "POST",
+    method,
     headers: {
       authorization: `Bearer ${apiKey}`,
       "content-type": "application/json"
     },
     body: JSON.stringify(body)
   });
+
+const post = (apiKey: string, path: string, body: unknown): Promise<Response> =>
+  send(apiKey, "POST", path, body);
+
+const toUser = (u: WireUser): AuthUser => ({
+  id: u.id,
+  email: u.email,
+  firstName: u.first_name,
+  lastName: u.last_name
+});
+
+/** One display name → WorkOS's split fields: the first word is the first
+ * name, the rest (if any) the last name. Comet only ever shows them joined,
+ * so the display round-trips exactly. */
+export const splitName = (name: string): { firstName: string; lastName: string | null } => {
+  const words = name.trim().split(/\s+/);
+  const firstName = words[0] ?? "";
+  const rest = words.slice(1).join(" ");
+  return { firstName, lastName: rest.length > 0 ? rest : null };
+};
 
 /** `authenticateWithCode`: WorkOS code → tokens + user. */
 export const exchange = async (env: Env, apiKey: string, code: string): Promise<ExchangeResult> => {
@@ -93,16 +123,7 @@ export const exchange = async (env: Env, apiKey: string, code: string): Promise<
   });
   if (!res.ok) return failed(res);
   const r = (await res.json()) as WireAuthResponse;
-  return {
-    user: {
-      id: r.user.id,
-      email: r.user.email,
-      firstName: r.user.first_name,
-      lastName: r.user.last_name
-    },
-    accessToken: r.access_token,
-    refreshToken: r.refresh_token
-  };
+  return { user: toUser(r.user), accessToken: r.access_token, refreshToken: r.refresh_token };
 };
 
 /** `authenticateWithRefreshToken`; passing `organizationId` scopes the session
@@ -126,7 +147,18 @@ export const refresh = async (
   });
   if (!res.ok) return failed(res);
   const r = (await res.json()) as WireAuthResponse;
-  return { accessToken: r.access_token, refreshToken: r.refresh_token };
+  return { user: toUser(r.user), accessToken: r.access_token, refreshToken: r.refresh_token };
+};
+
+/** Rename the user (WorkOS "Update a User"); returns the updated profile. */
+export const updateUser = async (apiKey: string, userId: string, name: string): Promise<AuthUser> => {
+  const { firstName, lastName } = splitName(name);
+  const res = await send(apiKey, "PUT", `/user_management/users/${encodeURIComponent(userId)}`, {
+    first_name: firstName,
+    last_name: lastName
+  });
+  if (!res.ok) return failed(res);
+  return toUser((await res.json()) as WireUser);
 };
 
 /** The user's active organization memberships. */

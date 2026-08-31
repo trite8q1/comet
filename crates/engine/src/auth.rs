@@ -50,6 +50,35 @@ pub struct AuthUser {
     pub name: Option<String>,
 }
 
+/// The edge's user shape (`/auth/exchange`, `/auth/refresh`, `/auth/profile`).
+/// WorkOS keeps first and last names apart; Comet only ever shows them joined.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireUser {
+    id: String,
+    email: String,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<String>,
+}
+
+impl WireUser {
+    fn into_auth_user(self) -> AuthUser {
+        let name = [self.first_name, self.last_name]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        AuthUser {
+            id: self.id,
+            email: self.email,
+            name: (!name.is_empty()).then_some(name),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrgMembership {
@@ -547,6 +576,49 @@ impl Auth {
         Ok(())
     }
 
+    /// Rename the signed-in user at WorkOS. The AuthStatus stream carries the new
+    /// profile to this engine's clients; other devices pick it up at their next refresh.
+    pub async fn update_name(&self, name: &str) -> Result<(), EngineError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 80 {
+            return Err(EngineError::Other("name must be 1-80 characters".into()));
+        }
+        if self.inner.workos.is_none() {
+            // Dev mode has no edge session: rename the in-memory user so the UI works.
+            self.inner.state_tx.send_modify(|state| {
+                if let AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } =
+                    state
+                {
+                    user.name = Some(name.to_string());
+                }
+            });
+            return Ok(());
+        }
+        #[derive(Deserialize)]
+        struct Updated {
+            user: WireUser,
+        }
+        let updated: Updated = self
+            .authed_json(
+                reqwest::Method::PATCH,
+                "/auth/profile",
+                Some(serde_json::json!({ "name": name })),
+            )
+            .await?;
+        let user = updated.user.into_auth_user();
+        let org_id = {
+            let mut stored = lock(&self.inner.stored);
+            let Some(session) = stored.as_mut() else {
+                return Err(EngineError::Other("not signed in".into()));
+            };
+            session.user = user.clone();
+            session.org_id.clone()
+        };
+        self.persist(lock(&self.inner.stored).as_ref());
+        self.inner.state_tx.send_replace(state_for(user, org_id));
+        Ok(())
+    }
+
     // -- internals ----------------------------------------------------------
 
     fn begin_sign_in(&self, redirect_uri: &str) -> String {
@@ -584,16 +656,6 @@ impl Auth {
     async fn exchange_code(&self, code: &str) -> Result<SignInResult, EngineError> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct WireUser {
-            id: String,
-            email: String,
-            #[serde(default)]
-            first_name: Option<String>,
-            #[serde(default)]
-            last_name: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
         struct Exchange {
             user: WireUser,
             access_token: String,
@@ -621,18 +683,8 @@ impl Auth {
             .json()
             .await
             .map_err(|e| EngineError::Other(format!("malformed exchange response: {e}")))?;
-        let name = [body.user.first_name, body.user.last_name]
-            .into_iter()
-            .flatten()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
         Ok(SignInResult {
-            user: AuthUser {
-                id: body.user.id,
-                email: body.user.email,
-                name: (!name.is_empty()).then_some(name),
-            },
+            user: body.user.into_auth_user(),
             access_token: body.access_token,
             refresh_token: body.refresh_token,
         })
@@ -738,6 +790,9 @@ impl Auth {
         struct Tokens {
             access_token: String,
             refresh_token: String,
+            /// Absent from an edge that predates profile edits.
+            #[serde(default)]
+            user: Option<WireUser>,
         }
         let tokens: Tokens = res
             .json()
@@ -747,20 +802,28 @@ impl Auth {
         let entry = AccessEntry::fresh(tokens.access_token.clone());
         tracing::info!(ttl_s = entry.ttl.as_secs(), "auth: access token refreshed");
         *lock(&self.inner.access) = Some(entry);
-        let (user, org_changed) = {
+        let fresh_user = tokens.user.map(WireUser::into_auth_user);
+        let (user, state_changed) = {
             let mut stored = lock(&self.inner.stored);
             match stored.as_mut() {
                 Some(session) => {
-                    let changed = session.org_id != org_id;
+                    let mut changed = session.org_id != org_id;
                     session.refresh_token = tokens.refresh_token;
                     session.org_id = org_id.clone();
+                    // A profile renamed on another device lands here.
+                    if let Some(user) = fresh_user
+                        && user != session.user
+                    {
+                        session.user = user;
+                        changed = true;
+                    }
                     (session.user.clone(), changed)
                 }
                 None => return Ok(None), // signed out mid-refresh
             }
         };
         self.persist(lock(&self.inner.stored).as_ref());
-        if org_changed {
+        if state_changed {
             self.inner.state_tx.send_replace(state_for(user, org_id));
         }
         self.inner
@@ -1143,6 +1206,27 @@ mod tests {
         let raw = "http://127.0.0.1:1234/callback?x=a b&y=%";
         assert_eq!(url_decode(&url_encode(raw)), raw);
         assert_eq!(url_encode("a b"), "a%20b");
+    }
+
+    #[test]
+    fn wire_user_joins_split_names() {
+        let joined = |first: Option<&str>, last: Option<&str>| {
+            WireUser {
+                id: "u1".into(),
+                email: "u@x".into(),
+                first_name: first.map(str::to_string),
+                last_name: last.map(str::to_string),
+            }
+            .into_auth_user()
+            .name
+        };
+        assert_eq!(
+            joined(Some("Mary"), Some("Ann Smith")).as_deref(),
+            Some("Mary Ann Smith")
+        );
+        assert_eq!(joined(Some("Cher"), None).as_deref(), Some("Cher"));
+        assert_eq!(joined(None, Some("Smith")).as_deref(), Some("Smith"));
+        assert_eq!(joined(Some(""), None), None);
     }
 
     #[test]

@@ -11,8 +11,8 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
-    px,
+    AnyElement, Context, Entity, Focusable as _, Hsla, SharedString, Subscription, Task, Window,
+    div, prelude::*, px,
 };
 use std::time::Duration;
 
@@ -176,6 +176,14 @@ impl LoginFlow {
     }
 }
 
+/// The Comet account "Edit name" dialog.
+struct EditNameDialog {
+    input: Entity<ComposerInput>,
+    /// Focus the input on the dialog's first paint (opened without window access).
+    focus_pending: bool,
+    _events: Subscription,
+}
+
 pub struct AccountsPage {
     state: Entity<AppState>,
     /// Which device's logins are shown; `None` = this device (no passthrough).
@@ -189,9 +197,13 @@ pub struct AccountsPage {
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
+    edit_name: Option<EditNameDialog>,
+    /// UpdateProfile in flight.
+    saving_name: bool,
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
+    name_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
 }
@@ -214,9 +226,12 @@ impl AccountsPage {
             login: None,
             error: None,
             code_input,
+            edit_name: None,
+            saving_name: false,
             load_task: None,
             action_task: None,
             poll_task: None,
+            name_task: None,
             _observe: observe,
             _code_events: code_events,
         };
@@ -1113,6 +1128,205 @@ impl AccountsPage {
         Some(popover::modal("add-account-dialog", viewport, card))
     }
 
+    fn open_edit_name(&mut self, cx: &mut Context<Self>) {
+        let current = self
+            .state
+            .read(cx)
+            .auth_user()
+            .and_then(|user| user.name.clone())
+            .unwrap_or_default();
+        let input = cx.new(|cx| ComposerInput::new("Name", cx));
+        input.update(cx, |input, cx| input.set_text(current, cx));
+        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_edit_name(cx);
+            }
+        });
+        self.edit_name = Some(EditNameDialog {
+            input,
+            focus_pending: true,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    fn submit_edit_name(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.edit_name.as_ref() else {
+            return;
+        };
+        let name = dialog.input.read(cx).text().trim().to_string();
+        if name.is_empty() || name.chars().count() > 80 {
+            cx.notify();
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.edit_name = None;
+        self.saving_name = true;
+        self.error = None;
+        self.name_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::UPDATE_PROFILE, serde_json::json!({ "name": name }))
+                .await;
+            this.update(cx, |page, cx| {
+                page.saving_name = false;
+                if let Err(err) = result {
+                    page.error = Some(format!("Rename failed: {err}").into());
+                }
+                // Success needs nothing here: the AuthStatus stream carries the new name.
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// The signed-in Comet user (the account itself, not a CLI login) with the
+    /// rename action; nothing when the workspace has no signed-in user.
+    fn render_profile_section(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::settings::widgets;
+        let user = self.state.read(cx).auth_user()?.clone();
+        let title: SharedString = user
+            .name
+            .clone()
+            .unwrap_or_else(|| user.email.clone())
+            .into();
+        // Same avatar as the sidebar identity row.
+        let initial: SharedString = title
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".into())
+            .into();
+        let identity = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(widgets::row_title(theme, title))
+            .when(user.name.is_some(), |el| {
+                el.child(widgets::meta_line(
+                    theme,
+                    vec![
+                        div()
+                            .child(SharedString::from(user.email))
+                            .into_any_element(),
+                    ],
+                ))
+            });
+        Some(
+            div()
+                .mt(px(24.0))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(14.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from("Comet account")),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("edit-account-name")
+                                .hover(|s| widgets::ghost_hover(theme, s))
+                                .when(self.saving_name, |el| el.opacity(0.5))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if !this.saving_name {
+                                        this.open_edit_name(cx);
+                                    }
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::PEN)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Edit name")),
+                        ),
+                )
+                .child(
+                    widgets::section_card(theme).mt(px(8.0)).child(
+                        widgets::card_row(theme, true)
+                            .child(
+                                div()
+                                    .size(px(28.0))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(theme.text)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.bg)
+                                    .child(initial),
+                            )
+                            .child(identity),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_edit_name_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let dialog = self.edit_name.as_mut()?;
+        if std::mem::take(&mut dialog.focus_pending) {
+            window.focus(&dialog.input.focus_handle(cx), cx);
+        }
+        let input = dialog.input.clone();
+        let card = popover::dialog_card(&theme)
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" {
+                    this.edit_name = None;
+                    cx.notify();
+                }
+            }))
+            .child(popover::dialog_title(&theme, "Edit name"))
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .child(popover::dialog_field(input.into_any_element())),
+            )
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "edit-name-cancel")
+                            .id("edit-name-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.edit_name = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        popover::btn_primary(&theme, "Save")
+                            .id("edit-name-save")
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_edit_name(cx))),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("edit-name-dialog", viewport, card))
+    }
+
     /// A ghost account row (comet settings.agents.tsx `SkeletonRow`): avatar,
     /// email line, two usage-meter ghosts, a badge — same geometry as the real
     /// row so loaded data lands without a layout jump. `dim` fades row two.
@@ -1204,6 +1418,8 @@ impl Render for AccountsPage {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
+        let edit_name_dialog = self.render_edit_name_dialog(window.viewport_size(), window, cx);
+        let profile = self.render_profile_section(&theme, cx);
         let refreshing = matches!(self.snapshot, Loadable::Loading);
         let account_count = self
             .snapshot
@@ -1460,6 +1676,7 @@ impl Render for AccountsPage {
                                 })),
                         )
                     })
+                    .when_some(profile, |el, section| el.child(section))
                     .children(sections)
                     // Footer note (comet: `mt-6 text-[12px] leading-relaxed
                     // text-muted-foreground/60`).
@@ -1478,6 +1695,7 @@ impl Render for AccountsPage {
                     ),
             )
             .when_some(dialog, |el, dialog| el.child(dialog))
+            .when_some(edit_name_dialog, |el, dialog| el.child(dialog))
     }
 }
 
