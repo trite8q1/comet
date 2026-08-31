@@ -81,8 +81,9 @@ impl Render for SidebarViewOptionsTooltip {
 
 #[derive(Clone, Copy)]
 enum SidebarViewRow {
+    /// The folder view ([`SidebarOrganization::ByProjectMerged`] — one folder
+    /// per project name, merged across devices).
     ByProject,
-    ByProjectMerged,
     ByDevice,
     InOneList,
     LastUpdated,
@@ -98,19 +99,13 @@ impl SidebarViewRow {
     fn closes_menu(self) -> bool {
         matches!(
             self,
-            Self::ByProject
-                | Self::ByProjectMerged
-                | Self::ByDevice
-                | Self::InOneList
-                | Self::LastUpdated
-                | Self::Created
+            Self::ByProject | Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
         )
     }
 }
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 9] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 8] = [
     SidebarViewRow::ByProject,
-    SidebarViewRow::ByProjectMerged,
     SidebarViewRow::ByDevice,
     SidebarViewRow::InOneList,
     SidebarViewRow::LastUpdated,
@@ -181,14 +176,15 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
 }
 
 /// A project-folder header (the Codex-style collapsible folder): a leading
-/// folder icon and a primary-weight name, an optional trailing device chip,
-/// then the rotating disclosure chevron. Unlike [`sidebar_disclosure_header`]
-/// there is no full-bleed hairline — folders are objects, not sections, so the
-/// 12px inter-section gap carries the separation and keeps the list uncluttered.
+/// folder icon and a primary-weight name, an optional trailing attention dot
+/// (the folder's most urgent nested status), then the rotating disclosure
+/// chevron. Unlike [`sidebar_disclosure_header`] there is no full-bleed
+/// hairline — folders are objects, not sections, so the 12px inter-section
+/// gap carries the separation and keeps the list uncluttered.
 fn sidebar_folder_header(
     theme: &Theme,
     label: SharedString,
-    device_chip: Option<AnyElement>,
+    trailing: Option<AnyElement>,
     chevron: AnyElement,
 ) -> gpui::Div {
     div()
@@ -215,19 +211,21 @@ fn sidebar_folder_header(
                 .text_color(theme.text.opacity(0.8))
                 .child(label),
         )
-        .when_some(device_chip, |el, chip| el.child(chip))
+        .when_some(trailing, |el, chip| el.child(chip))
         .child(chevron)
 }
 
-/// Folder key + display label + no-project flag for a chat in the project
-/// folder views. The key is the space id (ByProject — device-scoped, so a repo
-/// on two machines reads as two folders) or the lowercased project name
-/// (ByProjectMerged — one folder per repo across devices); project-less or
-/// dangling chats share the `~no-project` bucket, labeled "No project".
+/// The "No project" bucket: project-less or dangling chats share it. It is
+/// pinned last in the folder view and never persisted in the manual order.
+pub(super) const NO_PROJECT_KEY: &str = "~no-project";
+
+/// Folder key + display label + no-project flag for a chat in the "By
+/// project" view. The key is the lowercased project name — one folder per
+/// repo across devices; project-less or dangling chats share the
+/// [`NO_PROJECT_KEY`] bucket, labeled "No project".
 fn chat_folder_key(
     state: &crate::state::AppState,
     chat: &comet_proto::Chat,
-    merged: bool,
 ) -> (String, String, bool) {
     let space = state.space_for_chat(chat);
     let no_project = space.is_none();
@@ -236,15 +234,76 @@ fn chat_folder_key(
         None => "No project".to_string(),
     };
     let key = if no_project {
-        "~no-project".to_string()
-    } else if merged {
-        label.to_lowercase()
+        NO_PROJECT_KEY.to_string()
     } else {
-        chat.space_id
-            .clone()
-            .unwrap_or_else(|| "~no-project".to_string())
+        label.to_lowercase()
     };
     (key, label, no_project)
+}
+
+/// Final folder display order plus the newly-seen keys (topmost first, for
+/// persisting). Stored keys keep their stored order; unseen keys (first run,
+/// new projects) go to the TOP in the given recency order; the "No project"
+/// bucket is pinned last and never persisted.
+fn ordered_folder_keys(recency: &[String], stored: &[String]) -> (Vec<String>, Vec<String>) {
+    let has_no_project = recency.iter().any(|key| key == NO_PROJECT_KEY);
+    let new_keys: Vec<String> = recency
+        .iter()
+        .filter(|key| key.as_str() != NO_PROJECT_KEY && !stored.contains(*key))
+        .cloned()
+        .collect();
+    let mut order = new_keys.clone();
+    order.extend(stored.iter().filter(|key| recency.contains(*key)).cloned());
+    if has_no_project {
+        order.push(NO_PROJECT_KEY.to_string());
+    }
+    (order, new_keys)
+}
+
+/// Apply a drag-committed move to the persisted folder order. `visible` is
+/// the on-screen draggable key list (a subsequence of `stored` after the
+/// render pass persisted new keys), `over` the insertion slot among them.
+/// Keys of folders not currently on screen keep their positions.
+fn apply_folder_move(stored: &mut Vec<String>, visible: &[String], key: &str, over: usize) {
+    let Some(from) = visible.iter().position(|k| k.as_str() == key) else {
+        return;
+    };
+    let rest: Vec<&String> = visible.iter().filter(|k| k.as_str() != key).collect();
+    let slot = (if over > from { over - 1 } else { over }).min(rest.len());
+    stored.retain(|k| k.as_str() != key);
+    let insert_at = match rest.get(slot) {
+        Some(next) => stored
+            .iter()
+            .position(|k| k == *next)
+            .unwrap_or(stored.len()),
+        None => rest
+            .last()
+            .and_then(|last| stored.iter().position(|k| k == *last))
+            .map(|p| p + 1)
+            .unwrap_or(stored.len()),
+    };
+    stored.insert(insert_at.min(stored.len()), key.to_string());
+}
+
+/// Insertion slot for a folder drag at `rel_y` (sidebar-list content
+/// coordinates, scroll already applied). `heights` are the rendered section
+/// heights top to bottom ("No project" last when present); each slot's
+/// boundary sits at its section's vertical midpoint. Returns 0..=slots.
+pub(super) fn folder_drop_slot(
+    rel_y: f32,
+    heights: &[f32],
+    gap: f32,
+    top_pad: f32,
+    slots: usize,
+) -> usize {
+    let mut top = top_pad;
+    for (ix, height) in heights.iter().enumerate().take(slots) {
+        if rel_y < top + height * 0.5 {
+            return ix;
+        }
+        top += height + gap;
+    }
+    slots
 }
 
 /// One row of the open dropdown, in display order.
@@ -433,6 +492,52 @@ impl Shell {
                 .into_any_element()
         }
     }
+    /// Track the hovered insertion slot mid folder-drag.
+    pub(super) fn update_folder_drag_over(
+        &mut self,
+        from: usize,
+        over: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match &mut self.sidebar_folder_drag {
+            Some(drag) if drag.over == over => {}
+            Some(drag) => {
+                drag.over = over;
+                cx.notify();
+            }
+            None => {
+                self.sidebar_folder_drag = Some(FolderDragState { from, over });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Commit a folder drop: move the dragged key to the hovered slot within
+    /// the persisted manual order and clear the drag. The FLIP resort glides
+    /// the sections to their new positions on the next frame.
+    pub(super) fn commit_folder_drag(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(drag) = self.sidebar_folder_drag.take() else {
+            return;
+        };
+        // On-screen draggable keys, from the last rendered order ("No
+        // project" excluded — it is pinned).
+        let visible: Vec<String> = self
+            .sidebar_prev_order
+            .iter()
+            .filter_map(|(k, _)| k.strip_prefix("folder:"))
+            .filter(|k| *k != NO_PROJECT_KEY)
+            .map(str::to_string)
+            .collect();
+        apply_folder_move(
+            &mut self.settings.sidebar_folder_order,
+            &visible,
+            key,
+            drag.over,
+        );
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     // ---- space filter ----
 
     /// Set the sidebar's session filter (`None` = All spaces). On the
@@ -616,9 +721,6 @@ impl Shell {
     fn activate_sidebar_view_row(&mut self, row: SidebarViewRow, cx: &mut Context<Self>) {
         match row {
             SidebarViewRow::ByProject => {
-                self.settings.sidebar_organization = SidebarOrganization::ByProject
-            }
-            SidebarViewRow::ByProjectMerged => {
                 self.settings.sidebar_organization = SidebarOrganization::ByProjectMerged
             }
             SidebarViewRow::ByDevice => {
@@ -694,8 +796,7 @@ impl Shell {
         let show_pr = self.settings.sidebar_show_pull_request;
 
         let labels = [
-            "Group by project",
-            "Group by project, all devices",
+            "By project",
             "By device",
             "In one list",
             "Last updated",
@@ -706,7 +807,6 @@ impl Shell {
         ];
         let icons = [
             icons::FOLDER,
-            icons::FOLDER_WITH_FILES,
             icons::LAPTOP,
             icons::LIST,
             icons::CLOCK_CIRCLE,
@@ -716,8 +816,10 @@ impl Shell {
             icons::BOT,
         ];
         let selected = [
-            organization == SidebarOrganization::ByProject,
-            organization == SidebarOrganization::ByProjectMerged,
+            matches!(
+                organization,
+                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+            ),
             organization == SidebarOrganization::ByDevice,
             organization == SidebarOrganization::InOneList,
             sort == SidebarSort::LastUpdated,
@@ -761,8 +863,8 @@ impl Shell {
                 .into_any_element()
             })
             .collect();
-        let show_rows = rows.split_off(6);
-        let sort_rows = rows.split_off(4);
+        let show_rows = rows.split_off(5);
+        let sort_rows = rows.split_off(3);
         let organization_rows = rows;
 
         popover::popover_card(theme)
@@ -1165,20 +1267,24 @@ impl Shell {
                 SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
             )
         {
-            let merged = organization == SidebarOrganization::ByProjectMerged;
-            let mut folders: Vec<(String, bool, Vec<comet_proto::Chat>)> = Vec::new();
+            let mut folders: Vec<(String, Vec<comet_proto::Chat>)> = Vec::new();
             for chat in chats {
-                let (key, _label, no_project) = chat_folder_key(state, &chat, merged);
-                if let Some((_, _, rows)) = folders.iter_mut().find(|(k, _, _)| k == &key) {
+                let (key, _label, _no_project) = chat_folder_key(state, &chat);
+                if let Some((_, rows)) = folders.iter_mut().find(|(k, _)| k == &key) {
                     rows.push(chat);
                 } else {
-                    folders.push((key, no_project, vec![chat]));
+                    folders.push((key, vec![chat]));
                 }
             }
-            folders.sort_by_key(|(_, no_project, _)| *no_project);
+            // The same stable manual order `render_folder_rows` draws,
+            // applied read-only (no persist) so keyboard order never drifts.
+            let recency: Vec<String> = folders.iter().map(|(key, _)| key.clone()).collect();
+            let (order, _new) = ordered_folder_keys(&recency, &self.settings.sidebar_folder_order);
+            folders
+                .sort_by_key(|(key, _)| order.iter().position(|k| k == key).unwrap_or(usize::MAX));
             return folders
                 .into_iter()
-                .flat_map(|(_, _, rows)| rows)
+                .flat_map(|(_, rows)| rows)
                 .map(|chat| chat.id)
                 .collect();
         }
@@ -1434,12 +1540,13 @@ impl Shell {
         rendered
     }
 
-    /// The Codex-style project-folder list for the "All projects" view: one
-    /// collapsible folder per project, chats nested and recency-sorted, each
-    /// folder paging its tail behind "Show N more". Device is named in the
-    /// folder header (ByProject) or per chat (ByProjectMerged, only when a
-    /// folder actually spans devices), and only when more than one device is
-    /// known — a single-machine user sees a clean, deviceless list.
+    /// The "By project" folder list for the "All projects" view: one
+    /// collapsible folder per project name (merged across devices), chats
+    /// nested and sorted inside, each folder paging its tail behind "Show N
+    /// more". Folder positions are manual and STABLE — seeded from recency
+    /// once, then fixed; drag-and-drop rewrites them; activity surfaces as
+    /// the header's attention dot, never as reordering. Chats carry a device
+    /// tag only when their folder actually spans devices.
     fn render_folder_rows(
         &mut self,
         theme: &Theme,
@@ -1449,12 +1556,10 @@ impl Shell {
         const FOLDER_PAGE: usize = 25;
         const PAGER_ROW_HEIGHT: f32 = 32.0;
         let now = Utc::now();
-        let merged = self.settings.sidebar_organization == SidebarOrganization::ByProjectMerged;
         let sort = self.settings.sidebar_sort;
         let show_branch = self.settings.sidebar_show_branch;
         let show_pr = self.settings.sidebar_show_pull_request;
         let show_harness = self.settings.sidebar_show_harness;
-        let multiple_devices = self.state.read(cx).has_multiple_devices();
         let selected = self.state.read(cx).selected_chat.clone();
 
         struct FolderRow {
@@ -1467,7 +1572,6 @@ impl Shell {
         struct Folder {
             key: String,
             label: SharedString,
-            header_device: Option<(SharedString, bool)>,
             no_project: bool,
             rows: Vec<FolderRow>,
         }
@@ -1482,7 +1586,7 @@ impl Shell {
                 .collect();
             chats.sort_by(|left, right| compare_sidebar_chats(sort, &left.1, &right.1));
             for (status, chat) in chats {
-                let (key, label, no_project) = chat_folder_key(state, &chat, merged);
+                let (key, label, no_project) = chat_folder_key(state, &chat);
                 let branch = if show_branch {
                     crate::change_requests::conversation_branch(&chat, &state.spaces)
                         .map(str::trim)
@@ -1507,30 +1611,38 @@ impl Shell {
                 if let Some(folder) = folders.iter_mut().find(|f| f.key == key) {
                     folder.rows.push(row);
                 } else {
-                    // ByProject folders name their owning device when more than
-                    // one device is known; merged folders show device per chat.
-                    let header_device = if merged || no_project || !multiple_devices {
-                        None
-                    } else {
-                        let (name, show_local) = state.device_label(&row.device_id);
-                        Some((SharedString::from(name), show_local))
-                    };
                     folders.push(Folder {
                         key,
                         label: SharedString::from(label),
-                        header_device,
                         no_project,
                         rows: vec![row],
                     });
                 }
             }
         }
-        // "No project" sinks to the bottom; the rest keep the recency/created
-        // order their top chat sorted into (stable — first appearance wins).
-        folders.sort_by_key(|folder| folder.no_project);
+        // Stable manual order: stored positions win; unseen folders (first
+        // run, new projects) go to the top in recency order and are persisted
+        // so they never move again on activity. "No project" is pinned last.
+        let recency: Vec<String> = folders.iter().map(|f| f.key.clone()).collect();
+        let (order, new_keys) = ordered_folder_keys(&recency, &self.settings.sidebar_folder_order);
+        if !new_keys.is_empty() {
+            let mut stored = new_keys;
+            stored.extend(self.settings.sidebar_folder_order.iter().cloned());
+            self.settings.sidebar_folder_order = stored;
+            self.schedule_save(cx);
+        }
+        folders.sort_by_key(|folder| {
+            order
+                .iter()
+                .position(|key| key == &folder.key)
+                .unwrap_or(usize::MAX)
+        });
 
+        let draggable_count = folders.iter().filter(|f| !f.no_project).count();
+        let has_no_project = folders.iter().any(|f| f.no_project);
+        let drag_over = self.sidebar_folder_drag.as_ref().map(|d| d.over);
         let mut rendered: Vec<(String, f32, AnyElement)> = Vec::new();
-        for folder in folders {
+        for (ix, folder) in folders.into_iter().enumerate() {
             let collapse_key = format!("folder:{}", folder.key);
             let motion_key = format!("group:{collapse_key}");
             let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
@@ -1543,14 +1655,22 @@ impl Shell {
                 .max(FOLDER_INITIAL);
             let visible_count = total.min(shown);
             let has_more = total > visible_count;
-            // A merged folder that mixes devices tags each chat with its device.
-            let multi_device_folder = merged && {
+            // A folder that mixes devices tags each chat with its device.
+            let multi_device_folder = {
                 let mut ids = folder.rows.iter().map(|r| r.device_id.as_str());
                 match ids.next() {
                     Some(first) => ids.any(|d| d != first),
                     None => false,
                 }
             };
+            // Most urgent nested status — the header's attention dot. Folders
+            // never move on activity; the dot is what pulls the eye.
+            let urgent = folder
+                .rows
+                .iter()
+                .map(|row| row.status)
+                .min_by_key(|status| crate::state::attention_rank(*status))
+                .unwrap_or(ChatIndicator::Idle);
 
             let mut row_elements: Vec<(f32, AnyElement)> = Vec::new();
             for row in folder.rows.into_iter().take(visible_count) {
@@ -1658,29 +1778,21 @@ impl Shell {
             } else {
                 folder.label.clone()
             };
-            let device_chip: Option<AnyElement> = folder.header_device.map(|(name, show_local)| {
+            let dot: Option<AnyElement> = (urgent != ChatIndicator::Idle).then(|| {
                 div()
+                    .size(px(6.0))
                     .flex_none()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .text_size(crate::typography::ui_rems(10.0))
-                    .text_color(theme.text_muted.opacity(0.7))
-                    .child(name)
-                    .when(show_local, |el| {
-                        el.child(
-                            div()
-                                .text_color(theme.text_muted.opacity(0.45))
-                                .child(SharedString::from("Local")),
-                        )
-                    })
+                    .rounded_full()
+                    .bg(status_dot_color(urgent, theme))
                     .into_any_element()
             });
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let toggle_key = collapse_key.clone();
             let toggle_motion = motion_key.clone();
-            let header = sidebar_folder_header(theme, visible_label, device_chip, chevron)
+            let folder_key = folder.key.clone();
+            let folder_title = folder.label.clone();
+            let draggable = !folder.no_project && draggable_count > 1;
+            let header = sidebar_folder_header(theme, visible_label, dot, chevron)
                 .id(SharedString::from(format!("sidebar-folder-{collapse_key}")))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
@@ -1695,7 +1807,24 @@ impl Shell {
                         this.sidebar_collapsed_groups.remove(&toggle_key);
                     }
                     cx.notify();
-                }));
+                }))
+                // Manual reorder: the header is the drag handle (the surface
+                // tab strip's recipe — payload + ghost chip; the drop targets
+                // live on the sidebar list container).
+                .when(draggable, |el| {
+                    el.on_drag(
+                        FolderDrag {
+                            key: folder_key,
+                            from: ix,
+                            title: folder_title,
+                        },
+                        |payload, _point, _, cx| {
+                            let title = payload.title.clone();
+                            cx.stop_propagation();
+                            cx.new(|_| SurfaceTabGhost { title })
+                        },
+                    )
+                });
             let body = self.render_sidebar_disclosure_body(
                 &motion_key,
                 !collapsed,
@@ -1704,11 +1833,42 @@ impl Shell {
             );
             let height =
                 SIDEBAR_DISCLOSURE_SECTION_HEIGHT + if collapsed { 0.0 } else { body_height };
+            // Insertion line while a folder drags: slot ix sits above section
+            // ix; the slot after the last draggable folder renders as a
+            // bottom line when no "No project" section follows it.
+            let show_top_line = drag_over == Some(ix);
+            let show_bottom_line =
+                drag_over == Some(draggable_count) && !has_no_project && ix + 1 == draggable_count;
             let element = div()
                 .w_full()
+                .relative()
                 .flex()
                 .flex_col()
                 .pt(px(SIDEBAR_SECTION_GAP))
+                .when(show_top_line, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(5.0))
+                            .left(px(Theme::SPACE_SM))
+                            .right(px(Theme::SPACE_SM))
+                            .h(px(2.0))
+                            .rounded_full()
+                            .bg(theme.accent),
+                    )
+                })
+                .when(show_bottom_line, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom(px(-1.0))
+                            .left(px(Theme::SPACE_SM))
+                            .right(px(Theme::SPACE_SM))
+                            .h(px(2.0))
+                            .rounded_full()
+                            .bg(theme.accent),
+                    )
+                })
                 .child(header)
                 .child(body)
                 .into_any_element();
@@ -3456,7 +3616,10 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{chat_folder_key, compare_sidebar_chats, promote_local_device_group};
+    use super::{
+        NO_PROJECT_KEY, apply_folder_move, chat_folder_key, compare_sidebar_chats,
+        folder_drop_slot, ordered_folder_keys, promote_local_device_group,
+    };
     use crate::settings::SidebarSort;
     use crate::state::AppState;
 
@@ -3546,7 +3709,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_keys_group_by_space_or_project_name() {
+    fn folder_keys_merge_by_project_name() {
         let mut state = AppState::new();
         state.apply_spaces(vec![
             space("s1", "devA", "/home/maps", "gonzocity-maps"),
@@ -3562,43 +3725,85 @@ mod tests {
         let mut loose = chat("loose");
         loose.space_id = None;
 
-        // ByProject: the key is the space id (device-scoped), so the same repo
-        // on two machines reads as two folders that share a display label.
+        // One folder per project name, across devices.
         assert_eq!(
-            chat_folder_key(&state, &a, false),
-            ("s1".to_string(), "gonzocity-maps".to_string(), false)
+            chat_folder_key(&state, &a),
+            (
+                "gonzocity-maps".to_string(),
+                "gonzocity-maps".to_string(),
+                false
+            )
         );
+        assert_eq!(chat_folder_key(&state, &b).0, "gonzocity-maps");
+        // Project-less chats share the pinned "No project" bucket.
         assert_eq!(
-            chat_folder_key(&state, &b, false),
-            ("s2".to_string(), "gonzocity-maps".to_string(), false)
-        );
-        // Merged: the key is the lowercased project name, so both machines fall
-        // into one folder.
-        assert_eq!(chat_folder_key(&state, &a, true).0, "gonzocity-maps");
-        assert_eq!(chat_folder_key(&state, &b, true).0, "gonzocity-maps");
-        // Project-less chats share the "No project" bucket in either mode.
-        assert_eq!(
-            chat_folder_key(&state, &loose, false),
-            ("~no-project".to_string(), "No project".to_string(), true)
-        );
-        assert_eq!(
-            chat_folder_key(&state, &loose, true).0,
-            "~no-project".to_string()
+            chat_folder_key(&state, &loose),
+            (NO_PROJECT_KEY.to_string(), "No project".to_string(), true)
         );
     }
 
     #[test]
-    fn device_label_marks_local_and_gates_on_device_count() {
+    fn device_label_marks_the_local_machine() {
         let mut state = AppState::new();
-        // A lone local device needs no disambiguation.
-        state.apply_devices(vec![device("devA", "Mac Studio")]);
-        state.local_device_id = Some("devA".into());
-        assert!(!state.has_multiple_devices());
-
-        // Two devices: labels add information, and the local one wears "Local".
         state.apply_devices(vec![device("devA", "Mac Studio"), device("devB", "Air")]);
-        assert!(state.has_multiple_devices());
+        state.local_device_id = Some("devA".into());
         assert_eq!(state.device_label("devA"), ("Mac Studio".to_string(), true));
         assert_eq!(state.device_label("devB"), ("Air".to_string(), false));
+    }
+
+    fn keys(list: &[&str]) -> Vec<String> {
+        list.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn stored_folder_order_wins_and_new_keys_prepend() {
+        let recency = keys(&["c", "a", "b", NO_PROJECT_KEY]);
+        let stored = keys(&["a", "b"]);
+        let (order, new) = ordered_folder_keys(&recency, &stored);
+        assert_eq!(order, keys(&["c", "a", "b", NO_PROJECT_KEY]));
+        assert_eq!(new, keys(&["c"]));
+
+        // First run: pure recency seed, "No project" last, all persisted.
+        let (order, new) = ordered_folder_keys(&recency, &[]);
+        assert_eq!(order, keys(&["c", "a", "b", NO_PROJECT_KEY]));
+        assert_eq!(new, keys(&["c", "a", "b"]));
+
+        // Vanished stored keys are skipped on screen but stay persistable.
+        let stored = keys(&["gone", "b", "a"]);
+        let (order, new) = ordered_folder_keys(&keys(&["a", "b"]), &stored);
+        assert_eq!(order, keys(&["b", "a"]));
+        assert!(new.is_empty());
+    }
+
+    #[test]
+    fn folder_move_respects_vanished_keys() {
+        let mut stored = keys(&["a", "gone", "b", "c"]);
+        // On-screen: a, b, c. Drag "a" to the slot after "b" (over = 2).
+        apply_folder_move(&mut stored, &keys(&["a", "b", "c"]), "a", 2);
+        assert_eq!(stored, keys(&["gone", "b", "a", "c"]));
+
+        // Drag "c" to the top.
+        let mut stored = keys(&["a", "gone", "b", "c"]);
+        apply_folder_move(&mut stored, &keys(&["a", "b", "c"]), "c", 0);
+        assert_eq!(stored, keys(&["c", "a", "gone", "b"]));
+
+        // Drop past the end lands last among the visibles.
+        let mut stored = keys(&["a", "b", "c"]);
+        apply_folder_move(&mut stored, &keys(&["a", "b", "c"]), "a", 3);
+        assert_eq!(stored, keys(&["b", "c", "a"]));
+    }
+
+    #[test]
+    fn folder_drop_slot_quantizes_by_section_midpoints() {
+        let heights = [40.0, 60.0, 40.0];
+        // Above the first midpoint (4 + 20): slot 0.
+        assert_eq!(folder_drop_slot(10.0, &heights, 2.0, 4.0, 3), 0);
+        // Past it: slot 1 until the second midpoint (46 + 30 = 76).
+        assert_eq!(folder_drop_slot(50.0, &heights, 2.0, 4.0, 3), 1);
+        assert_eq!(folder_drop_slot(80.0, &heights, 2.0, 4.0, 3), 2);
+        // Below everything clamps to the slot count.
+        assert_eq!(folder_drop_slot(500.0, &heights, 2.0, 4.0, 3), 3);
+        // Fewer slots than sections ("No project" pinned last).
+        assert_eq!(folder_drop_slot(500.0, &heights, 2.0, 4.0, 2), 2);
     }
 }

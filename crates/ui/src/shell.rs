@@ -656,6 +656,21 @@ impl Render for SurfaceTabGhost {
             .child(div().truncate().child(self.title.clone()))
     }
 }
+/// The dragged sidebar project-folder payload ("By project" manual reorder).
+pub(super) struct FolderDrag {
+    pub(super) key: String,
+    pub(super) from: usize,
+    pub(super) title: SharedString,
+}
+
+/// Live drag-over state for the folder list: `over` is the insertion slot
+/// among draggable folders (0..=count). No slide tween — the drop slot is
+/// marked by an insertion line; the FLIP resort glides after commit.
+pub(super) struct FolderDragState {
+    pub(super) from: usize,
+    pub(super) over: usize,
+}
+
 /// Drag marker for the terminal-panel height handle.
 struct TerminalResize;
 
@@ -1019,6 +1034,8 @@ pub struct Shell {
     /// same organization + id folder key as `sidebar_collapsed_groups`. Absent
     /// = the initial page; each click reveals another page. Session-transient.
     pub(super) sidebar_folder_shown: std::collections::HashMap<String, usize>,
+    /// In-flight folder drag ("By project" manual reorder), `None` at rest.
+    pub(super) sidebar_folder_drag: Option<FolderDragState>,
     /// In-flight disclosure tweens, shared by device groups and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -1324,6 +1341,7 @@ impl Shell {
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
             sidebar_folder_shown: std::collections::HashMap::new(),
+            sidebar_folder_drag: None,
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
             terminal: None,
@@ -4443,6 +4461,14 @@ impl Shell {
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
 
+        // Folder drag-and-drop targets only exist on the "By project" view of
+        // All projects — a filtered or flat list has nothing to reorder.
+        let folder_drag_enabled = self.settings.space_filter.is_none()
+            && matches!(
+                self.settings.sidebar_organization,
+                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+            );
+
         div()
             .w(px(self.settings.sidebar_width))
             .h_full()
@@ -4474,6 +4500,50 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
+                            // Folder drag: this container owns the drop
+                            // targets; the folder headers are the handles.
+                            // Drop math mirrors the surface-tab strip's,
+                            // turned vertical over the last rendered keyed
+                            // heights.
+                            .when(folder_drag_enabled, |el| {
+                                let scroll = self.sidebar_scroll.clone();
+                                el.on_drag_move::<FolderDrag>(cx.listener(
+                                    move |this, event: &gpui::DragMoveEvent<FolderDrag>, _, cx| {
+                                        let payload = event.drag(cx);
+                                        let from = payload.from;
+                                        let rel_y = f32::from(event.event.position.y)
+                                            - f32::from(event.bounds.top())
+                                            - f32::from(scroll.offset().y);
+                                        let heights: Vec<f32> = this
+                                            .sidebar_prev_order
+                                            .iter()
+                                            .map(|(_, height)| *height)
+                                            .collect();
+                                        let slots = this
+                                            .sidebar_prev_order
+                                            .iter()
+                                            .filter(|(key, _)| {
+                                                key.strip_prefix("folder:")
+                                                    .is_some_and(|k| k != spaces::NO_PROJECT_KEY)
+                                            })
+                                            .count();
+                                        let over = spaces::folder_drop_slot(
+                                            rel_y,
+                                            &heights,
+                                            SIDEBAR_LIST_GAP,
+                                            4.0,
+                                            slots,
+                                        );
+                                        this.update_folder_drag_over(from, over, cx);
+                                    },
+                                ))
+                                .on_drop::<FolderDrag>(
+                                    cx.listener(|this, payload: &FolderDrag, _, cx| {
+                                        let key = payload.key.clone();
+                                        this.commit_folder_drag(&key, cx);
+                                    }),
+                                )
+                            })
                             // No "Sessions" header (user request) — the list
                             // is the whole column; a little air stands in.
                             .pt(px(4.0))

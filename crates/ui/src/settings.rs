@@ -170,13 +170,14 @@ fn flush_latest(cx: &mut App) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SidebarOrganization {
-    /// Folders: one collapsible folder per project (a `Space`, which is
-    /// device-scoped). The same repo on two machines reads as two folders,
-    /// each labeled with its device.
-    #[default]
+    /// Legacy persisted value (the short-lived per-device folder mode). It
+    /// recreated duplicate-project confusion and is normalized to
+    /// [`Self::ByProjectMerged`] on load.
     ByProject,
-    /// Folders: one collapsible folder per project *name*, merging a repo
-    /// across devices; each chat carries its device.
+    /// "By project": one collapsible folder per project *name*, merging a
+    /// repo across devices; chats carry their device when a folder spans
+    /// machines. Folder positions are manual ([`UiSettings::sidebar_folder_order`]).
+    #[default]
     ByProjectMerged,
     ByDevice,
     InOneList,
@@ -229,6 +230,12 @@ pub struct UiSettings {
     /// list. Kept for file compatibility; no longer read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
+    /// Manual order of the "By project" folder list (merged-folder keys,
+    /// topmost first). Seeded from recency when folders first materialize;
+    /// new projects prepend; drag-and-drop rewrites it. Keys of vanished
+    /// folders are kept so a returning project regains its slot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidebar_folder_order: Vec<String>,
     /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -275,7 +282,7 @@ impl Default for UiSettings {
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             sidebar_grouped: false,
-            sidebar_organization: SidebarOrganization::ByProject,
+            sidebar_organization: SidebarOrganization::ByProjectMerged,
             sidebar_sort: SidebarSort::LastUpdated,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
@@ -285,6 +292,7 @@ impl Default for UiSettings {
             space_filter: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
+            sidebar_folder_order: Vec::new(),
             sound_enabled: true,
             notifications_enabled: true,
             notifications_background_only: true,
@@ -681,6 +689,9 @@ pub fn badge_combo_on(mac: bool, combo: &str) -> String {
 impl UiSettings {
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
     pub fn clamped(mut self) -> Self {
+        if self.sidebar_organization == SidebarOrganization::ByProject {
+            self.sidebar_organization = SidebarOrganization::ByProjectMerged;
+        }
         self.sidebar_width = clamp_or(
             self.sidebar_width,
             SIDEBAR_MIN,
@@ -781,6 +792,7 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
+            sidebar_folder_order: vec!["comet".to_string(), "aether".to_string()],
             sound_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,
@@ -840,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn project_organization_loads_as_folders() {
+    fn legacy_per_device_folders_normalize_to_merged() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
@@ -850,7 +862,7 @@ mod tests {
 
         assert_eq!(
             UiSettings::load(dir.path()).sidebar_organization,
-            SidebarOrganization::ByProject
+            SidebarOrganization::ByProjectMerged
         );
     }
 

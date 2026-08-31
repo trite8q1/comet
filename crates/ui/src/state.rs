@@ -615,7 +615,12 @@ fn demo_spaces(now: DateTime<Utc>) -> Vec<Space> {
         // "comet" is worked on from every machine (laptop, Studio, VPS), so the
         // merged view folds all three into one folder while the default view
         // keeps them separate per device.
-        space("demo-studio-comet", "demo-studio", "/Users/nico/dev/comet", "comet"),
+        space(
+            "demo-studio-comet",
+            "demo-studio",
+            "/Users/nico/dev/comet",
+            "comet",
+        ),
         space(
             "demo-studio-design",
             "demo-studio",
@@ -635,59 +640,160 @@ fn demo_spaces(now: DateTime<Utc>) -> Vec<Space> {
 fn demo_chats(now: DateTime<Utc>) -> Vec<Chat> {
     use comet_proto::HarnessId::{self, ClaudeCode, Codex, Cursor};
     use comet_proto::SandboxLevel;
-    let chat =
-        |id: &str, device: &str, space: &str, title: &str, harness: HarnessId, branch: &str, age_h: i64| {
-            Chat {
-                id: id.into(),
-                device_id: device.into(),
-                title: Some(title.into()),
-                archived: false,
-                cwd: None,
-                branch: Some(branch.into()),
-                checkout_id: None,
-                // The sidebar branch line reads source_context.branch.
-                source_context: Some(comet_proto::ConversationSourceContext {
-                    checkout_id: format!("{space}-checkout"),
-                    repo_root: "/repo".into(),
-                    cwd: "/repo".into(),
-                    branch: branch.into(),
-                    head_sha: None,
-                    observed_at: now,
-                }),
-                config: Some(comet_proto::ChatConfig {
-                    harness,
-                    model: None,
-                    reasoning: None,
-                    model_options: Default::default(),
-                    sandbox: SandboxLevel::WorkspaceWrite,
-                }),
-                last_message_preview: None,
-                last_message_at: Some(now - chrono::Duration::hours(age_h)),
-                created_at: now - chrono::Duration::hours(age_h + 100),
-                harness_session_id: None,
-                harness_session_cwd: None,
-                space_id: Some(space.into()),
-                last_seen_at: None,
-                room_gen: None,
-            }
-        };
+    let chat = |id: &str,
+                device: &str,
+                space: &str,
+                title: &str,
+                harness: HarnessId,
+                branch: &str,
+                age_h: i64| {
+        Chat {
+            id: id.into(),
+            device_id: device.into(),
+            title: Some(title.into()),
+            archived: false,
+            cwd: None,
+            branch: Some(branch.into()),
+            checkout_id: None,
+            // The sidebar branch line reads source_context.branch.
+            source_context: Some(comet_proto::ConversationSourceContext {
+                checkout_id: format!("{space}-checkout"),
+                repo_root: "/repo".into(),
+                cwd: "/repo".into(),
+                branch: branch.into(),
+                head_sha: None,
+                observed_at: now,
+            }),
+            config: Some(comet_proto::ChatConfig {
+                harness,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            }),
+            last_message_preview: None,
+            last_message_at: Some(now - chrono::Duration::hours(age_h)),
+            created_at: now - chrono::Duration::hours(age_h + 100),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: Some(space.into()),
+            last_seen_at: None,
+            room_gen: None,
+        }
+    };
     vec![
         // Mac Studio — comet (pushes the merged "comet" folder past the pager).
-        chat("demo-studio-comet-1", "demo-studio", "demo-studio-comet", "Port renderer to Metal", ClaudeCode, "feat/metal-renderer", 1),
-        chat("demo-studio-comet-2", "demo-studio", "demo-studio-comet", "Fix GPUI memory leak", Codex, "fix/gpui-leak", 6),
-        chat("demo-studio-comet-3", "demo-studio", "demo-studio-comet", "Profile cold-start time", ClaudeCode, "perf/startup", 22),
-        chat("demo-studio-comet-4", "demo-studio", "demo-studio-comet", "Wire up presence heartbeat", ClaudeCode, "feat/presence", 44),
+        chat(
+            "demo-studio-comet-1",
+            "demo-studio",
+            "demo-studio-comet",
+            "Port renderer to Metal",
+            ClaudeCode,
+            "feat/metal-renderer",
+            1,
+        ),
+        chat(
+            "demo-studio-comet-2",
+            "demo-studio",
+            "demo-studio-comet",
+            "Fix GPUI memory leak",
+            Codex,
+            "fix/gpui-leak",
+            6,
+        ),
+        chat(
+            "demo-studio-comet-3",
+            "demo-studio",
+            "demo-studio-comet",
+            "Profile cold-start time",
+            ClaudeCode,
+            "perf/startup",
+            22,
+        ),
+        chat(
+            "demo-studio-comet-4",
+            "demo-studio",
+            "demo-studio-comet",
+            "Wire up presence heartbeat",
+            ClaudeCode,
+            "feat/presence",
+            44,
+        ),
         // Mac Studio — design-system
-        chat("demo-studio-design-1", "demo-studio", "demo-studio-design", "Token pipeline overhaul", ClaudeCode, "feat/token-pipeline", 3),
-        chat("demo-studio-design-2", "demo-studio", "demo-studio-design", "Dark mode contrast audit", Cursor, "chore/dark-mode-audit", 28),
+        chat(
+            "demo-studio-design-1",
+            "demo-studio",
+            "demo-studio-design",
+            "Token pipeline overhaul",
+            ClaudeCode,
+            "feat/token-pipeline",
+            3,
+        ),
+        chat(
+            "demo-studio-design-2",
+            "demo-studio",
+            "demo-studio-design",
+            "Dark mode contrast audit",
+            Cursor,
+            "chore/dark-mode-audit",
+            28,
+        ),
         // Cloud VPS — comet
-        chat("demo-vps-comet-1", "demo-vps", "demo-vps-comet", "Nightly release pipeline", Codex, "ci/nightly", 2),
-        chat("demo-vps-comet-2", "demo-vps", "demo-vps-comet", "Reproduce flaky sync test", ClaudeCode, "fix/flaky-sync", 9),
-        chat("demo-vps-comet-3", "demo-vps", "demo-vps-comet", "Upgrade Loro CRDT", Codex, "chore/loro-upgrade", 40),
+        chat(
+            "demo-vps-comet-1",
+            "demo-vps",
+            "demo-vps-comet",
+            "Nightly release pipeline",
+            Codex,
+            "ci/nightly",
+            2,
+        ),
+        chat(
+            "demo-vps-comet-2",
+            "demo-vps",
+            "demo-vps-comet",
+            "Reproduce flaky sync test",
+            ClaudeCode,
+            "fix/flaky-sync",
+            9,
+        ),
+        chat(
+            "demo-vps-comet-3",
+            "demo-vps",
+            "demo-vps-comet",
+            "Upgrade Loro CRDT",
+            Codex,
+            "chore/loro-upgrade",
+            40,
+        ),
         // Cloud VPS — gonzocity-maps
-        chat("demo-vps-maps-1", "demo-vps", "demo-vps-maps", "GPX import support", ClaudeCode, "feat/gpx-import", 4),
-        chat("demo-vps-maps-2", "demo-vps", "demo-vps-maps", "Staging deploy", Codex, "deploy/staging", 33),
-        chat("demo-vps-maps-3", "demo-vps", "demo-vps-maps", "Tile cache warmup", ClaudeCode, "perf/tile-cache", 52),
+        chat(
+            "demo-vps-maps-1",
+            "demo-vps",
+            "demo-vps-maps",
+            "GPX import support",
+            ClaudeCode,
+            "feat/gpx-import",
+            4,
+        ),
+        chat(
+            "demo-vps-maps-2",
+            "demo-vps",
+            "demo-vps-maps",
+            "Staging deploy",
+            Codex,
+            "deploy/staging",
+            33,
+        ),
+        chat(
+            "demo-vps-maps-3",
+            "demo-vps",
+            "demo-vps-maps",
+            "Tile cache warmup",
+            ClaudeCode,
+            "perf/tile-cache",
+            52,
+        ),
     ]
 }
 
@@ -1378,13 +1484,6 @@ impl AppState {
             .device_name(&space.device_id)
             .unwrap_or("Unknown device");
         (format!("@ {device}"), offline)
-    }
-
-    /// More than the local device is known — device labels add information and
-    /// should be shown. A lone local device needs no disambiguation, so the
-    /// folder sidebar stays clean for single-machine users.
-    pub fn has_multiple_devices(&self) -> bool {
-        self.devices.len() > 1
     }
 
     /// The device label for a folder/chat, matching the composer's device chip
