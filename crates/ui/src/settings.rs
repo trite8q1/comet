@@ -230,12 +230,6 @@ pub struct UiSettings {
     /// list. Kept for file compatibility; no longer read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
-    /// Manual order of the "By project" folder list (merged-folder keys,
-    /// topmost first). Seeded from recency when folders first materialize;
-    /// new projects prepend; drag-and-drop rewrites it. Keys of vanished
-    /// folders are kept so a returning project regains its slot.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sidebar_folder_order: Vec<String>,
     /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -292,7 +286,6 @@ impl Default for UiSettings {
             space_filter: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
-            sidebar_folder_order: Vec::new(),
             sound_enabled: true,
             notifications_enabled: true,
             notifications_background_only: true,
@@ -792,7 +785,6 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
-            sidebar_folder_order: vec!["comet".to_string(), "aether".to_string()],
             sound_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,

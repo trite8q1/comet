@@ -221,8 +221,8 @@ fn sidebar_folder_header(
 }
 
 /// The "No project" bucket: project-less or dangling chats share it. It is
-/// pinned last in the folder view and never persisted in the manual order.
-pub(super) const NO_PROJECT_KEY: &str = "~no-project";
+/// pinned last in the folder views.
+const NO_PROJECT_KEY: &str = "~no-project";
 
 /// Folder key + display label + no-project flag for a chat in the "By
 /// project" view. The key is the lowercased project name — one folder per
@@ -244,71 +244,6 @@ fn chat_folder_key(
         label.to_lowercase()
     };
     (key, label, no_project)
-}
-
-/// Final folder display order plus the newly-seen keys (topmost first, for
-/// persisting). Stored keys keep their stored order; unseen keys (first run,
-/// new projects) go to the TOP in the given recency order; the "No project"
-/// bucket is pinned last and never persisted.
-fn ordered_folder_keys(recency: &[String], stored: &[String]) -> (Vec<String>, Vec<String>) {
-    let has_no_project = recency.iter().any(|key| key == NO_PROJECT_KEY);
-    let new_keys: Vec<String> = recency
-        .iter()
-        .filter(|key| key.as_str() != NO_PROJECT_KEY && !stored.contains(*key))
-        .cloned()
-        .collect();
-    let mut order = new_keys.clone();
-    order.extend(stored.iter().filter(|key| recency.contains(*key)).cloned());
-    if has_no_project {
-        order.push(NO_PROJECT_KEY.to_string());
-    }
-    (order, new_keys)
-}
-
-/// Apply a drag-committed move to the persisted folder order. `visible` is
-/// the on-screen draggable key list (a subsequence of `stored` after the
-/// render pass persisted new keys), `over` the insertion slot among them.
-/// Keys of folders not currently on screen keep their positions.
-fn apply_folder_move(stored: &mut Vec<String>, visible: &[String], key: &str, over: usize) {
-    let Some(from) = visible.iter().position(|k| k.as_str() == key) else {
-        return;
-    };
-    let rest: Vec<&String> = visible.iter().filter(|k| k.as_str() != key).collect();
-    let slot = (if over > from { over - 1 } else { over }).min(rest.len());
-    stored.retain(|k| k.as_str() != key);
-    let insert_at = match rest.get(slot) {
-        Some(next) => stored
-            .iter()
-            .position(|k| k == *next)
-            .unwrap_or(stored.len()),
-        None => rest
-            .last()
-            .and_then(|last| stored.iter().position(|k| k == *last))
-            .map(|p| p + 1)
-            .unwrap_or(stored.len()),
-    };
-    stored.insert(insert_at.min(stored.len()), key.to_string());
-}
-
-/// Insertion slot for a folder drag at `rel_y` (sidebar-list content
-/// coordinates, scroll already applied). `heights` are the rendered section
-/// heights top to bottom ("No project" last when present); each slot's
-/// boundary sits at its section's vertical midpoint. Returns 0..=slots.
-pub(super) fn folder_drop_slot(
-    rel_y: f32,
-    heights: &[f32],
-    gap: f32,
-    top_pad: f32,
-    slots: usize,
-) -> usize {
-    let mut top = top_pad;
-    for (ix, height) in heights.iter().enumerate().take(slots) {
-        if rel_y < top + height * 0.5 {
-            return ix;
-        }
-        top += height + gap;
-    }
-    slots
 }
 
 /// One row of the open dropdown, in display order.
@@ -497,52 +432,6 @@ impl Shell {
                 .into_any_element()
         }
     }
-    /// Track the hovered insertion slot mid folder-drag.
-    pub(super) fn update_folder_drag_over(
-        &mut self,
-        from: usize,
-        over: usize,
-        cx: &mut Context<Self>,
-    ) {
-        match &mut self.sidebar_folder_drag {
-            Some(drag) if drag.over == over => {}
-            Some(drag) => {
-                drag.over = over;
-                cx.notify();
-            }
-            None => {
-                self.sidebar_folder_drag = Some(FolderDragState { from, over });
-                cx.notify();
-            }
-        }
-    }
-
-    /// Commit a folder drop: move the dragged key to the hovered slot within
-    /// the persisted manual order and clear the drag. The FLIP resort glides
-    /// the sections to their new positions on the next frame.
-    pub(super) fn commit_folder_drag(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(drag) = self.sidebar_folder_drag.take() else {
-            return;
-        };
-        // On-screen draggable keys, from the last rendered order ("No
-        // project" excluded — it is pinned).
-        let visible: Vec<String> = self
-            .sidebar_prev_order
-            .iter()
-            .filter_map(|(k, _)| k.strip_prefix("folder:"))
-            .filter(|k| *k != NO_PROJECT_KEY)
-            .map(str::to_string)
-            .collect();
-        apply_folder_move(
-            &mut self.settings.sidebar_folder_order,
-            &visible,
-            key,
-            drag.over,
-        );
-        self.schedule_save(cx);
-        cx.notify();
-    }
-
     // ---- space filter ----
 
     /// Set the sidebar's session filter (`None` = All spaces). On the
@@ -1281,12 +1170,9 @@ impl Shell {
                     folders.push((key, vec![chat]));
                 }
             }
-            // The same stable manual order `render_folder_rows` draws,
-            // applied read-only (no persist) so keyboard order never drifts.
-            let recency: Vec<String> = folders.iter().map(|(key, _)| key.clone()).collect();
-            let (order, _new) = ordered_folder_keys(&recency, &self.settings.sidebar_folder_order);
-            folders
-                .sort_by_key(|(key, _)| order.iter().position(|k| k == key).unwrap_or(usize::MAX));
+            // Same order `render_folder_rows` draws ("No project" last) so
+            // keyboard order never drifts from the screen.
+            folders.sort_by_key(|(key, _)| key.as_str() == NO_PROJECT_KEY);
             return folders
                 .into_iter()
                 .flat_map(|(_, rows)| rows)
@@ -1548,10 +1434,11 @@ impl Shell {
     /// The "By project" folder list for the "All projects" view: one
     /// collapsible folder per project name (merged across devices), chats
     /// nested and sorted inside, each folder paging its tail behind "Show N
-    /// more". Folder positions are manual and STABLE — seeded from recency
-    /// once, then fixed; drag-and-drop rewrites them; activity surfaces as
-    /// the header's attention dot, never as reordering. Chats carry a device
-    /// tag only when their folder actually spans devices.
+    /// more". Folders order by recency — first appearance in the sorted walk,
+    /// "No project" pinned last — the same model as the archived zone. A
+    /// collapsed folder still signals its most urgent nested status via the
+    /// header's attention dot. Chats carry a device tag only when their
+    /// folder actually spans devices.
     fn render_folder_rows(
         &mut self,
         theme: &Theme,
@@ -1622,29 +1509,12 @@ impl Shell {
                 }
             }
         }
-        // Stable manual order: stored positions win; unseen folders (first
-        // run, new projects) go to the top in recency order and are persisted
-        // so they never move again on activity. "No project" is pinned last.
-        let recency: Vec<String> = folders.iter().map(|f| f.key.clone()).collect();
-        let (order, new_keys) = ordered_folder_keys(&recency, &self.settings.sidebar_folder_order);
-        if !new_keys.is_empty() {
-            let mut stored = new_keys;
-            stored.extend(self.settings.sidebar_folder_order.iter().cloned());
-            self.settings.sidebar_folder_order = stored;
-            self.schedule_save(cx);
-        }
-        folders.sort_by_key(|folder| {
-            order
-                .iter()
-                .position(|key| key == &folder.key)
-                .unwrap_or(usize::MAX)
-        });
+        // "No project" sinks to the bottom; the rest keep the recency/created
+        // order their top chat sorted into (first appearance wins).
+        folders.sort_by_key(|folder| folder.no_project);
 
-        let draggable_count = folders.iter().filter(|f| !f.no_project).count();
-        let has_no_project = folders.iter().any(|f| f.no_project);
-        let drag_over = self.sidebar_folder_drag.as_ref().map(|d| d.over);
         let mut rendered: Vec<(String, f32, AnyElement)> = Vec::new();
-        for (ix, folder) in folders.into_iter().enumerate() {
+        for folder in folders {
             let collapse_key = format!("folder:{}", folder.key);
             let motion_key = format!("group:{collapse_key}");
             let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
@@ -1791,9 +1661,6 @@ impl Shell {
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let toggle_key = collapse_key.clone();
             let toggle_motion = motion_key.clone();
-            let folder_key = folder.key.clone();
-            let folder_title = folder.label.clone();
-            let draggable = !folder.no_project && draggable_count > 1;
             let header = sidebar_folder_header(theme, visible_label, dot, chevron)
                 .id(SharedString::from(format!("sidebar-folder-{collapse_key}")))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1809,24 +1676,7 @@ impl Shell {
                         this.sidebar_collapsed_groups.remove(&toggle_key);
                     }
                     cx.notify();
-                }))
-                // Manual reorder: the header is the drag handle (the surface
-                // tab strip's recipe — payload + ghost chip; the drop targets
-                // live on the sidebar list container).
-                .when(draggable, |el| {
-                    el.on_drag(
-                        FolderDrag {
-                            key: folder_key,
-                            from: ix,
-                            title: folder_title,
-                        },
-                        |payload, _point, _, cx| {
-                            let title = payload.title.clone();
-                            cx.stop_propagation();
-                            cx.new(|_| SurfaceTabGhost { title })
-                        },
-                    )
-                });
+                }));
             let body = self.render_sidebar_disclosure_body(
                 &motion_key,
                 !collapsed,
@@ -1835,42 +1685,11 @@ impl Shell {
             );
             let height =
                 SIDEBAR_DISCLOSURE_SECTION_HEIGHT + if collapsed { 0.0 } else { body_height };
-            // Insertion line while a folder drags: slot ix sits above section
-            // ix; the slot after the last draggable folder renders as a
-            // bottom line when no "No project" section follows it.
-            let show_top_line = drag_over == Some(ix);
-            let show_bottom_line =
-                drag_over == Some(draggable_count) && !has_no_project && ix + 1 == draggable_count;
             let element = div()
                 .w_full()
-                .relative()
                 .flex()
                 .flex_col()
                 .pt(px(SIDEBAR_SECTION_GAP))
-                .when(show_top_line, |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .top(px(5.0))
-                            .left(px(Theme::SPACE_SM))
-                            .right(px(Theme::SPACE_SM))
-                            .h(px(2.0))
-                            .rounded_full()
-                            .bg(theme.accent),
-                    )
-                })
-                .when(show_bottom_line, |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .bottom(px(-1.0))
-                            .left(px(Theme::SPACE_SM))
-                            .right(px(Theme::SPACE_SM))
-                            .h(px(2.0))
-                            .rounded_full()
-                            .bg(theme.accent),
-                    )
-                })
                 .child(header)
                 .child(body)
                 .into_any_element();
@@ -3829,8 +3648,7 @@ mod tests {
     use chrono::{TimeZone as _, Utc};
 
     use super::{
-        NO_PROJECT_KEY, apply_folder_move, chat_folder_key, compare_sidebar_chats,
-        folder_drop_slot, ordered_folder_keys, promote_local_device_group,
+        NO_PROJECT_KEY, chat_folder_key, compare_sidebar_chats, promote_local_device_group,
     };
     use crate::settings::SidebarSort;
     use crate::state::AppState;
@@ -3961,61 +3779,5 @@ mod tests {
         state.local_device_id = Some("devA".into());
         assert_eq!(state.device_label("devA"), ("Mac Studio".to_string(), true));
         assert_eq!(state.device_label("devB"), ("Air".to_string(), false));
-    }
-
-    fn keys(list: &[&str]) -> Vec<String> {
-        list.iter().map(|k| k.to_string()).collect()
-    }
-
-    #[test]
-    fn stored_folder_order_wins_and_new_keys_prepend() {
-        let recency = keys(&["c", "a", "b", NO_PROJECT_KEY]);
-        let stored = keys(&["a", "b"]);
-        let (order, new) = ordered_folder_keys(&recency, &stored);
-        assert_eq!(order, keys(&["c", "a", "b", NO_PROJECT_KEY]));
-        assert_eq!(new, keys(&["c"]));
-
-        // First run: pure recency seed, "No project" last, all persisted.
-        let (order, new) = ordered_folder_keys(&recency, &[]);
-        assert_eq!(order, keys(&["c", "a", "b", NO_PROJECT_KEY]));
-        assert_eq!(new, keys(&["c", "a", "b"]));
-
-        // Vanished stored keys are skipped on screen but stay persistable.
-        let stored = keys(&["gone", "b", "a"]);
-        let (order, new) = ordered_folder_keys(&keys(&["a", "b"]), &stored);
-        assert_eq!(order, keys(&["b", "a"]));
-        assert!(new.is_empty());
-    }
-
-    #[test]
-    fn folder_move_respects_vanished_keys() {
-        let mut stored = keys(&["a", "gone", "b", "c"]);
-        // On-screen: a, b, c. Drag "a" to the slot after "b" (over = 2).
-        apply_folder_move(&mut stored, &keys(&["a", "b", "c"]), "a", 2);
-        assert_eq!(stored, keys(&["gone", "b", "a", "c"]));
-
-        // Drag "c" to the top.
-        let mut stored = keys(&["a", "gone", "b", "c"]);
-        apply_folder_move(&mut stored, &keys(&["a", "b", "c"]), "c", 0);
-        assert_eq!(stored, keys(&["c", "a", "gone", "b"]));
-
-        // Drop past the end lands last among the visibles.
-        let mut stored = keys(&["a", "b", "c"]);
-        apply_folder_move(&mut stored, &keys(&["a", "b", "c"]), "a", 3);
-        assert_eq!(stored, keys(&["b", "c", "a"]));
-    }
-
-    #[test]
-    fn folder_drop_slot_quantizes_by_section_midpoints() {
-        let heights = [40.0, 60.0, 40.0];
-        // Above the first midpoint (4 + 20): slot 0.
-        assert_eq!(folder_drop_slot(10.0, &heights, 2.0, 4.0, 3), 0);
-        // Past it: slot 1 until the second midpoint (46 + 30 = 76).
-        assert_eq!(folder_drop_slot(50.0, &heights, 2.0, 4.0, 3), 1);
-        assert_eq!(folder_drop_slot(80.0, &heights, 2.0, 4.0, 3), 2);
-        // Below everything clamps to the slot count.
-        assert_eq!(folder_drop_slot(500.0, &heights, 2.0, 4.0, 3), 3);
-        // Fewer slots than sections ("No project" pinned last).
-        assert_eq!(folder_drop_slot(500.0, &heights, 2.0, 4.0, 2), 2);
     }
 }

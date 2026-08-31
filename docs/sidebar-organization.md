@@ -105,8 +105,10 @@ Ordering rules for the stable folder view:
 - [x] Manual positions live in a new `sidebar_folder_order` settings field
       (name keys, topmost first). The legacy `space_order` field stays
       untouched — its entries are space ids, a different key space.
+      *(Reversed 2026-08-31, see log: the ordering package was removed.)*
 - [x] Folder attention dot AND the collapsed "(count)" coexist.
 - [x] Drag-and-drop ships in v1 (menu label: "By project").
+      *(Reversed 2026-08-31, see log.)*
 
 ## Decision log
 
@@ -117,3 +119,4 @@ Ordering rules for the stable folder view:
 | 2026-08-31 | Folder-jump problem identified: folder rank rides its newest chat. Two philosophies captured; synthesis proposed, not yet locked. |
 | 2026-08-31 | Synthesis locked and implemented (ADR 0003): single "By project" folder mode (merged, default), stable manual order seeded from recency (new projects prepend, "No project" pinned last), drag-and-drop reorder persisted in `sidebar_folder_order`, attention dot on folder headers. Sort keeps ordering chats inside folders. |
 | 2026-08-31 | Archived zone nests its chats in project folders when the folder view is active: same header/disclosure/per-folder pager as the top zone, dimmed whole; independent collapse state (`archived-folder:` keys). Folder order there is plain recency — no manual order, no drag, no dots (they serve active work). The same project appearing active on top and archived below is lifecycle, not duplication. |
+| 2026-08-31 | Simplification pass: the manual-ordering package removed (drag-and-drop, frozen order, the `sidebar_folder_order` setting). Folders in BOTH zones now order by plain recency — main's model with only the folder UI layer on top. Kept deliberately: the attention dot (it restores status visibility that a collapsed folder would otherwise hide) and the collapsed count. ADR 0003 amended to match. |
