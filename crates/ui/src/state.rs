@@ -681,7 +681,20 @@ fn demo_chats(now: DateTime<Utc>) -> Vec<Chat> {
             room_gen: None,
         }
     };
-    vec![
+    // Settled work: same projects, archived — the archived shelf shows its
+    // grayed folders below the active ones (lifecycle, not duplication).
+    let archived = |id: &str,
+                    device: &str,
+                    space: &str,
+                    title: &str,
+                    harness: HarnessId,
+                    branch: &str,
+                    age_h: i64| {
+        let mut chat = chat(id, device, space, title, harness, branch, age_h);
+        chat.archived = true;
+        chat
+    };
+    let mut chats = vec![
         // Mac Studio — comet (pushes the merged "comet" folder past the pager).
         chat(
             "demo-studio-comet-1",
@@ -794,7 +807,49 @@ fn demo_chats(now: DateTime<Utc>) -> Vec<Chat> {
             "perf/tile-cache",
             52,
         ),
-    ]
+        // Archived — comet (also alive above) and gonzocity-maps.
+        archived(
+            "demo-arch-comet-1",
+            "demo-studio",
+            "demo-studio-comet",
+            "Old renderer spike",
+            ClaudeCode,
+            "spike/renderer",
+            200,
+        ),
+        archived(
+            "demo-arch-comet-2",
+            "demo-vps",
+            "demo-vps-comet",
+            "Evaluate sync libraries",
+            Codex,
+            "research/sync-libs",
+            340,
+        ),
+        archived(
+            "demo-arch-maps-1",
+            "demo-vps",
+            "demo-vps-maps",
+            "Prototype vector tiles",
+            Cursor,
+            "proto/vector-tiles",
+            260,
+        ),
+    ];
+    // One project-less settled chat: lands in the archived "No project"
+    // folder, pinned last.
+    let mut loose = archived(
+        "demo-arch-loose-1",
+        "demo-studio",
+        "demo-studio-comet",
+        "Scratch: harness flags",
+        ClaudeCode,
+        "main",
+        400,
+    );
+    loose.space_id = None;
+    chats.push(loose);
+    chats
 }
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)

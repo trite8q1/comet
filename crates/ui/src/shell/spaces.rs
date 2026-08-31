@@ -128,6 +128,11 @@ const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
+/// Project-folder paging (the active zone and the archived zone's folders):
+/// initial page, the "Show more" step, and the pager row's height.
+const FOLDER_INITIAL: usize = 8;
+const FOLDER_PAGE: usize = 25;
+const PAGER_ROW_HEIGHT: f32 = 32.0;
 pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(120);
 
@@ -1552,9 +1557,6 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
-        const FOLDER_INITIAL: usize = 8;
-        const FOLDER_PAGE: usize = 25;
-        const PAGER_ROW_HEIGHT: f32 = 32.0;
         let now = Utc::now();
         let sort = self.settings.sidebar_sort;
         let show_branch = self.settings.sidebar_show_branch;
@@ -1912,179 +1914,44 @@ impl Shell {
         }
         let total = rows.len();
         let open = self.archived_open;
-        let shown = self.archived_shown.max(INITIAL);
-        let visible_count = total.min(shown);
-        let has_more = total > shown;
-        let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
-            + visible_count as f32 * 36.0
-            + visible_count.saturating_sub(1) as f32 * SIDEBAR_LIST_GAP
-            + if has_more {
-                36.0 + SIDEBAR_LIST_GAP
-            } else {
-                0.0
-            };
-        // Header (t3code settled-shelf toggle): muted 12px label, a hairline
-        // filling the middle, chevron flipping open/closed. The count only
-        // shows while collapsed — expanded, the rows speak for themselves.
-        let label: SharedString = if open {
-            "Archived".into()
+        let selected = self.state.read(cx).selected_chat.clone();
+        let selected_wash = crate::theme::glass_selected_bg();
+        // The archived zone mirrors the active zone's structure: when the
+        // sidebar shows project folders, settled history nests in (grayed)
+        // folders too; a filtered or flat view keeps the flat shelf.
+        let folders_active = filter.is_none()
+            && matches!(
+                self.settings.sidebar_organization,
+                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+            );
+        let (body_height, body): (f32, AnyElement) = if folders_active {
+            self.render_archived_folders(rows, now, selected.as_deref(), selected_wash, theme, cx)
         } else {
-            format!("Archived ({total})").into()
-        };
-        let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
-            .id("archived-toggle")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let was_open = this.archived_open;
-                this.begin_sidebar_disclosure_motion(
-                    "archived",
-                    if was_open { body_height } else { 0.0 },
-                    if was_open { 0.0 } else { body_height },
-                );
-                this.archived_open = !was_open;
-                this.archived_shown = INITIAL;
-                cx.notify();
-            }));
-        let section = div().flex().flex_col().child(header);
-        let body = {
-            let selected = self.state.read(cx).selected_chat.clone();
-            let selected_wash = crate::theme::glass_selected_bg();
+            let shown = self.archived_shown.max(INITIAL);
+            let visible_count = total.min(shown);
+            let has_more = total > shown;
+            let height = SIDEBAR_DISCLOSURE_BODY_INSET
+                + visible_count as f32 * 36.0
+                + visible_count.saturating_sub(1) as f32 * SIDEBAR_LIST_GAP
+                + if has_more {
+                    36.0 + SIDEBAR_LIST_GAP
+                } else {
+                    0.0
+                };
             let mut list = div()
                 .flex()
                 .flex_col()
                 .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
                 .gap(px(SIDEBAR_LIST_GAP));
             for chat in rows.into_iter().take(shown) {
-                let id = chat.id.clone();
-                let hovered = self.archived_hover.as_deref() == Some(id.as_str());
-                let is_selected = selected.as_deref() == Some(id.as_str());
-                let title: SharedString = transcript::single_line(
-                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                )
-                .into();
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let brand = if self.settings.sidebar_show_harness {
-                    chat.config
-                        .as_ref()
-                        .map(|c| crate::pickers::harness_brand_icon(c.harness))
-                } else {
-                    None
-                };
-                // Right slot: time at rest; the Unarchive affordance takes
-                // its place on row hover (t3code: "only the time/jump label
-                // yields to the settle affordance").
-                let right: AnyElement = if hovered {
-                    let restore_id = id.clone();
-                    // Metrics match the active rows' Archive pill exactly
-                    // (18px pill, 11px icon, 10px label, padding bled right)
-                    // — two sizes of the same affordance read as a mistake.
-                    div()
-                        .id(SharedString::from(format!("archived-restore-{id}")))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(4.0))
-                        .h(px(18.0))
-                        .px(px(4.0))
-                        .mr(px(-4.0))
-                        .rounded(px(5.0))
-                        .bg(crate::theme::wash(0.10))
-                        .hover(|s| s.bg(crate::theme::wash(0.18)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_chat_archived(restore_id.clone(), false, cx);
-                        }))
-                        .child(
-                            crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::typography::ui_rems(10.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from("Unarchive")),
-                        )
-                        .into_any_element()
-                } else {
-                    div()
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_muted.opacity(0.55))
-                        .child(time_ago)
-                        .into_any_element()
-                };
-                let hover_id = id.clone();
-                let open_id = id.clone();
-                let menu_id = id.clone();
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("archived-{id}")))
-                        .h(px(36.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP))
-                        .px(px(Theme::SPACE_SM))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
-                        .when(is_selected, |el| el.bg(selected_wash))
-                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
-                        .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
-                            if *entered {
-                                if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
-                                    this.archived_hover = Some(hover_id.clone());
-                                    cx.notify();
-                                }
-                            } else if this.archived_hover.as_deref() == Some(hover_id.as_str()) {
-                                this.archived_hover = None;
-                                cx.notify();
-                            }
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_chat(open_id.clone(), cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                this.chat_menu.open(ChatMenuState {
-                                    chat_id: menu_id.clone(),
-                                    position: event.position,
-                                    page: ChatMenuPage::Root,
-                                });
-                                cx.notify();
-                            }),
-                        )
-                        // Archived history recedes: dimmed mark at rest,
-                        // restored on hover (t3code's grayscale favicon).
-                        .when_some(brand, |el, (mark, tint)| {
-                            el.child(
-                                crate::icons::icon(mark)
-                                    .size(px(SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(if hovered || is_selected {
-                                        tint.unwrap_or(theme.text_muted)
-                                    } else {
-                                        tint.unwrap_or(theme.text_muted).opacity(0.4)
-                                    }),
-                            )
-                        })
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(crate::typography::ui_rems(13.0))
-                                .text_color(if hovered || is_selected {
-                                    theme.text
-                                } else {
-                                    theme.text.opacity(0.55)
-                                })
-                                .child(title),
-                        )
-                        .child(right),
-                );
+                list = list.child(self.render_archived_row(
+                    chat,
+                    now,
+                    selected.as_deref(),
+                    selected_wash,
+                    theme,
+                    cx,
+                ));
             }
             let mut body = div().w_full().flex().flex_col().child(list);
             if has_more {
@@ -2118,11 +1985,356 @@ impl Shell {
                         .child(SharedString::from(format!("Show {remaining} more"))),
                 );
             }
-            body.into_any_element()
+            (height, body.into_any_element())
         };
+        // Header (t3code settled-shelf toggle): muted 12px label, a hairline
+        // filling the middle, chevron flipping open/closed. The count only
+        // shows while collapsed — expanded, the rows speak for themselves.
+        let label: SharedString = if open {
+            "Archived".into()
+        } else {
+            format!("Archived ({total})").into()
+        };
+        let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
+        let header = sidebar_disclosure_header(theme, label, chevron)
+            .id("archived-toggle")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let was_open = this.archived_open;
+                this.begin_sidebar_disclosure_motion(
+                    "archived",
+                    if was_open { body_height } else { 0.0 },
+                    if was_open { 0.0 } else { body_height },
+                );
+                this.archived_open = !was_open;
+                this.archived_shown = INITIAL;
+                cx.notify();
+            }));
         let body = self.render_sidebar_disclosure_body("archived", open, body_height, body);
-        let section = section.pt(px(SIDEBAR_SECTION_GAP)).child(body);
+        let section = div()
+            .flex()
+            .flex_col()
+            .pt(px(SIDEBAR_SECTION_GAP))
+            .child(header)
+            .child(body);
         Some(section.into_any_element())
+    }
+
+    /// The archived zone's folder layout: chats nested in project folders
+    /// that mirror the active zone's (same header cloth, disclosure motion,
+    /// per-folder "Show more") but grayed — settled history recedes. Folder
+    /// order is plain recency (first appearance in the sorted walk); nothing
+    /// is persisted and nothing drags — stability serves the workspace, not
+    /// the graveyard. Collapse keys wear the `archived-folder:` prefix so the
+    /// same project's active and archived folders fold independently (the
+    /// same project appearing in both zones is lifecycle, not duplication).
+    /// Returns the zone body's height and element.
+    fn render_archived_folders(
+        &mut self,
+        rows: Vec<comet_proto::Chat>,
+        now: chrono::DateTime<Utc>,
+        selected: Option<&str>,
+        selected_wash: gpui::Hsla,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> (f32, AnyElement) {
+        struct ArchivedFolder {
+            key: String,
+            label: SharedString,
+            no_project: bool,
+            chats: Vec<comet_proto::Chat>,
+        }
+        let mut folders: Vec<ArchivedFolder> = Vec::new();
+        {
+            let state = self.state.read(cx);
+            for chat in rows {
+                let (key, label, no_project) = chat_folder_key(state, &chat);
+                if let Some(folder) = folders.iter_mut().find(|f| f.key == key) {
+                    folder.chats.push(chat);
+                } else {
+                    folders.push(ArchivedFolder {
+                        key,
+                        label: SharedString::from(label),
+                        no_project,
+                        chats: vec![chat],
+                    });
+                }
+            }
+        }
+        folders.sort_by_key(|folder| folder.no_project);
+
+        let mut zone_height: f32 = 0.0;
+        let mut column = div().w_full().flex().flex_col();
+        for folder in folders {
+            let collapse_key = format!("archived-folder:{}", folder.key);
+            let motion_key = format!("group:{collapse_key}");
+            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+            let total = folder.chats.len();
+            let shown = self
+                .sidebar_folder_shown
+                .get(&collapse_key)
+                .copied()
+                .unwrap_or(FOLDER_INITIAL)
+                .max(FOLDER_INITIAL);
+            let visible_count = total.min(shown);
+            let has_more = total > visible_count;
+            let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
+                + visible_count as f32 * 36.0
+                + SIDEBAR_LIST_GAP * visible_count.saturating_sub(1) as f32
+                + if has_more {
+                    PAGER_ROW_HEIGHT + SIDEBAR_LIST_GAP
+                } else {
+                    0.0
+                };
+
+            let mut rows_column = div()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+                .gap(px(SIDEBAR_LIST_GAP));
+            for chat in folder.chats.into_iter().take(visible_count) {
+                rows_column = rows_column.child(self.render_archived_row(
+                    chat,
+                    now,
+                    selected,
+                    selected_wash,
+                    theme,
+                    cx,
+                ));
+            }
+            let mut body_inner = div().w_full().flex().flex_col().child(rows_column);
+            if has_more {
+                let remaining = (total - visible_count).min(FOLDER_PAGE);
+                let more_key = collapse_key.clone();
+                body_inner = body_inner.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "archived-folder-more-{collapse_key}"
+                        )))
+                        .mt(px(SIDEBAR_LIST_GAP))
+                        .h(px(PAGER_ROW_HEIGHT))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(Theme::SPACE_SM))
+                        .rounded(px(8.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let shown = this
+                                .sidebar_folder_shown
+                                .entry(more_key.clone())
+                                .or_insert(FOLDER_INITIAL);
+                            *shown = (*shown).max(FOLDER_INITIAL) + FOLDER_PAGE;
+                            cx.notify();
+                        }))
+                        .child(icon(icons::PLUS).size(px(12.0)).flex_none())
+                        .child(SharedString::from(format!("Show {remaining} more"))),
+                );
+            }
+
+            let visible_label: SharedString = if collapsed {
+                format!("{} ({total})", folder.label).into()
+            } else {
+                folder.label.clone()
+            };
+            let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
+            let toggle_key = collapse_key.clone();
+            let toggle_motion = motion_key.clone();
+            // The active folders' exact header, dimmed whole — no attention
+            // dot and no drag handle in the graveyard.
+            let header = sidebar_folder_header(theme, visible_label, None, chevron)
+                .opacity(0.55)
+                .id(SharedString::from(format!(
+                    "sidebar-archived-folder-{collapse_key}"
+                )))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
+                    this.begin_sidebar_disclosure_motion(
+                        &toggle_motion,
+                        if was_open { body_height } else { 0.0 },
+                        if was_open { 0.0 } else { body_height },
+                    );
+                    if was_open {
+                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                    } else {
+                        this.sidebar_collapsed_groups.remove(&toggle_key);
+                    }
+                    cx.notify();
+                }));
+            let body = self.render_sidebar_disclosure_body(
+                &motion_key,
+                !collapsed,
+                body_height,
+                body_inner.into_any_element(),
+            );
+            // The zone's own frame is not animated, so track a folder's
+            // in-flight tween height — otherwise the shelf snaps to the
+            // target and clips the folder mid-collapse.
+            let resting = if collapsed { 0.0 } else { body_height };
+            let effective = self
+                .sidebar_disclosure_motion
+                .get(&motion_key)
+                .copied()
+                .filter(|motion| motion.animating())
+                .map(SidebarDisclosureMotion::current)
+                .unwrap_or(resting);
+            zone_height += SIDEBAR_DISCLOSURE_SECTION_HEIGHT + effective;
+            column = column.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .pt(px(SIDEBAR_SECTION_GAP))
+                    .child(header)
+                    .child(body),
+            );
+        }
+        (zone_height, column.into_any_element())
+    }
+
+    /// One archived 36px slim row (dimmed harness mark, title, time-ago that
+    /// yields to the Unarchive pill on row hover) — shared by the flat shelf
+    /// and the archived project folders.
+    fn render_archived_row(
+        &mut self,
+        chat: comet_proto::Chat,
+        now: chrono::DateTime<Utc>,
+        selected: Option<&str>,
+        selected_wash: gpui::Hsla,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = chat.id.clone();
+        let hovered = self.archived_hover.as_deref() == Some(id.as_str());
+        let is_selected = selected == Some(id.as_str());
+        let title: SharedString =
+            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
+                .into();
+        let time_ago: SharedString =
+            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+        let brand = if self.settings.sidebar_show_harness {
+            chat.config
+                .as_ref()
+                .map(|c| crate::pickers::harness_brand_icon(c.harness))
+        } else {
+            None
+        };
+        // Right slot: time at rest; the Unarchive affordance takes
+        // its place on row hover (t3code: "only the time/jump label
+        // yields to the settle affordance").
+        let right: AnyElement = if hovered {
+            let restore_id = id.clone();
+            // Metrics match the active rows' Archive pill exactly
+            // (18px pill, 11px icon, 10px label, padding bled right)
+            // — two sizes of the same affordance read as a mistake.
+            div()
+                .id(SharedString::from(format!("archived-restore-{id}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .h(px(18.0))
+                .px(px(4.0))
+                .mr(px(-4.0))
+                .rounded(px(5.0))
+                .bg(crate::theme::wash(0.10))
+                .hover(|s| s.bg(crate::theme::wash(0.18)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_chat_archived(restore_id.clone(), false, cx);
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                        .size(px(11.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Unarchive")),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted.opacity(0.55))
+                .child(time_ago)
+                .into_any_element()
+        };
+        let hover_id = id.clone();
+        let open_id = id.clone();
+        let menu_id = id.clone();
+        div()
+            .id(SharedString::from(format!("archived-{id}")))
+            .h(px(36.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP))
+            .px(px(Theme::SPACE_SM))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .when(is_selected, |el| el.bg(selected_wash))
+            .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
+            .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                if *entered {
+                    if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
+                        this.archived_hover = Some(hover_id.clone());
+                        cx.notify();
+                    }
+                } else if this.archived_hover.as_deref() == Some(hover_id.as_str()) {
+                    this.archived_hover = None;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_chat(open_id.clone(), cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.chat_menu.open(ChatMenuState {
+                        chat_id: menu_id.clone(),
+                        position: event.position,
+                        page: ChatMenuPage::Root,
+                    });
+                    cx.notify();
+                }),
+            )
+            // Archived history recedes: dimmed mark at rest,
+            // restored on hover (t3code's grayscale favicon).
+            .when_some(brand, |el, (mark, tint)| {
+                el.child(
+                    crate::icons::icon(mark)
+                        .size(px(SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE))
+                        .flex_none()
+                        .text_color(if hovered || is_selected {
+                            tint.unwrap_or(theme.text_muted)
+                        } else {
+                            tint.unwrap_or(theme.text_muted).opacity(0.4)
+                        }),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .text_color(if hovered || is_selected {
+                        theme.text
+                    } else {
+                        theme.text.opacity(0.55)
+                    })
+                    .child(title),
+            )
+            .child(right)
+            .into_any_element()
     }
 
     // ---- add-space flow (the ⌘K palette) ----
