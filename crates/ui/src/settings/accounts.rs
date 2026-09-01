@@ -11,8 +11,8 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, Focusable as _, Hsla, SharedString, Subscription, Task, Window,
-    div, prelude::*, px,
+    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
+    px,
 };
 use std::time::Duration;
 
@@ -176,14 +176,6 @@ impl LoginFlow {
     }
 }
 
-/// The Comet account "Edit name" dialog.
-struct EditNameDialog {
-    input: Entity<ComposerInput>,
-    /// Focus the input on the dialog's first paint (opened without window access).
-    focus_pending: bool,
-    _events: Subscription,
-}
-
 pub struct AccountsPage {
     state: Entity<AppState>,
     /// Which device's logins are shown; `None` = this device (no passthrough).
@@ -197,7 +189,10 @@ pub struct AccountsPage {
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
-    edit_name: Option<EditNameDialog>,
+    /// The always-visible Display name field, plus the value it was last seeded
+    /// with — the field follows the live account name until the user edits it.
+    name_input: Entity<ComposerInput>,
+    name_seed: String,
     /// UpdateProfile in flight.
     saving_name: bool,
     load_task: Option<Task<()>>,
@@ -206,16 +201,30 @@ pub struct AccountsPage {
     name_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
+    _name_events: Subscription,
 }
 
 impl AccountsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        // The Display name field follows the live account name (see
+        // `sync_name_input`), so a state change re-seeds it, not just repaints.
+        let observe = cx.observe(&state, |this, _, cx| {
+            this.sync_name_input(cx);
+            cx.notify();
+        });
         let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.submit_code(cx);
             }
+        });
+        let name_input = cx.new(|cx| ComposerInput::new("Your name", cx));
+        let name_events = cx.subscribe(&name_input, |this: &mut Self, _, event, cx| match event {
+            // Enter commits; every edit repaints so the Save button tracks
+            // whether there is an unsaved, non-empty change.
+            ComposerInputEvent::Submitted => this.submit_display_name(cx),
+            ComposerInputEvent::Edited => cx.notify(),
+            _ => {}
         });
         let mut page = Self {
             state,
@@ -226,7 +235,8 @@ impl AccountsPage {
             login: None,
             error: None,
             code_input,
-            edit_name: None,
+            name_input,
+            name_seed: String::new(),
             saving_name: false,
             load_task: None,
             action_task: None,
@@ -234,7 +244,12 @@ impl AccountsPage {
             name_task: None,
             _observe: observe,
             _code_events: code_events,
+            _name_events: name_events,
         };
+        // Seed the field if the account is already known at mount (the common
+        // case — Settings opens from a signed-in shell); otherwise `observe`
+        // seeds it when the AuthStatus frame arrives.
+        page.sync_name_input(cx);
         // Force the usage probe on the visit's first list — a plain list
         // returns no usage windows on a cold engine cache, which rendered
         // every account as "Usage unavailable" until a manual Refresh. The
@@ -1128,54 +1143,63 @@ impl AccountsPage {
         Some(popover::modal("add-account-dialog", viewport, card))
     }
 
-    fn open_edit_name(&mut self, cx: &mut Context<Self>) {
-        let current = self
-            .state
+    /// The account's current name, per the live AuthStatus frame.
+    fn current_name(&self, cx: &Context<Self>) -> String {
+        self.state
             .read(cx)
             .auth_user()
             .and_then(|user| user.name.clone())
-            .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Name", cx));
-        input.update(cx, |input, cx| input.set_text(current, cx));
-        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.submit_edit_name(cx);
-            }
-        });
-        self.edit_name = Some(EditNameDialog {
-            input,
-            focus_pending: true,
-            _events: events,
-        });
-        cx.notify();
+            .unwrap_or_default()
     }
 
-    fn submit_edit_name(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.edit_name.as_ref() else {
+    /// Keep the Display name field in step with the live account name — but only
+    /// while it is untouched since the last seed, so an in-progress edit is never
+    /// clobbered by the AuthStatus frame our own save triggers (or a rename from
+    /// another device).
+    fn sync_name_input(&mut self, cx: &mut Context<Self>) {
+        let current = self.current_name(cx);
+        let text = self.name_input.read(cx).text().to_string();
+        if text == self.name_seed && text != current {
+            self.name_input
+                .update(cx, |input, cx| input.set_text(current.clone(), cx));
+            self.name_seed = current;
+        }
+    }
+
+    fn submit_display_name(&mut self, cx: &mut Context<Self>) {
+        if self.saving_name {
             return;
-        };
-        let name = dialog.input.read(cx).text().trim().to_string();
-        if name.is_empty() || name.chars().count() > 80 {
-            cx.notify();
+        }
+        let current = self.current_name(cx);
+        let name = self.name_input.read(cx).text().trim().to_string();
+        // Nothing to save: empty, too long, or unchanged.
+        if name.is_empty() || name.chars().count() > 80 || name == current {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        self.edit_name = None;
         self.saving_name = true;
         self.error = None;
         self.name_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::UPDATE_PROFILE, serde_json::json!({ "name": name }))
+                .call(
+                    methods::UPDATE_PROFILE,
+                    serde_json::json!({ "name": name.clone() }),
+                )
                 .await;
             this.update(cx, |page, cx| {
                 page.saving_name = false;
-                if let Err(err) = result {
-                    page.error = Some(format!("Rename failed: {err}").into());
+                match result {
+                    // The AuthStatus stream carries the new name back; treat the
+                    // saved value as the new baseline so the field follows future
+                    // (e.g. cross-device) changes again.
+                    Ok(_) => page.name_seed = name,
+                    Err(err) => {
+                        page.error = Some(format!("Couldn\u{2019}t save your name: {err}").into())
+                    }
                 }
-                // Success needs nothing here: the AuthStatus stream carries the new name.
                 cx.notify();
             })
             .ok();
@@ -1183,148 +1207,63 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// The signed-in Comet user (the account itself, not a CLI login) with the
-    /// rename action; nothing when the workspace has no signed-in user.
-    fn render_profile_section(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The Display name field: the current name pre-filled, with an inline Save
+    /// button. Hidden until the account is known (no row while signed out/local).
+    fn render_display_name_section(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         use crate::settings::widgets;
-        let user = self.state.read(cx).auth_user()?.clone();
-        let title: SharedString = user
-            .name
-            .clone()
-            .unwrap_or_else(|| user.email.clone())
-            .into();
-        // Same avatar as the sidebar identity row.
-        let initial: SharedString = title
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
-        let identity = div()
-            .flex_1()
-            .min_w_0()
+        self.state.read(cx).auth_user()?;
+        let current = self.current_name(cx);
+        let typed = self.name_input.read(cx).text().trim().to_string();
+        let can_save = !self.saving_name && !typed.is_empty() && typed != current;
+
+        // Same fill and metrics as btn_primary, but hover/cursor/click only when
+        // there is something to save — btn_primary bakes in a hover that would
+        // otherwise light the button up in its disabled state.
+        // No fixed height: the row stretches it to match the input field.
+        let mut save = div()
+            .id("save-display-name")
+            .flex_none()
+            .px(px(14.0))
             .flex()
-            .flex_col()
-            .child(widgets::row_title(theme, title))
-            .when(user.name.is_some(), |el| {
-                el.child(widgets::meta_line(
-                    theme,
-                    vec![
-                        div()
-                            .child(SharedString::from(user.email))
-                            .into_any_element(),
-                    ],
-                ))
-            });
+            .items_center()
+            .rounded(px(8.0))
+            .bg(theme.text)
+            .text_size(crate::typography::ui_rems(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.on_solid)
+            .child(SharedString::from("Save"));
+        save = if can_save {
+            save.cursor_pointer()
+                .hover(|s| s.opacity(0.9))
+                .on_click(cx.listener(|this, _, _, cx| this.submit_display_name(cx)))
+        } else {
+            save.opacity(0.4)
+        };
+
         Some(
             div()
                 .mt(px(24.0))
                 .flex()
                 .flex_col()
+                .child(widgets::field_label(theme, "Display name"))
                 .child(
                     div()
+                        .mt(px(8.0))
                         .flex()
                         .flex_row()
-                        .items_center()
+                        .items_stretch()
                         .gap(px(8.0))
-                        .child(
-                            div()
-                                .text_size(crate::typography::ui_rems(14.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text)
-                                .child(SharedString::from("Comet account")),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            widgets::ghost_action(theme)
-                                .id("edit-account-name")
-                                .hover(|s| widgets::ghost_hover(theme, s))
-                                .when(self.saving_name, |el| el.opacity(0.5))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if !this.saving_name {
-                                        this.open_edit_name(cx);
-                                    }
-                                }))
-                                .child(
-                                    crate::icons::icon(crate::icons::PEN)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Edit name")),
-                        ),
-                )
-                .child(
-                    widgets::section_card(theme).mt(px(8.0)).child(
-                        widgets::card_row(theme, true)
-                            .child(
-                                div()
-                                    .size(px(28.0))
-                                    .flex_none()
-                                    .rounded_full()
-                                    .bg(theme.text)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(crate::typography::ui_rems(12.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.bg)
-                                    .child(initial),
-                            )
-                            .child(identity),
-                    ),
+                        .child(div().flex_1().min_w_0().child(popover::dialog_field(
+                            self.name_input.clone().into_any_element(),
+                        )))
+                        .child(save),
                 )
                 .into_any_element(),
         )
-    }
-
-    fn render_edit_name_dialog(
-        &mut self,
-        viewport: gpui::Size<gpui::Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let theme = Theme::of(cx).clone();
-        let dialog = self.edit_name.as_mut()?;
-        if std::mem::take(&mut dialog.focus_pending) {
-            window.focus(&dialog.input.focus_handle(cx), cx);
-        }
-        let input = dialog.input.clone();
-        let card = popover::dialog_card(&theme)
-            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                if ev.keystroke.key == "escape" {
-                    this.edit_name = None;
-                    cx.notify();
-                }
-            }))
-            .child(popover::dialog_title(&theme, "Edit name"))
-            .child(
-                div()
-                    .mt(px(12.0))
-                    .child(popover::dialog_field(input.into_any_element())),
-            )
-            .child(
-                div()
-                    .mt(px(16.0))
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .gap(px(8.0))
-                    .child(
-                        popover::btn_ghost(&theme, "Cancel", "edit-name-cancel")
-                            .id("edit-name-cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.edit_name = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        popover::btn_primary(&theme, "Save")
-                            .id("edit-name-save")
-                            .on_click(cx.listener(|this, _, _, cx| this.submit_edit_name(cx))),
-                    ),
-            )
-            .into_any_element();
-        Some(popover::modal("edit-name-dialog", viewport, card))
     }
 
     /// A ghost account row (comet settings.agents.tsx `SkeletonRow`): avatar,
@@ -1418,8 +1357,7 @@ impl Render for AccountsPage {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
-        let edit_name_dialog = self.render_edit_name_dialog(window.viewport_size(), window, cx);
-        let profile = self.render_profile_section(&theme, cx);
+        let display_name = self.render_display_name_section(&theme, cx);
         let refreshing = matches!(self.snapshot, Loadable::Loading);
         let account_count = self
             .snapshot
@@ -1676,7 +1614,7 @@ impl Render for AccountsPage {
                                 })),
                         )
                     })
-                    .when_some(profile, |el, section| el.child(section))
+                    .when_some(display_name, |el, section| el.child(section))
                     .children(sections)
                     // Footer note (comet: `mt-6 text-[12px] leading-relaxed
                     // text-muted-foreground/60`).
@@ -1695,7 +1633,6 @@ impl Render for AccountsPage {
                     ),
             )
             .when_some(dialog, |el, dialog| el.child(dialog))
-            .when_some(edit_name_dialog, |el, dialog| el.child(dialog))
     }
 }
 
