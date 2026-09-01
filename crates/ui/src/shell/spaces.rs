@@ -38,6 +38,23 @@ fn compare_sidebar_chats(
     primary.then_with(|| left.id.cmp(&right.id))
 }
 
+/// The archived shelf's order. Under Last updated a row ranks by when it was
+/// put away ([`crate::state::archived_recency`]) — the event that placed it
+/// in this list — not by its last message; Created stays creation order.
+fn compare_archived_chats(
+    sort: SidebarSort,
+    left: &comet_proto::Chat,
+    right: &comet_proto::Chat,
+) -> std::cmp::Ordering {
+    let primary = match sort {
+        SidebarSort::Created => right.created_at.cmp(&left.created_at),
+        SidebarSort::LastUpdated => {
+            crate::state::archived_recency(right).cmp(&crate::state::archived_recency(left))
+        }
+    };
+    primary.then_with(|| left.id.cmp(&right.id))
+}
+
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
@@ -1911,7 +1928,7 @@ impl Shell {
                 .cloned()
                 .collect()
         };
-        rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        rows.sort_by(|left, right| compare_archived_chats(self.settings.sidebar_sort, left, right));
         if rows.is_empty() {
             return None;
         }
@@ -3836,8 +3853,8 @@ mod tests {
     use comet_proto::ChatIndicator;
 
     use super::{
-        FolderActivity, NO_PROJECT_KEY, chat_activity_at, chat_folder_key, compare_sidebar_chats,
-        hold_order, promote_local_device_group,
+        FolderActivity, NO_PROJECT_KEY, chat_activity_at, chat_folder_key, compare_archived_chats,
+        compare_sidebar_chats, hold_order, promote_local_device_group,
     };
     use crate::settings::SidebarSort;
     use crate::state::AppState;
@@ -3888,6 +3905,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            archived_at: None,
             room_gen: None,
         }
     }
@@ -3898,6 +3916,24 @@ mod tests {
         let beta = chat("beta");
         assert!(compare_sidebar_chats(SidebarSort::Created, &alpha, &beta).is_lt());
         assert!(compare_sidebar_chats(SidebarSort::LastUpdated, &alpha, &beta).is_lt());
+    }
+
+    #[test]
+    fn archived_shelf_orders_by_archive_time_with_message_fallback() {
+        // Fixture chats: last message at 10, created at 5.
+        let mut put_away = chat("put-away");
+        put_away.archived_at = Some(Utc.timestamp_opt(50, 0).unwrap());
+        let mut chatty = chat("chatty");
+        chatty.last_message_at = Some(Utc.timestamp_opt(20, 0).unwrap());
+        // The archive stamp beats a newer last message…
+        assert!(compare_archived_chats(SidebarSort::LastUpdated, &put_away, &chatty).is_lt());
+        // …a row without a stamp falls back to its last message…
+        let legacy = chat("legacy");
+        assert!(compare_archived_chats(SidebarSort::LastUpdated, &chatty, &legacy).is_lt());
+        // …and Created ignores both.
+        let mut older = chat("older");
+        older.created_at = Utc.timestamp_opt(1, 0).unwrap();
+        assert!(compare_archived_chats(SidebarSort::Created, &put_away, &older).is_lt());
     }
 
     #[test]

@@ -272,6 +272,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         harness_session_cwd: None,
         space_id: None,
         last_seen_at: None,
+        archived_at: None,
         room_gen: None,
     }
 }
@@ -508,7 +509,7 @@ fn field_mutators_round_trip() {
     ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
 
     assert!(ws.rename_chat("chat-1", "Renamed").unwrap());
-    assert!(ws.set_chat_archived("chat-1", true).unwrap());
+    assert!(ws.set_chat_archived("chat-1", true, ts(4_000)).unwrap());
     assert!(
         ws.set_chat_last_message("chat-1", "preview text", ts(5_000))
             .unwrap()
@@ -516,17 +517,27 @@ fn field_mutators_round_trip() {
     assert!(ws.rename_device("dev-a", "workstation").unwrap());
     assert!(ws.set_device_last_seen("dev-a", ts(6_000)).unwrap());
     assert!(!ws.rename_chat("nope", "x").unwrap());
-    assert!(!ws.set_chat_archived("nope", true).unwrap());
+    assert!(!ws.set_chat_archived("nope", true, ts(4_000)).unwrap());
     assert!(!ws.rename_device("nope", "x").unwrap());
 
     let chat = ws.chat("chat-1").unwrap().unwrap();
     assert_eq!(chat.title.as_deref(), Some("Renamed"));
     assert!(chat.archived);
+    assert_eq!(chat.archived_at, Some(ts(4_000)));
     assert_eq!(chat.last_message_preview.as_deref(), Some("preview text"));
     assert_eq!(chat.last_message_at, Some(ts(5_000)));
     let dev = &ws.read_devices().unwrap()[0];
     assert_eq!(dev.name, "workstation");
     assert_eq!(dev.last_seen_at, Some(ts(6_000)));
+
+    // Unarchiving clears the stamp; re-archiving stamps afresh.
+    assert!(ws.set_chat_archived("chat-1", false, ts(7_000)).unwrap());
+    assert_eq!(ws.chat("chat-1").unwrap().unwrap().archived_at, None);
+    assert!(ws.set_chat_archived("chat-1", true, ts(8_000)).unwrap());
+    assert_eq!(
+        ws.chat("chat-1").unwrap().unwrap().archived_at,
+        Some(ts(8_000))
+    );
 }
 
 #[test]

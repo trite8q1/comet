@@ -114,6 +114,7 @@ Ordering rules for the stable folder view:
 
 | Date | Decision |
 |---|---|
+| 2026-09-01 | Archived recency: a synced `Chat.archived_at` (stamped by the host on archive, cleared on unarchive) now orders the archived shelf and Settings → Archived under Sort = Last updated, falling back to `last_message_at` for rows archived before the field existed. Rationale: a list's order follows the event that put a row in it (messages for the active list, the archive action here). Active list, tabs, jump order, hold: untouched. Prerequisite for one-click project archiving (not built yet). iOS archives without a stamp for now (falls back). |
 | 2026-08-30 | Folder views added; folders default. Device labels only when informative; local device wears the composer's "Local" tag treatment. |
 | 2026-08-30 | Chat rows in folders drop the "project @ device" subline (compact rows). |
 | 2026-08-31 | Folder-jump problem identified: folder rank rides its newest chat. Two philosophies captured; synthesis proposed, not yet locked. |

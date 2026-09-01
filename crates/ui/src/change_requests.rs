@@ -352,6 +352,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: Some("space".into()),
             last_seen_at: None,
+            archived_at: None,
             room_gen: None,
         }
     }

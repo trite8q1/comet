@@ -502,9 +502,10 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
 // and with their own test suite. Re-exported here because every call site in
 // this crate reads them as `state::…`.
 pub use comet_proto::view::{
-    ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
-    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, archived_recency,
+    attention_rank, chat_location, display_status, effective_indicator, format_time_ago,
+    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats, sort_spaces,
+    sort_tabs,
 };
 
 // ---------------------------------------------------------------------------
@@ -574,282 +575,6 @@ pub const UNDELIVERED_GRACE_MS: i64 = 120_000;
 pub struct UploadProgress {
     done: std::sync::Arc<std::sync::atomic::AtomicU64>,
     total: u64,
-}
-
-/// Dev-only, env-gated (`COMET_DEMO_DEVICES`): augment the sidebar with two
-/// extra devices plus spaces and chats hosted on them, so the multi-device
-/// folder views can be judged locally without real cross-device sync. Purely
-/// additive and client-side — nothing is written to the workspace doc, and
-/// each snapshot re-merges these so they persist without accumulating.
-fn demo_devices_enabled() -> bool {
-    std::env::var_os("COMET_DEMO_DEVICES").is_some()
-}
-
-fn demo_devices(now: DateTime<Utc>) -> Vec<Device> {
-    let device = |id: &str, name: &str, platform: &str| Device {
-        id: id.into(),
-        name: name.into(),
-        platform: platform.into(),
-        last_seen_at: Some(now),
-        created_at: Some(now),
-        version: None,
-    };
-    vec![
-        device("demo-studio", "Mac Studio", "macos"),
-        device("demo-vps", "Cloud VPS", "linux"),
-    ]
-}
-
-fn demo_spaces(now: DateTime<Utc>) -> Vec<Space> {
-    let space = |id: &str, device: &str, path: &str, name: &str| Space {
-        id: id.into(),
-        device_id: device.into(),
-        path: path.into(),
-        name: Some(name.into()),
-        git_detected: true,
-        git_checked_at: Some(now),
-        checkout_id: None,
-        created_at: now,
-    };
-    vec![
-        // "comet" is worked on from every machine (laptop, Studio, VPS), so the
-        // merged view folds all three into one folder while the default view
-        // keeps them separate per device.
-        space(
-            "demo-studio-comet",
-            "demo-studio",
-            "/Users/nico/dev/comet",
-            "comet",
-        ),
-        space(
-            "demo-studio-design",
-            "demo-studio",
-            "/Users/nico/dev/design-system",
-            "design-system",
-        ),
-        space("demo-vps-comet", "demo-vps", "/srv/comet", "comet"),
-        space(
-            "demo-vps-maps",
-            "demo-vps",
-            "/srv/gonzocity-maps",
-            "gonzocity-maps",
-        ),
-    ]
-}
-
-fn demo_chats(now: DateTime<Utc>) -> Vec<Chat> {
-    use comet_proto::HarnessId::{self, ClaudeCode, Codex, Cursor};
-    use comet_proto::SandboxLevel;
-    let chat = |id: &str,
-                device: &str,
-                space: &str,
-                title: &str,
-                harness: HarnessId,
-                branch: &str,
-                age_h: i64| {
-        Chat {
-            id: id.into(),
-            device_id: device.into(),
-            title: Some(title.into()),
-            archived: false,
-            cwd: None,
-            branch: Some(branch.into()),
-            checkout_id: None,
-            // The sidebar branch line reads source_context.branch.
-            source_context: Some(comet_proto::ConversationSourceContext {
-                checkout_id: format!("{space}-checkout"),
-                repo_root: "/repo".into(),
-                cwd: "/repo".into(),
-                branch: branch.into(),
-                head_sha: None,
-                observed_at: now,
-            }),
-            config: Some(comet_proto::ChatConfig {
-                harness,
-                model: None,
-                reasoning: None,
-                model_options: Default::default(),
-                sandbox: SandboxLevel::WorkspaceWrite,
-            }),
-            last_message_preview: None,
-            last_message_at: Some(now - chrono::Duration::hours(age_h)),
-            created_at: now - chrono::Duration::hours(age_h + 100),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            space_id: Some(space.into()),
-            last_seen_at: None,
-            room_gen: None,
-        }
-    };
-    // Settled work: same projects, archived — the archived shelf shows its
-    // grayed folders below the active ones (lifecycle, not duplication).
-    let archived = |id: &str,
-                    device: &str,
-                    space: &str,
-                    title: &str,
-                    harness: HarnessId,
-                    branch: &str,
-                    age_h: i64| {
-        let mut chat = chat(id, device, space, title, harness, branch, age_h);
-        chat.archived = true;
-        chat
-    };
-    let mut chats = vec![
-        // Mac Studio — comet (pushes the merged "comet" folder past the pager).
-        chat(
-            "demo-studio-comet-1",
-            "demo-studio",
-            "demo-studio-comet",
-            "Port renderer to Metal",
-            ClaudeCode,
-            "feat/metal-renderer",
-            1,
-        ),
-        chat(
-            "demo-studio-comet-2",
-            "demo-studio",
-            "demo-studio-comet",
-            "Fix GPUI memory leak",
-            Codex,
-            "fix/gpui-leak",
-            6,
-        ),
-        chat(
-            "demo-studio-comet-3",
-            "demo-studio",
-            "demo-studio-comet",
-            "Profile cold-start time",
-            ClaudeCode,
-            "perf/startup",
-            22,
-        ),
-        chat(
-            "demo-studio-comet-4",
-            "demo-studio",
-            "demo-studio-comet",
-            "Wire up presence heartbeat",
-            ClaudeCode,
-            "feat/presence",
-            44,
-        ),
-        // Mac Studio — design-system
-        chat(
-            "demo-studio-design-1",
-            "demo-studio",
-            "demo-studio-design",
-            "Token pipeline overhaul",
-            ClaudeCode,
-            "feat/token-pipeline",
-            3,
-        ),
-        chat(
-            "demo-studio-design-2",
-            "demo-studio",
-            "demo-studio-design",
-            "Dark mode contrast audit",
-            Cursor,
-            "chore/dark-mode-audit",
-            28,
-        ),
-        // Cloud VPS — comet
-        chat(
-            "demo-vps-comet-1",
-            "demo-vps",
-            "demo-vps-comet",
-            "Nightly release pipeline",
-            Codex,
-            "ci/nightly",
-            2,
-        ),
-        chat(
-            "demo-vps-comet-2",
-            "demo-vps",
-            "demo-vps-comet",
-            "Reproduce flaky sync test",
-            ClaudeCode,
-            "fix/flaky-sync",
-            9,
-        ),
-        chat(
-            "demo-vps-comet-3",
-            "demo-vps",
-            "demo-vps-comet",
-            "Upgrade Loro CRDT",
-            Codex,
-            "chore/loro-upgrade",
-            40,
-        ),
-        // Cloud VPS — gonzocity-maps
-        chat(
-            "demo-vps-maps-1",
-            "demo-vps",
-            "demo-vps-maps",
-            "GPX import support",
-            ClaudeCode,
-            "feat/gpx-import",
-            4,
-        ),
-        chat(
-            "demo-vps-maps-2",
-            "demo-vps",
-            "demo-vps-maps",
-            "Staging deploy",
-            Codex,
-            "deploy/staging",
-            33,
-        ),
-        chat(
-            "demo-vps-maps-3",
-            "demo-vps",
-            "demo-vps-maps",
-            "Tile cache warmup",
-            ClaudeCode,
-            "perf/tile-cache",
-            52,
-        ),
-        // Archived — comet (also alive above) and gonzocity-maps.
-        archived(
-            "demo-arch-comet-1",
-            "demo-studio",
-            "demo-studio-comet",
-            "Old renderer spike",
-            ClaudeCode,
-            "spike/renderer",
-            200,
-        ),
-        archived(
-            "demo-arch-comet-2",
-            "demo-vps",
-            "demo-vps-comet",
-            "Evaluate sync libraries",
-            Codex,
-            "research/sync-libs",
-            340,
-        ),
-        archived(
-            "demo-arch-maps-1",
-            "demo-vps",
-            "demo-vps-maps",
-            "Prototype vector tiles",
-            Cursor,
-            "proto/vector-tiles",
-            260,
-        ),
-    ];
-    // One project-less settled chat: lands in the archived "No project"
-    // folder, pinned last.
-    let mut loose = archived(
-        "demo-arch-loose-1",
-        "demo-studio",
-        "demo-studio-comet",
-        "Scratch: harness flags",
-        ClaudeCode,
-        "main",
-        400,
-    );
-    loose.space_id = None;
-    chats.push(loose);
-    chats
 }
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
@@ -1027,9 +752,6 @@ impl AppState {
     // ---- reducers (pure) ----
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
-        if demo_devices_enabled() {
-            chats.extend(demo_chats(Utc::now()));
-        }
         sort_chats(&mut chats);
         self.chats = chats;
         self.chats_synced = true;
@@ -1049,9 +771,6 @@ impl AppState {
     }
 
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
-        if demo_devices_enabled() {
-            spaces.extend(demo_spaces(Utc::now()));
-        }
         sort_spaces(&mut spaces);
         self.spaces = spaces;
         self.spaces_synced = true;
@@ -1136,9 +855,6 @@ impl AppState {
             && device.name == "unknown-device"
         {
             device.name = "Local".to_string();
-        }
-        if demo_devices_enabled() {
-            devices.extend(demo_devices(Utc::now()));
         }
         for device in &devices {
             self.change_requests
@@ -2912,6 +2628,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            archived_at: None,
             room_gen: None,
         }
     }

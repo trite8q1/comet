@@ -10,7 +10,7 @@
 //!   gitDetected, gitCheckedAt?, checkoutId?, createdAt}
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
 //!   branch?, checkoutId?, config?(json), lastMessagePreview?, lastMessageAt?, createdAt,
-//!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
+//!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?, archivedAt?}
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
 //!   updatedAt}
 //! - `meta`: LoroMap {schemaVersion} — in-band detection for future destructive changes
@@ -272,6 +272,7 @@ impl WorkspaceDoc {
         )?;
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
+        set_opt_ms(&row, "archivedAt", chat.archived_at)?;
         self.doc.commit();
         Ok(())
     }
@@ -332,11 +333,20 @@ impl WorkspaceDoc {
     }
 
     /// LWW archived flag from any device. `false` when no such row.
-    pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, DocError> {
+    /// Flip the archive flag, stamping `archivedAt = at` on archive and
+    /// clearing it on unarchive (the archived shelf's recency). `false` when
+    /// no such row.
+    pub fn set_chat_archived(
+        &self,
+        chat_id: &str,
+        archived: bool,
+        at: DateTime<Utc>,
+    ) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("archived", archived)?;
+        set_opt_ms(&row, "archivedAt", archived.then_some(at))?;
         self.doc.commit();
         Ok(true)
     }
@@ -683,6 +693,8 @@ pub(crate) struct RawChat {
     #[serde(default)]
     last_seen_at: Option<i64>,
     #[serde(default)]
+    archived_at: Option<i64>,
+    #[serde(default)]
     room_gen: Option<u32>,
 }
 
@@ -723,6 +735,7 @@ impl From<RawChat> for Chat {
             harness_session_cwd: raw.harness_session_cwd,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
+            archived_at: raw.archived_at.map(dt),
             room_gen: raw.room_gen,
         }
     }
@@ -796,6 +809,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            archived_at: None,
             room_gen: None,
         }
     }
@@ -927,7 +941,7 @@ mod tests {
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
 
         assert!(ws.rename_chat("chat-1", "Renamed").unwrap());
-        assert!(ws.set_chat_archived("chat-1", true).unwrap());
+        assert!(ws.set_chat_archived("chat-1", true, ts(4_000)).unwrap());
         assert!(
             ws.set_chat_last_message("chat-1", "preview text", ts(5_000))
                 .unwrap()
@@ -936,17 +950,27 @@ mod tests {
         assert!(ws.set_device_last_seen("dev-a", ts(6_000)).unwrap());
         // Unknown rows report false, never invent rows.
         assert!(!ws.rename_chat("nope", "x").unwrap());
-        assert!(!ws.set_chat_archived("nope", true).unwrap());
+        assert!(!ws.set_chat_archived("nope", true, ts(4_000)).unwrap());
         assert!(!ws.rename_device("nope", "x").unwrap());
 
         let chat = ws.chat("chat-1").unwrap().unwrap();
         assert_eq!(chat.title.as_deref(), Some("Renamed"));
         assert!(chat.archived);
+        assert_eq!(chat.archived_at, Some(ts(4_000)));
         assert_eq!(chat.last_message_preview.as_deref(), Some("preview text"));
         assert_eq!(chat.last_message_at, Some(ts(5_000)));
         let dev = &ws.read_devices().unwrap()[0];
         assert_eq!(dev.name, "workstation");
         assert_eq!(dev.last_seen_at, Some(ts(6_000)));
+
+        // Unarchiving clears the stamp; re-archiving stamps afresh.
+        assert!(ws.set_chat_archived("chat-1", false, ts(7_000)).unwrap());
+        assert_eq!(ws.chat("chat-1").unwrap().unwrap().archived_at, None);
+        assert!(ws.set_chat_archived("chat-1", true, ts(8_000)).unwrap());
+        assert_eq!(
+            ws.chat("chat-1").unwrap().unwrap().archived_at,
+            Some(ts(8_000))
+        );
     }
 
     #[test]

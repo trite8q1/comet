@@ -74,7 +74,14 @@ impl Render for ArchivedPage {
         let now = chrono::Utc::now();
         let (rows, device_names): (Vec<Chat>, std::collections::HashMap<String, String>) = {
             let state = self.state.read(cx);
-            let rows = archived_chats(&state.chats).into_iter().cloned().collect();
+            let mut rows: Vec<Chat> = archived_chats(&state.chats).into_iter().cloned().collect();
+            // Same order as the sidebar's archived shelf: most recently put
+            // away first.
+            rows.sort_by(|a, b| {
+                crate::state::archived_recency(b)
+                    .cmp(&crate::state::archived_recency(a))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
             let names = state
                 .devices
                 .iter()
@@ -98,11 +105,9 @@ impl Render for ArchivedPage {
                 // device span only when the name resolves).
                 let device: Option<SharedString> =
                     device_names.get(&chat.device_id).cloned().map(Into::into);
-                let time_ago: SharedString = crate::state::format_time_ago(
-                    chat.last_message_at.unwrap_or(chat.created_at),
-                    now,
-                )
-                .into();
+                let time_ago: SharedString =
+                    crate::state::format_time_ago(crate::state::archived_recency(&chat), now)
+                        .into();
                 let location: Option<SharedString> =
                     crate::state::chat_location(&chat).map(Into::into);
                 let is_busy = busy.as_deref() == Some(chat.id.as_str());
@@ -334,6 +339,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            archived_at: None,
             room_gen: None,
         }
     }

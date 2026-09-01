@@ -885,6 +885,7 @@ impl WorkspaceHost {
                 harness_session_cwd: None,
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
+                archived_at: None,
             })
         })?;
         Ok(())
@@ -1031,8 +1032,11 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_room_gen(chat_id, room_gen))?)
     }
 
+    /// Flip the archive flag. The host stamps `archivedAt` (the archived
+    /// shelf's recency) on archive; the doc clears it on unarchive.
     pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, EngineError> {
-        Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
+        let at = Utc::now();
+        Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived, at))?)
     }
 
     /// LWW full-config replace on the chat row (comet `SetChatConfig` — the
