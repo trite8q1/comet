@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use crate::settings::HoldWindow;
 use gpui::FocusHandle;
 use comet_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 
@@ -88,6 +89,8 @@ enum SidebarViewRow {
     InOneList,
     LastUpdated,
     Created,
+    /// The folder activity hold window ("Active for", [`HoldWindow`]).
+    Hold(HoldWindow),
     ShowBranch,
     ShowPullRequest,
     ShowHarness,
@@ -99,21 +102,34 @@ impl SidebarViewRow {
     fn closes_menu(self) -> bool {
         matches!(
             self,
-            Self::ByProject | Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
+            Self::ByProject
+                | Self::ByDevice
+                | Self::InOneList
+                | Self::LastUpdated
+                | Self::Created
+                | Self::Hold(_)
         )
     }
 }
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 8] = [
-    SidebarViewRow::ByProject,
-    SidebarViewRow::ByDevice,
-    SidebarViewRow::InOneList,
-    SidebarViewRow::LastUpdated,
-    SidebarViewRow::Created,
-    SidebarViewRow::ShowBranch,
-    SidebarViewRow::ShowPullRequest,
-    SidebarViewRow::ShowHarness,
+/// The "Active for" presets, in menu order.
+const HOLD_WINDOWS: [HoldWindow; 5] = [
+    HoldWindow::Hours2,
+    HoldWindow::Hours4,
+    HoldWindow::Hours8,
+    HoldWindow::Hours12,
+    HoldWindow::Day1,
 ];
+
+fn hold_window_label(window: HoldWindow) -> &'static str {
+    match window {
+        HoldWindow::Hours2 => "2 hours",
+        HoldWindow::Hours4 => "4 hours",
+        HoldWindow::Hours8 => "8 hours",
+        HoldWindow::Hours12 => "12 hours",
+        HoldWindow::Day1 => "1 day",
+    }
+}
 
 // With the search field and card insets, this lets the project picker grow to
 // roughly the same maximum footprint as the sidebar view-options menu while
@@ -133,12 +149,6 @@ const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
 const FOLDER_INITIAL: usize = 8;
 const FOLDER_PAGE: usize = 25;
 const PAGER_ROW_HEIGHT: f32 = 32.0;
-/// Activity hold for project folders (Sort = Last updated only): a folder
-/// with activity inside this window sits in a stable "active" block ordered
-/// by entry, so turns inside active projects never reorder them. The tuning
-/// knob — too short and projects churn in and out, too long and abandoned
-/// work lingers on top.
-const FOLDER_HOLD_SECS: i64 = 4 * 60 * 60;
 pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(120);
 
@@ -699,6 +709,7 @@ impl Shell {
             }
             SidebarViewRow::LastUpdated => self.settings.sidebar_sort = SidebarSort::LastUpdated,
             SidebarViewRow::Created => self.settings.sidebar_sort = SidebarSort::Created,
+            SidebarViewRow::Hold(window) => self.settings.sidebar_hold_window = window,
             SidebarViewRow::ShowBranch => {
                 self.settings.sidebar_show_branch = !self.settings.sidebar_show_branch
             }
@@ -732,23 +743,55 @@ impl Shell {
             popover::MenuKey::Escape => self.close_sidebar_view_menu(cx),
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let up = event.keystroke.key.eq_ignore_ascii_case("arrowup");
+                let count = self.sidebar_view_rows().len();
                 if let Some(menu) = self.sidebar_view_menu.open_mut() {
-                    menu.active = popover::menu_step(
-                        menu.active,
-                        SIDEBAR_VIEW_ROWS.len(),
-                        if up { -1 } else { 1 },
-                    );
+                    menu.active = popover::menu_step(menu.active, count, if up { -1 } else { 1 });
                     cx.notify();
                 }
             }
             popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
                 let active = self.sidebar_view_menu.get().and_then(|m| m.active);
-                if let Some(row) = active.and_then(|ix| SIDEBAR_VIEW_ROWS.get(ix)).copied() {
+                let rows = self.sidebar_view_rows();
+                if let Some(row) = active.and_then(|ix| rows.get(ix)).copied() {
                     self.activate_sidebar_view_row(row, cx);
                 }
             }
             popover::MenuKey::Backspace | popover::MenuKey::Other => {}
         }
+    }
+
+    /// The view menu's rows, top to bottom. "Active for" exists only where
+    /// the hold applies (By project + Last updated): both switches live in
+    /// this very menu and close it on selection, so the section simply shows
+    /// up on the next open — a mode-specific option hides rather than sits
+    /// disabled (Finder's View Options pattern). The project filter is
+    /// deliberately not a condition: it is a temporary lens set elsewhere,
+    /// and Organize stays visible under it too.
+    fn sidebar_view_rows(&self) -> Vec<SidebarViewRow> {
+        let mut rows = vec![
+            SidebarViewRow::ByProject,
+            SidebarViewRow::ByDevice,
+            SidebarViewRow::InOneList,
+            SidebarViewRow::LastUpdated,
+            SidebarViewRow::Created,
+        ];
+        if matches!(
+            self.settings.sidebar_organization,
+            SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+        ) && self.settings.sidebar_sort == SidebarSort::LastUpdated
+        {
+            rows.extend(
+                HOLD_WINDOWS
+                    .iter()
+                    .map(|window| SidebarViewRow::Hold(*window)),
+            );
+        }
+        rows.extend([
+            SidebarViewRow::ShowBranch,
+            SidebarViewRow::ShowPullRequest,
+            SidebarViewRow::ShowHarness,
+        ]);
+        rows
     }
 
     fn render_sidebar_view_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -759,51 +802,57 @@ impl Shell {
         let focus = menu_state.focus.clone();
         let organization = self.settings.sidebar_organization;
         let sort = self.settings.sidebar_sort;
+        let hold = self.settings.sidebar_hold_window;
         let show_harness = self.settings.sidebar_show_harness;
         let show_branch = self.settings.sidebar_show_branch;
         let show_pr = self.settings.sidebar_show_pull_request;
 
-        let labels = [
-            "By project",
-            "By device",
-            "In one list",
-            "Last updated",
-            "Created",
-            "Branch",
-            "Pull request",
-            "Harness",
-        ];
-        let icons = [
-            icons::FOLDER,
-            icons::LAPTOP,
-            icons::LIST,
-            icons::CLOCK_CIRCLE,
-            icons::CALENDAR,
-            icons::GIT_BRANCH,
-            icons::PULL_REQUEST,
-            icons::BOT,
-        ];
-        let selected = [
-            matches!(
-                organization,
-                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
-            ),
-            organization == SidebarOrganization::ByDevice,
-            organization == SidebarOrganization::InOneList,
-            sort == SidebarSort::LastUpdated,
-            sort == SidebarSort::Created,
-            show_branch,
-            show_pr,
-            show_harness,
-        ];
-        let mut rows: Vec<AnyElement> = SIDEBAR_VIEW_ROWS
-            .iter()
-            .copied()
+        let mut rows: Vec<AnyElement> = self
+            .sidebar_view_rows()
+            .into_iter()
             .enumerate()
             .map(|(ix, row)| {
+                let (label, icon_path, is_selected) = match row {
+                    SidebarViewRow::ByProject => (
+                        "By project",
+                        icons::FOLDER,
+                        matches!(
+                            organization,
+                            SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+                        ),
+                    ),
+                    SidebarViewRow::ByDevice => (
+                        "By device",
+                        icons::LAPTOP,
+                        organization == SidebarOrganization::ByDevice,
+                    ),
+                    SidebarViewRow::InOneList => (
+                        "In one list",
+                        icons::LIST,
+                        organization == SidebarOrganization::InOneList,
+                    ),
+                    SidebarViewRow::LastUpdated => (
+                        "Last updated",
+                        icons::CLOCK_CIRCLE,
+                        sort == SidebarSort::LastUpdated,
+                    ),
+                    SidebarViewRow::Created => {
+                        ("Created", icons::CALENDAR, sort == SidebarSort::Created)
+                    }
+                    SidebarViewRow::Hold(window) => (
+                        hold_window_label(window),
+                        icons::CLOCK_CIRCLE,
+                        hold == window,
+                    ),
+                    SidebarViewRow::ShowBranch => ("Branch", icons::GIT_BRANCH, show_branch),
+                    SidebarViewRow::ShowPullRequest => {
+                        ("Pull request", icons::PULL_REQUEST, show_pr)
+                    }
+                    SidebarViewRow::ShowHarness => ("Harness", icons::BOT, show_harness),
+                };
                 popover::menu_row_nav(
                     theme,
-                    selected[ix],
+                    is_selected,
                     active == Some(ix),
                     format!("sidebar-view-row-{ix}"),
                 )
@@ -815,13 +864,13 @@ impl Shell {
                     this.activate_sidebar_view_row(row, cx)
                 }))
                 .child(
-                    icon(icons[ix])
+                    icon(icon_path)
                         .size(px(15.0))
                         .flex_none()
                         .text_color(theme.text_muted.opacity(0.8)),
                 )
-                .child(div().flex_1().child(SharedString::from(labels[ix])))
-                .child(div().w(px(14.0)).flex_none().when(selected[ix], |el| {
+                .child(div().flex_1().child(SharedString::from(label)))
+                .child(div().w(px(14.0)).flex_none().when(is_selected, |el| {
                     el.child(
                         icon(icons::CHECK)
                             .size(px(14.0))
@@ -831,7 +880,10 @@ impl Shell {
                 .into_any_element()
             })
             .collect();
-        let show_rows = rows.split_off(5);
+        // Sections by row kind: Organize (3), Sort (2), Active for (5 when
+        // the hold applies, else none), Show (3).
+        let show_rows = rows.split_off(rows.len() - 3);
+        let hold_rows = rows.split_off(5);
         let sort_rows = rows.split_off(3);
         let organization_rows = rows;
 
@@ -855,6 +907,13 @@ impl Shell {
             .child(popover::menu_separator())
             .child(popover::menu_heading(theme, "Sort"))
             .child(div().flex().flex_col().gap(px(2.0)).children(sort_rows))
+            // How long a project folder holds its place in the active block
+            // after its last activity — only where the hold applies.
+            .when(!hold_rows.is_empty(), |el| {
+                el.child(popover::menu_separator())
+                    .child(popover::menu_heading(theme, "Active for"))
+                    .child(div().flex().flex_col().gap(px(2.0)).children(hold_rows))
+            })
             .child(popover::menu_separator())
             .child(popover::menu_heading(theme, "Show"))
             .child(div().flex().flex_col().gap(px(2.0)).children(show_rows))
@@ -1263,7 +1322,7 @@ impl Shell {
                     &inputs,
                     &self.sidebar_folder_hold,
                     now,
-                    chrono::Duration::seconds(FOLDER_HOLD_SECS),
+                    chrono::Duration::seconds(self.settings.sidebar_hold_window.seconds()),
                 );
                 folders.sort_by_key(|(f, _)| {
                     order.iter().position(|k| k == &f.key).unwrap_or(usize::MAX)
@@ -1630,7 +1689,7 @@ impl Shell {
                 &inputs,
                 &self.sidebar_folder_hold,
                 now,
-                chrono::Duration::seconds(FOLDER_HOLD_SECS),
+                chrono::Duration::seconds(self.settings.sidebar_hold_window.seconds()),
             );
             self.sidebar_folder_hold = next_hold;
             folders.sort_by_key(|f| order.iter().position(|k| k == &f.key).unwrap_or(usize::MAX));

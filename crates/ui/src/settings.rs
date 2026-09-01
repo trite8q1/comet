@@ -191,6 +191,32 @@ pub enum SidebarSort {
     Created,
 }
 
+/// How long a project folder stays in the sidebar's active block after its
+/// last activity ("By project" view, Sort = Last updated) — an Arc-style
+/// archive window. The default matches one working session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum HoldWindow {
+    Hours2,
+    #[default]
+    Hours4,
+    Hours8,
+    Hours12,
+    Day1,
+}
+
+impl HoldWindow {
+    pub fn seconds(self) -> i64 {
+        match self {
+            Self::Hours2 => 2 * 60 * 60,
+            Self::Hours4 => 4 * 60 * 60,
+            Self::Hours8 => 8 * 60 * 60,
+            Self::Hours12 => 12 * 60 * 60,
+            Self::Day1 => 24 * 60 * 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -203,6 +229,8 @@ pub struct UiSettings {
     pub sidebar_organization: SidebarOrganization,
     /// Timestamp used to order active sessions (newest first).
     pub sidebar_sort: SidebarSort,
+    /// Activity hold window for project folders (see [`HoldWindow`]).
+    pub sidebar_hold_window: HoldWindow,
     /// Optional harness branding and repository metadata shown below each
     /// session title.
     pub sidebar_show_harness: bool,
@@ -278,6 +306,7 @@ impl Default for UiSettings {
             sidebar_grouped: false,
             sidebar_organization: SidebarOrganization::ByProjectMerged,
             sidebar_sort: SidebarSort::LastUpdated,
+            sidebar_hold_window: HoldWindow::Hours4,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
@@ -774,6 +803,7 @@ mod tests {
             sidebar_grouped: true,
             sidebar_organization: SidebarOrganization::ByDevice,
             sidebar_sort: SidebarSort::Created,
+            sidebar_hold_window: HoldWindow::Hours12,
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,

@@ -17,8 +17,13 @@ position means recency, the dot means urgency, reorders glide.
 
 Apply hysteresis at the folder level only, under Sort = Last updated:
 
-- Folders with activity inside a hold window (a tunable constant, 4 hours to
-  start) form an active block ordered by the moment each entered it. That
+- Folders with activity inside a hold window form an active block ordered by
+  the moment each entered it. The window is a persisted setting chosen in the
+  sidebar's view-options menu ("Active for": 2 h, 4 h, 8 h, 12 h, 1 day;
+  default 4 h), Arc's archive-window pattern. The section is shown only
+  while By project + Last updated are selected — both switches sit in the
+  same menu and close it on selection, so a mode-specific option hides
+  rather than sits disabled. That
   entry time is frozen while the folder stays active, so turns inside active
   projects never reorder the block. Active projects behave like tabs.
 - A dormant folder that becomes active is inserted at the top of the block.
