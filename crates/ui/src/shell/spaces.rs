@@ -1779,6 +1779,11 @@ impl Shell {
             let ids: Vec<&str> = folder.rows.iter().map(|r| r.chat.id.as_str()).collect();
             let (expanded, visible_count) =
                 folder_visibility(&ids, shown, collapsed, selected.as_deref());
+            // The selected chat pins its folder open; a collapse click must
+            // record intent without a close tween it cannot win (see below).
+            let holds_selected = selected
+                .as_deref()
+                .is_some_and(|s| ids.iter().any(|id| *id == s));
             let has_more = total > visible_count;
             // A folder that mixes devices tags each chat with its device.
             let multi_device_folder = {
@@ -1929,10 +1934,21 @@ impl Shell {
             let header = sidebar_folder_header(theme, visible_label, dot, chevron)
                 .id(SharedString::from(format!("sidebar-folder-{collapse_key}")))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    // Toggle the effective (drawn) state: a folder held open by
-                    // the selected chat reads as open, so a click records the
-                    // collapse intent (it takes effect once selection leaves).
-                    let was_open = expanded;
+                    let currently_collapsed = this.sidebar_collapsed_groups.contains(&toggle_key);
+                    // The selected chat pins this folder open: `expanded` stays
+                    // true, so a close tween would animate shut and snap back.
+                    // Record the collapse intent for when selection leaves, but
+                    // play no animation that cannot win.
+                    if holds_selected {
+                        if currently_collapsed {
+                            this.sidebar_collapsed_groups.remove(&toggle_key);
+                        } else {
+                            this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    let was_open = !currently_collapsed;
                     this.begin_sidebar_disclosure_motion(
                         &toggle_motion,
                         if was_open { body_height } else { 0.0 },
@@ -2166,6 +2182,9 @@ impl Shell {
             // with no row (same rule as the active folders).
             let ids: Vec<&str> = folder.chats.iter().map(|c| c.id.as_str()).collect();
             let (expanded, visible_count) = folder_visibility(&ids, shown, collapsed, selected);
+            // The selected chat pins its folder open; the collapse click must
+            // not play a close tween it cannot win (mirrors the active folders).
+            let holds_selected = selected.is_some_and(|s| ids.iter().any(|id| *id == s));
             let has_more = total > visible_count;
             let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
                 + visible_count as f32 * 36.0
@@ -2241,7 +2260,19 @@ impl Shell {
                     "sidebar-archived-folder-{collapse_key}"
                 )))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let was_open = expanded;
+                    let currently_collapsed = this.sidebar_collapsed_groups.contains(&toggle_key);
+                    // A selected archived chat pins this folder open: skip the
+                    // close tween it cannot win, just record the intent.
+                    if holds_selected {
+                        if currently_collapsed {
+                            this.sidebar_collapsed_groups.remove(&toggle_key);
+                        } else {
+                            this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    let was_open = !currently_collapsed;
                     this.begin_sidebar_disclosure_motion(
                         &toggle_motion,
                         if was_open { body_height } else { 0.0 },
