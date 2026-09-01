@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use crate::settings::HoldWindow;
 use gpui::FocusHandle;
 use comet_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 
@@ -33,6 +34,23 @@ fn compare_sidebar_chats(
             .last_message_at
             .unwrap_or(right.created_at)
             .cmp(&left.last_message_at.unwrap_or(left.created_at)),
+    };
+    primary.then_with(|| left.id.cmp(&right.id))
+}
+
+/// The archived shelf's order. Under Last updated a row ranks by when it was
+/// put away ([`crate::state::archived_recency`]) — the event that placed it
+/// in this list — not by its last message; Created stays creation order.
+fn compare_archived_chats(
+    sort: SidebarSort,
+    left: &comet_proto::Chat,
+    right: &comet_proto::Chat,
+) -> std::cmp::Ordering {
+    let primary = match sort {
+        SidebarSort::Created => right.created_at.cmp(&left.created_at),
+        SidebarSort::LastUpdated => {
+            crate::state::archived_recency(right).cmp(&crate::state::archived_recency(left))
+        }
     };
     primary.then_with(|| left.id.cmp(&right.id))
 }
@@ -81,10 +99,15 @@ impl Render for SidebarViewOptionsTooltip {
 
 #[derive(Clone, Copy)]
 enum SidebarViewRow {
+    /// The folder view ([`SidebarOrganization::ByProjectMerged`] — one folder
+    /// per project name, merged across devices).
+    ByProject,
     ByDevice,
     InOneList,
     LastUpdated,
     Created,
+    /// The folder activity hold window ("Active for", [`HoldWindow`]).
+    Hold(HoldWindow),
     ShowBranch,
     ShowPullRequest,
     ShowHarness,
@@ -96,20 +119,34 @@ impl SidebarViewRow {
     fn closes_menu(self) -> bool {
         matches!(
             self,
-            Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
+            Self::ByProject
+                | Self::ByDevice
+                | Self::InOneList
+                | Self::LastUpdated
+                | Self::Created
+                | Self::Hold(_)
         )
     }
 }
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 7] = [
-    SidebarViewRow::ByDevice,
-    SidebarViewRow::InOneList,
-    SidebarViewRow::LastUpdated,
-    SidebarViewRow::Created,
-    SidebarViewRow::ShowBranch,
-    SidebarViewRow::ShowPullRequest,
-    SidebarViewRow::ShowHarness,
+/// The "Active for" presets, in menu order.
+const HOLD_WINDOWS: [HoldWindow; 5] = [
+    HoldWindow::Hours2,
+    HoldWindow::Hours4,
+    HoldWindow::Hours8,
+    HoldWindow::Hours12,
+    HoldWindow::Day1,
 ];
+
+fn hold_window_label(window: HoldWindow) -> &'static str {
+    match window {
+        HoldWindow::Hours2 => "2 hours",
+        HoldWindow::Hours4 => "4 hours",
+        HoldWindow::Hours8 => "8 hours",
+        HoldWindow::Hours12 => "12 hours",
+        HoldWindow::Day1 => "1 day",
+    }
+}
 
 // With the search field and card insets, this lets the project picker grow to
 // roughly the same maximum footprint as the sidebar view-options menu while
@@ -124,6 +161,11 @@ const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
+/// Project-folder paging (the active zone and the archived zone's folders):
+/// initial page, the "Show more" step, and the pager row's height.
+const FOLDER_INITIAL: usize = 8;
+const FOLDER_PAGE: usize = 25;
+const PAGER_ROW_HEIGHT: f32 = 32.0;
 pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(120);
 
@@ -169,6 +211,162 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
         )
         .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
         .child(chevron)
+}
+
+/// A project-folder header (the Codex-style collapsible folder): a leading
+/// folder icon and a primary-weight name, an optional trailing attention dot
+/// (the folder's most urgent nested status), then the rotating disclosure
+/// chevron. Unlike [`sidebar_disclosure_header`] there is no full-bleed
+/// hairline — folders are objects, not sections, so the 12px inter-section
+/// gap carries the separation and keeps the list uncluttered.
+fn sidebar_folder_header(
+    theme: &Theme,
+    label: SharedString,
+    trailing: Option<AnyElement>,
+    chevron: AnyElement,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
+        .px(px(Theme::SPACE_SM))
+        .cursor_pointer()
+        .child(
+            icon(icons::FOLDER)
+                .size(px(16.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.7)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(crate::typography::ui_rems(13.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text.opacity(0.8))
+                .child(label),
+        )
+        .when_some(trailing, |el, chip| el.child(chip))
+        .child(chevron)
+}
+
+/// The "No project" bucket: project-less or dangling chats share it. It is
+/// pinned last in the folder views.
+const NO_PROJECT_KEY: &str = "~no-project";
+
+/// Folder key + display label + no-project flag for a chat in the "By
+/// project" view. The key is the lowercased project name — one folder per
+/// repo across devices; project-less or dangling chats share the
+/// [`NO_PROJECT_KEY`] bucket, labeled "No project".
+fn chat_folder_key(
+    state: &crate::state::AppState,
+    chat: &comet_proto::Chat,
+) -> (String, String, bool) {
+    let space = state.space_for_chat(chat);
+    let no_project = space.is_none();
+    let label = match space {
+        Some(space) => space.display_name().to_string(),
+        None => "No project".to_string(),
+    };
+    let key = if no_project {
+        NO_PROJECT_KEY.to_string()
+    } else {
+        label.to_lowercase()
+    };
+    (key, label, no_project)
+}
+
+/// When a chat last "did work", for the folder hold: a live session (working,
+/// or waiting on the user — an in-flight send already reads as Working) is
+/// happening NOW; otherwise its last persisted message (creation when none).
+/// Selecting a chat, picking a project in the composer, hovering, collapsing:
+/// none of these touch the inputs, so they never count as activity.
+fn chat_activity_at(
+    status: ChatIndicator,
+    chat: &comet_proto::Chat,
+    now: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    match status {
+        ChatIndicator::Working | ChatIndicator::AwaitingInput => now,
+        _ => chat.last_message_at.unwrap_or(chat.created_at),
+    }
+}
+
+/// One folder's inputs to [`hold_order`].
+#[derive(Clone)]
+struct FolderActivity {
+    key: String,
+    activity_at: chrono::DateTime<Utc>,
+    no_project: bool,
+}
+
+/// Folder display order under the activity hold, plus the next hold map.
+/// Folders active inside `window` form a block ordered by the moment they
+/// entered it (newest entrant on top; `entered_at` is frozen while they stay
+/// active, so activity inside the block never reorders it — active projects
+/// behave like tabs). The rest follow by recency (a feed); "No project" is
+/// pinned last and never held. Pure and deterministic: the render path
+/// stores the returned map, the keyboard order recomputes and discards it,
+/// so screen and keys cannot disagree.
+fn hold_order(
+    folders: &[FolderActivity],
+    hold: &std::collections::HashMap<String, chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+    window: chrono::Duration,
+) -> (
+    Vec<String>,
+    std::collections::HashMap<String, chrono::DateTime<Utc>>,
+) {
+    let threshold = now - window;
+    let mut next = std::collections::HashMap::new();
+    let mut active: Vec<(chrono::DateTime<Utc>, &str)> = Vec::new();
+    let mut dormant: Vec<(chrono::DateTime<Utc>, &str)> = Vec::new();
+    let mut no_project: Option<&str> = None;
+    for folder in folders {
+        if folder.no_project {
+            no_project = Some(&folder.key);
+        } else if folder.activity_at >= threshold {
+            let entered_at = hold.get(&folder.key).copied().unwrap_or(folder.activity_at);
+            next.insert(folder.key.clone(), entered_at);
+            active.push((entered_at, &folder.key));
+        } else {
+            dormant.push((folder.activity_at, &folder.key));
+        }
+    }
+    active.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    dormant.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let order = active
+        .into_iter()
+        .chain(dormant)
+        .map(|(_, key)| key.to_string())
+        .chain(no_project.map(str::to_string))
+        .collect();
+    (order, next)
+}
+
+/// How many of a folder's rows are drawn, and whether it renders expanded.
+/// The single rule the drawn rows AND the keyboard (jump/cycle) order both
+/// obey, so screen and keys cannot disagree (ADR 0004): a folder pages to
+/// `shown` (at least [`FOLDER_INITIAL`]), but always far enough to include the
+/// selected chat, and a folder holding the selected chat renders open even if
+/// the user collapsed it. Session-transient: it reads paging/collapse, never
+/// mutates them, so selection reveals a chat without persisting anything.
+fn folder_visibility(
+    chat_ids: &[&str],
+    shown: usize,
+    collapsed: bool,
+    selected: Option<&str>,
+) -> (bool, usize) {
+    let total = chat_ids.len();
+    let mut visible = shown.max(FOLDER_INITIAL).min(total);
+    let holds_selected = selected.and_then(|s| chat_ids.iter().position(|id| *id == s));
+    if let Some(pos) = holds_selected {
+        visible = visible.max(pos + 1);
+    }
+    (!collapsed || holds_selected.is_some(), visible)
 }
 
 /// One row of the open dropdown, in display order.
@@ -539,6 +737,9 @@ impl Shell {
 
     fn activate_sidebar_view_row(&mut self, row: SidebarViewRow, cx: &mut Context<Self>) {
         match row {
+            SidebarViewRow::ByProject => {
+                self.settings.sidebar_organization = SidebarOrganization::ByProjectMerged
+            }
             SidebarViewRow::ByDevice => {
                 self.settings.sidebar_organization = SidebarOrganization::ByDevice
             }
@@ -547,6 +748,7 @@ impl Shell {
             }
             SidebarViewRow::LastUpdated => self.settings.sidebar_sort = SidebarSort::LastUpdated,
             SidebarViewRow::Created => self.settings.sidebar_sort = SidebarSort::Created,
+            SidebarViewRow::Hold(window) => self.settings.sidebar_hold_window = window,
             SidebarViewRow::ShowBranch => {
                 self.settings.sidebar_show_branch = !self.settings.sidebar_show_branch
             }
@@ -580,23 +782,55 @@ impl Shell {
             popover::MenuKey::Escape => self.close_sidebar_view_menu(cx),
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let up = event.keystroke.key.eq_ignore_ascii_case("arrowup");
+                let count = self.sidebar_view_rows().len();
                 if let Some(menu) = self.sidebar_view_menu.open_mut() {
-                    menu.active = popover::menu_step(
-                        menu.active,
-                        SIDEBAR_VIEW_ROWS.len(),
-                        if up { -1 } else { 1 },
-                    );
+                    menu.active = popover::menu_step(menu.active, count, if up { -1 } else { 1 });
                     cx.notify();
                 }
             }
             popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
                 let active = self.sidebar_view_menu.get().and_then(|m| m.active);
-                if let Some(row) = active.and_then(|ix| SIDEBAR_VIEW_ROWS.get(ix)).copied() {
+                let rows = self.sidebar_view_rows();
+                if let Some(row) = active.and_then(|ix| rows.get(ix)).copied() {
                     self.activate_sidebar_view_row(row, cx);
                 }
             }
             popover::MenuKey::Backspace | popover::MenuKey::Other => {}
         }
+    }
+
+    /// The view menu's rows, top to bottom. "Active for" exists only where
+    /// the hold applies (By project + Last updated): both switches live in
+    /// this very menu and close it on selection, so the section simply shows
+    /// up on the next open — a mode-specific option hides rather than sits
+    /// disabled (Finder's View Options pattern). The project filter is
+    /// deliberately not a condition: it is a temporary lens set elsewhere,
+    /// and Organize stays visible under it too.
+    fn sidebar_view_rows(&self) -> Vec<SidebarViewRow> {
+        let mut rows = vec![
+            SidebarViewRow::ByProject,
+            SidebarViewRow::ByDevice,
+            SidebarViewRow::InOneList,
+            SidebarViewRow::LastUpdated,
+            SidebarViewRow::Created,
+        ];
+        if matches!(
+            self.settings.sidebar_organization,
+            SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+        ) && self.settings.sidebar_sort == SidebarSort::LastUpdated
+        {
+            rows.extend(
+                HOLD_WINDOWS
+                    .iter()
+                    .map(|window| SidebarViewRow::Hold(*window)),
+            );
+        }
+        rows.extend([
+            SidebarViewRow::ShowBranch,
+            SidebarViewRow::ShowPullRequest,
+            SidebarViewRow::ShowHarness,
+        ]);
+        rows
     }
 
     fn render_sidebar_view_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -607,45 +841,57 @@ impl Shell {
         let focus = menu_state.focus.clone();
         let organization = self.settings.sidebar_organization;
         let sort = self.settings.sidebar_sort;
+        let hold = self.settings.sidebar_hold_window;
         let show_harness = self.settings.sidebar_show_harness;
         let show_branch = self.settings.sidebar_show_branch;
         let show_pr = self.settings.sidebar_show_pull_request;
 
-        let labels = [
-            "By device",
-            "In one list",
-            "Last updated",
-            "Created",
-            "Branch",
-            "Pull request",
-            "Harness",
-        ];
-        let icons = [
-            icons::LAPTOP,
-            icons::LIST,
-            icons::CLOCK_CIRCLE,
-            icons::CALENDAR,
-            icons::GIT_BRANCH,
-            icons::PULL_REQUEST,
-            icons::BOT,
-        ];
-        let selected = [
-            organization == SidebarOrganization::ByDevice,
-            organization == SidebarOrganization::InOneList,
-            sort == SidebarSort::LastUpdated,
-            sort == SidebarSort::Created,
-            show_branch,
-            show_pr,
-            show_harness,
-        ];
-        let mut rows: Vec<AnyElement> = SIDEBAR_VIEW_ROWS
-            .iter()
-            .copied()
+        let mut rows: Vec<AnyElement> = self
+            .sidebar_view_rows()
+            .into_iter()
             .enumerate()
             .map(|(ix, row)| {
+                let (label, icon_path, is_selected) = match row {
+                    SidebarViewRow::ByProject => (
+                        "By project",
+                        icons::FOLDER,
+                        matches!(
+                            organization,
+                            SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+                        ),
+                    ),
+                    SidebarViewRow::ByDevice => (
+                        "By device",
+                        icons::LAPTOP,
+                        organization == SidebarOrganization::ByDevice,
+                    ),
+                    SidebarViewRow::InOneList => (
+                        "In one list",
+                        icons::LIST,
+                        organization == SidebarOrganization::InOneList,
+                    ),
+                    SidebarViewRow::LastUpdated => (
+                        "Last updated",
+                        icons::CLOCK_CIRCLE,
+                        sort == SidebarSort::LastUpdated,
+                    ),
+                    SidebarViewRow::Created => {
+                        ("Created", icons::CALENDAR, sort == SidebarSort::Created)
+                    }
+                    SidebarViewRow::Hold(window) => (
+                        hold_window_label(window),
+                        icons::CLOCK_CIRCLE,
+                        hold == window,
+                    ),
+                    SidebarViewRow::ShowBranch => ("Branch", icons::GIT_BRANCH, show_branch),
+                    SidebarViewRow::ShowPullRequest => {
+                        ("Pull request", icons::PULL_REQUEST, show_pr)
+                    }
+                    SidebarViewRow::ShowHarness => ("Harness", icons::BOT, show_harness),
+                };
                 popover::menu_row_nav(
                     theme,
-                    selected[ix],
+                    is_selected,
                     active == Some(ix),
                     format!("sidebar-view-row-{ix}"),
                 )
@@ -657,13 +903,13 @@ impl Shell {
                     this.activate_sidebar_view_row(row, cx)
                 }))
                 .child(
-                    icon(icons[ix])
+                    icon(icon_path)
                         .size(px(15.0))
                         .flex_none()
                         .text_color(theme.text_muted.opacity(0.8)),
                 )
-                .child(div().flex_1().child(SharedString::from(labels[ix])))
-                .child(div().w(px(14.0)).flex_none().when(selected[ix], |el| {
+                .child(div().flex_1().child(SharedString::from(label)))
+                .child(div().w(px(14.0)).flex_none().when(is_selected, |el| {
                     el.child(
                         icon(icons::CHECK)
                             .size(px(14.0))
@@ -673,8 +919,11 @@ impl Shell {
                 .into_any_element()
             })
             .collect();
-        let show_rows = rows.split_off(4);
-        let sort_rows = rows.split_off(2);
+        // Sections by row kind: Organize (3), Sort (2), Active for (5 when
+        // the hold applies, else none), Show (3).
+        let show_rows = rows.split_off(rows.len() - 3);
+        let hold_rows = rows.split_off(5);
+        let sort_rows = rows.split_off(3);
         let organization_rows = rows;
 
         popover::popover_card(theme)
@@ -697,6 +946,13 @@ impl Shell {
             .child(popover::menu_separator())
             .child(popover::menu_heading(theme, "Sort"))
             .child(div().flex().flex_col().gap(px(2.0)).children(sort_rows))
+            // How long a project folder holds its place in the active block
+            // after its last activity — only where the hold applies.
+            .when(!hold_rows.is_empty(), |el| {
+                el.child(popover::menu_separator())
+                    .child(popover::menu_heading(theme, "Active for"))
+                    .child(div().flex().flex_col().gap(px(2.0)).children(hold_rows))
+            })
             .child(popover::menu_separator())
             .child(popover::menu_heading(theme, "Show"))
             .child(div().flex().flex_col().gap(px(2.0)).children(show_rows))
@@ -1060,14 +1316,84 @@ impl Shell {
     /// the screen.
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
         let filter = self.settings.space_filter.clone();
+        let organization = self.settings.sidebar_organization;
+        let sort = self.settings.sidebar_sort;
+        let now = Utc::now();
         let state = self.state.read(cx);
-        let mut chats: Vec<comet_proto::Chat> = state
-            .sidebar_chats(Utc::now(), filter.as_deref())
+        let mut chats: Vec<(ChatIndicator, comet_proto::Chat)> = state
+            .sidebar_chats(now, filter.as_deref())
             .into_iter()
-            .map(|(_, chat)| chat.clone())
+            .map(|(status, chat)| (status, chat.clone()))
             .collect();
-        chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
-        if self.settings.sidebar_organization != SidebarOrganization::ByDevice {
+        chats.sort_by(|left, right| compare_sidebar_chats(sort, &left.1, &right.1));
+        let selected = state.selected_chat.clone();
+        // Project folders (the "All projects" view): flatten folder-by-folder
+        // in the exact order `render_folder_rows` draws them (the activity
+        // hold under Last updated, No project last) and only the rows it draws
+        // (each folder's page, collapsed folders skipped), so ⌘-jump and
+        // cycling never open a chat that is off screen. Read-only: the hold
+        // map is recomputed and discarded here; only the render path stores it.
+        if filter.is_none()
+            && matches!(
+                organization,
+                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+            )
+        {
+            let mut folders: Vec<(FolderActivity, Vec<comet_proto::Chat>)> = Vec::new();
+            for (status, chat) in chats {
+                let (key, _label, no_project) = chat_folder_key(state, &chat);
+                let activity_at = chat_activity_at(status, &chat, now);
+                if let Some((folder, rows)) = folders.iter_mut().find(|(f, _)| f.key == key) {
+                    folder.activity_at = folder.activity_at.max(activity_at);
+                    rows.push(chat);
+                } else {
+                    folders.push((
+                        FolderActivity {
+                            key,
+                            activity_at,
+                            no_project,
+                        },
+                        vec![chat],
+                    ));
+                }
+            }
+            if sort == SidebarSort::LastUpdated {
+                let inputs: Vec<FolderActivity> = folders.iter().map(|(f, _)| f.clone()).collect();
+                let (order, _next) = hold_order(
+                    &inputs,
+                    &self.sidebar_folder_hold,
+                    now,
+                    chrono::Duration::seconds(self.settings.sidebar_hold_window.seconds()),
+                );
+                folders.sort_by_key(|(f, _)| {
+                    order.iter().position(|k| k == &f.key).unwrap_or(usize::MAX)
+                });
+            } else {
+                folders.sort_by_key(|(f, _)| f.no_project);
+            }
+            let selected = selected.as_deref();
+            return folders
+                .into_iter()
+                .flat_map(|(folder, rows)| {
+                    let collapse_key = format!("folder:{}", folder.key);
+                    let shown = self
+                        .sidebar_folder_shown
+                        .get(&collapse_key)
+                        .copied()
+                        .unwrap_or(FOLDER_INITIAL);
+                    let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+                    let ids: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
+                    let (expanded, visible) = folder_visibility(&ids, shown, collapsed, selected);
+                    // A collapsed folder draws no chat rows, so it contributes
+                    // nothing to the keyboard order; an expanded one contributes
+                    // exactly its drawn page.
+                    let take = if expanded { visible } else { 0 };
+                    rows.into_iter().take(take).map(|chat| chat.id)
+                })
+                .collect();
+        }
+        let chats: Vec<comet_proto::Chat> = chats.into_iter().map(|(_, chat)| chat).collect();
+        if organization != SidebarOrganization::ByDevice {
             return chats.into_iter().map(|chat| chat.id).collect();
         }
         let mut groups: Vec<(Option<(String, String)>, Vec<comet_proto::Chat>)> = Vec::new();
@@ -1097,6 +1423,17 @@ impl Shell {
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
+        // Codex-style project folders replace the flat list on the "All
+        // projects" view; a single-project filter is already scoped, so it
+        // keeps the flat card list.
+        if filter.is_none()
+            && matches!(
+                self.settings.sidebar_organization,
+                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+            )
+        {
+            return self.render_folder_rows(theme, cx);
+        }
         let mut rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
             let mut chats: Vec<_> = state
@@ -1136,7 +1473,9 @@ impl Shell {
                     let change_request = state.change_request_for_chat(&chat).cloned();
                     let group = match self.settings.sidebar_organization {
                         SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
-                        SidebarOrganization::ByProject | SidebarOrganization::InOneList => None,
+                        SidebarOrganization::ByProject
+                        | SidebarOrganization::ByProjectMerged
+                        | SidebarOrganization::InOneList => None,
                     };
                     ActiveChatRow {
                         status,
@@ -1202,7 +1541,8 @@ impl Shell {
                     .sidebar_show_harness
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
-                let height = super::chat_row_height(branch.is_some(), change_request.is_some());
+                let height =
+                    super::chat_row_height(false, branch.is_some(), change_request.is_some());
                 // Only rows a jump slot can reach wear a chip; row 10 onward
                 // keeps its time-ago.
                 let jump_label: Option<SharedString> = if jump_hints {
@@ -1219,7 +1559,7 @@ impl Shell {
                     )
                     .into(),
                     time_ago,
-                    folder.into(),
+                    Some(folder.into()),
                     branch.map(SharedString::from),
                     change_request,
                     harness,
@@ -1239,7 +1579,9 @@ impl Shell {
             };
             let organization = match self.settings.sidebar_organization {
                 SidebarOrganization::ByDevice => "device",
-                SidebarOrganization::ByProject | SidebarOrganization::InOneList => "list",
+                SidebarOrganization::ByProject
+                | SidebarOrganization::ByProjectMerged
+                | SidebarOrganization::InOneList => "list",
             };
             let collapse_key = format!("{organization}:{key}");
             let motion_key = format!("group:{collapse_key}");
@@ -1303,6 +1645,343 @@ impl Shell {
         rendered
     }
 
+    /// The "By project" folder list for the "All projects" view: one
+    /// collapsible folder per project name (merged across devices), chats
+    /// nested and sorted inside, each folder paging its tail behind "Show N
+    /// more". Folders order by recency — first appearance in the sorted walk,
+    /// "No project" pinned last — the same model as the archived zone. A
+    /// collapsed folder still signals its most urgent nested status via the
+    /// header's attention dot. Chats carry a device tag only when their
+    /// folder actually spans devices.
+    fn render_folder_rows(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<(String, f32, AnyElement)> {
+        let now = Utc::now();
+        let sort = self.settings.sidebar_sort;
+        let show_branch = self.settings.sidebar_show_branch;
+        let show_pr = self.settings.sidebar_show_pull_request;
+        let show_harness = self.settings.sidebar_show_harness;
+        let selected = self.state.read(cx).selected_chat.clone();
+
+        struct FolderRow {
+            status: ChatIndicator,
+            chat: comet_proto::Chat,
+            branch: Option<String>,
+            change_request: Option<comet_proto::ChangeRequestSummary>,
+            device_id: String,
+        }
+        struct Folder {
+            key: String,
+            label: SharedString,
+            no_project: bool,
+            /// Newest activity across ALL the folder's chats (not just the
+            /// paged-visible ones) — the hold's input.
+            activity_at: chrono::DateTime<Utc>,
+            rows: Vec<FolderRow>,
+        }
+
+        let mut folders: Vec<Folder> = Vec::new();
+        {
+            let state = self.state.read(cx);
+            let mut chats: Vec<(ChatIndicator, comet_proto::Chat)> = state
+                .sidebar_chats(now, None)
+                .into_iter()
+                .map(|(status, chat)| (status, chat.clone()))
+                .collect();
+            chats.sort_by(|left, right| compare_sidebar_chats(sort, &left.1, &right.1));
+            for (status, chat) in chats {
+                let (key, label, no_project) = chat_folder_key(state, &chat);
+                let branch = if show_branch {
+                    crate::change_requests::conversation_branch(&chat, &state.spaces)
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                let change_request = if show_pr {
+                    state.change_request_for_chat(&chat).cloned()
+                } else {
+                    None
+                };
+                let device_id = chat.device_id.clone();
+                let activity_at = chat_activity_at(status, &chat, now);
+                let row = FolderRow {
+                    status,
+                    chat,
+                    branch,
+                    change_request,
+                    device_id,
+                };
+                if let Some(folder) = folders.iter_mut().find(|f| f.key == key) {
+                    folder.activity_at = folder.activity_at.max(activity_at);
+                    folder.rows.push(row);
+                } else {
+                    folders.push(Folder {
+                        key,
+                        label: SharedString::from(label),
+                        no_project,
+                        activity_at,
+                        rows: vec![row],
+                    });
+                }
+            }
+        }
+        // Sort = Last updated: the activity hold keeps active projects in a
+        // stable block (see `hold_order`). Otherwise "No project" sinks to the
+        // bottom and the rest keep the order their top chat sorted into.
+        if sort == SidebarSort::LastUpdated {
+            let inputs: Vec<FolderActivity> = folders
+                .iter()
+                .map(|f| FolderActivity {
+                    key: f.key.clone(),
+                    activity_at: f.activity_at,
+                    no_project: f.no_project,
+                })
+                .collect();
+            let (order, next_hold) = hold_order(
+                &inputs,
+                &self.sidebar_folder_hold,
+                now,
+                chrono::Duration::seconds(self.settings.sidebar_hold_window.seconds()),
+            );
+            self.sidebar_folder_hold = next_hold;
+            folders.sort_by_key(|f| order.iter().position(|k| k == &f.key).unwrap_or(usize::MAX));
+        } else {
+            folders.sort_by_key(|folder| folder.no_project);
+        }
+
+        // Jump chips for the folder view, mirroring `render_active_rows`: a
+        // flat slot counter walks the drawn rows in the same order
+        // `sidebar_visible_order` hands the shortcuts and cycling, so a chip
+        // always names the key that opens its row. A collapsed folder draws no
+        // rows and takes no slot.
+        let jump_hints = self.jump_hints && !self.overlay_owns_keyboard(cx);
+        let keymap = self.settings.keymap.clone();
+        let mut slot = 0usize;
+        let mut rendered: Vec<(String, f32, AnyElement)> = Vec::new();
+        for folder in folders {
+            let collapse_key = format!("folder:{}", folder.key);
+            let motion_key = format!("group:{collapse_key}");
+            let total = folder.rows.len();
+            let shown = self
+                .sidebar_folder_shown
+                .get(&collapse_key)
+                .copied()
+                .unwrap_or(FOLDER_INITIAL);
+            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+            // The one rule the keyboard order also obeys: page to `shown`, but
+            // far enough to include `selected`, and force a folder that holds
+            // the selected chat open even if collapsed (`folder_visibility`),
+            // so an open chat always has a row.
+            let ids: Vec<&str> = folder.rows.iter().map(|r| r.chat.id.as_str()).collect();
+            let (expanded, visible_count) =
+                folder_visibility(&ids, shown, collapsed, selected.as_deref());
+            // The selected chat pins its folder open; a collapse click must
+            // record intent without a close tween it cannot win (see below).
+            let holds_selected = selected
+                .as_deref()
+                .is_some_and(|s| ids.iter().any(|id| *id == s));
+            let has_more = total > visible_count;
+            // A folder that mixes devices tags each chat with its device.
+            let multi_device_folder = {
+                let mut ids = folder.rows.iter().map(|r| r.device_id.as_str());
+                match ids.next() {
+                    Some(first) => ids.any(|d| d != first),
+                    None => false,
+                }
+            };
+            // Most urgent nested status — the header's attention dot. Folders
+            // never move on activity; the dot is what pulls the eye.
+            let urgent = folder
+                .rows
+                .iter()
+                .map(|row| row.status)
+                .min_by_key(|status| crate::state::attention_rank(*status))
+                .unwrap_or(ChatIndicator::Idle);
+
+            let mut row_elements: Vec<(f32, AnyElement)> = Vec::new();
+            for row in folder.rows.into_iter().take(visible_count) {
+                let FolderRow {
+                    status,
+                    chat,
+                    branch,
+                    change_request,
+                    device_id,
+                } = row;
+                let title: SharedString = transcript::single_line(
+                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                )
+                .into();
+                let time_ago: SharedString =
+                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+                let is_selected = selected.as_deref() == Some(chat.id.as_str());
+                let harness = show_harness
+                    .then(|| chat.config.as_ref().map(|c| c.harness))
+                    .flatten();
+                let context: Option<SharedString> = if multi_device_folder {
+                    let (name, show_local) = self.state.read(cx).device_label(&device_id);
+                    Some(if show_local {
+                        format!("{name} · Local").into()
+                    } else {
+                        SharedString::from(name)
+                    })
+                } else {
+                    None
+                };
+                let compact = context.is_none();
+                let height =
+                    super::chat_row_height(compact, branch.is_some(), change_request.is_some());
+                // Only rows on screen (an expanded folder's drawn page) wear a
+                // chip and consume a jump slot; row 10 onward keeps its time-ago.
+                let jump_label: Option<SharedString> =
+                    if expanded && jump_hints && slot < JUMP_SLOTS {
+                        let combo = keymap.get(ShortcutId::JumpSession(slot));
+                        (!combo.is_empty()).then(|| badge_combo(combo).into())
+                    } else {
+                        None
+                    };
+                if expanded {
+                    slot += 1;
+                }
+                let element = self.render_chat_row(
+                    chat.id.clone(),
+                    title,
+                    time_ago,
+                    context,
+                    branch.map(SharedString::from),
+                    change_request,
+                    harness,
+                    status,
+                    is_selected,
+                    false,
+                    jump_label,
+                    theme,
+                    cx,
+                );
+                row_elements.push((height, element));
+            }
+
+            let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
+                + row_elements.iter().map(|(h, _)| *h).sum::<f32>()
+                + SIDEBAR_LIST_GAP * visible_count.saturating_sub(1) as f32
+                + if has_more {
+                    PAGER_ROW_HEIGHT + SIDEBAR_LIST_GAP
+                } else {
+                    0.0
+                };
+
+            let rows_column = div()
+                .flex()
+                .flex_col()
+                .gap(px(SIDEBAR_LIST_GAP))
+                .children(row_elements.into_iter().map(|(_, el)| el));
+            let mut body_inner = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+                .child(rows_column);
+            if has_more {
+                let remaining = (total - visible_count).min(FOLDER_PAGE);
+                let more_key = collapse_key.clone();
+                body_inner = body_inner.child(
+                    div()
+                        .id(SharedString::from(format!("folder-more-{collapse_key}")))
+                        .mt(px(SIDEBAR_LIST_GAP))
+                        .h(px(PAGER_ROW_HEIGHT))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(Theme::SPACE_SM))
+                        .rounded(px(8.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let shown = this
+                                .sidebar_folder_shown
+                                .entry(more_key.clone())
+                                .or_insert(FOLDER_INITIAL);
+                            *shown = (*shown).max(FOLDER_INITIAL) + FOLDER_PAGE;
+                            cx.notify();
+                        }))
+                        .child(icon(icons::PLUS).size(px(12.0)).flex_none())
+                        .child(SharedString::from(format!("Show {remaining} more"))),
+                );
+            }
+
+            let visible_label: SharedString = if !expanded {
+                format!("{} ({total})", folder.label).into()
+            } else {
+                folder.label.clone()
+            };
+            let dot: Option<AnyElement> = (urgent != ChatIndicator::Idle).then(|| {
+                div()
+                    .size(px(6.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(status_dot_color(urgent, theme))
+                    .into_any_element()
+            });
+            let chevron = self.sidebar_disclosure_chevron(&motion_key, expanded, theme);
+            let toggle_key = collapse_key.clone();
+            let toggle_motion = motion_key.clone();
+            let header = sidebar_folder_header(theme, visible_label, dot, chevron)
+                .id(SharedString::from(format!("sidebar-folder-{collapse_key}")))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let currently_collapsed = this.sidebar_collapsed_groups.contains(&toggle_key);
+                    // The selected chat pins this folder open: `expanded` stays
+                    // true, so a close tween would animate shut and snap back.
+                    // Record the collapse intent for when selection leaves, but
+                    // play no animation that cannot win.
+                    if holds_selected {
+                        if currently_collapsed {
+                            this.sidebar_collapsed_groups.remove(&toggle_key);
+                        } else {
+                            this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    let was_open = !currently_collapsed;
+                    this.begin_sidebar_disclosure_motion(
+                        &toggle_motion,
+                        if was_open { body_height } else { 0.0 },
+                        if was_open { 0.0 } else { body_height },
+                    );
+                    if was_open {
+                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                    } else {
+                        this.sidebar_collapsed_groups.remove(&toggle_key);
+                    }
+                    cx.notify();
+                }));
+            let body = self.render_sidebar_disclosure_body(
+                &motion_key,
+                expanded,
+                body_height,
+                body_inner.into_any_element(),
+            );
+            let height =
+                SIDEBAR_DISCLOSURE_SECTION_HEIGHT + if expanded { body_height } else { 0.0 };
+            let element = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_SECTION_GAP))
+                .child(header)
+                .child(body)
+                .into_any_element();
+            rendered.push((format!("folder:{}", folder.key), height, element));
+        }
+        rendered
+    }
+
     /// The sidebar's archived shelf — a direct port of t3code's settled
     /// shelf: header is label + hairline + chevron ("Archived (N)" closed,
     /// "Archived" open), rows are 36px SLIM one-liners (dimmed harness mark,
@@ -1332,185 +2011,50 @@ impl Shell {
                 .cloned()
                 .collect()
         };
-        rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        rows.sort_by(|left, right| compare_archived_chats(self.settings.sidebar_sort, left, right));
         if rows.is_empty() {
             return None;
         }
         let total = rows.len();
         let open = self.archived_open;
-        let shown = self.archived_shown.max(INITIAL);
-        let visible_count = total.min(shown);
-        let has_more = total > shown;
-        let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
-            + visible_count as f32 * 36.0
-            + visible_count.saturating_sub(1) as f32 * SIDEBAR_LIST_GAP
-            + if has_more {
-                36.0 + SIDEBAR_LIST_GAP
-            } else {
-                0.0
-            };
-        // Header (t3code settled-shelf toggle): muted 12px label, a hairline
-        // filling the middle, chevron flipping open/closed. The count only
-        // shows while collapsed — expanded, the rows speak for themselves.
-        let label: SharedString = if open {
-            "Archived".into()
+        let selected = self.state.read(cx).selected_chat.clone();
+        let selected_wash = crate::theme::glass_selected_bg();
+        // The archived zone mirrors the active zone's structure: when the
+        // sidebar shows project folders, settled history nests in (grayed)
+        // folders too; a filtered or flat view keeps the flat shelf.
+        let folders_active = filter.is_none()
+            && matches!(
+                self.settings.sidebar_organization,
+                SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
+            );
+        let (body_height, body): (f32, AnyElement) = if folders_active {
+            self.render_archived_folders(rows, now, selected.as_deref(), selected_wash, theme, cx)
         } else {
-            format!("Archived ({total})").into()
-        };
-        let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
-            .id("archived-toggle")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let was_open = this.archived_open;
-                this.begin_sidebar_disclosure_motion(
-                    "archived",
-                    if was_open { body_height } else { 0.0 },
-                    if was_open { 0.0 } else { body_height },
-                );
-                this.archived_open = !was_open;
-                this.archived_shown = INITIAL;
-                cx.notify();
-            }));
-        let section = div().flex().flex_col().child(header);
-        let body = {
-            let selected = self.state.read(cx).selected_chat.clone();
-            let selected_wash = crate::theme::glass_selected_bg();
+            let shown = self.archived_shown.max(INITIAL);
+            let visible_count = total.min(shown);
+            let has_more = total > shown;
+            let height = SIDEBAR_DISCLOSURE_BODY_INSET
+                + visible_count as f32 * 36.0
+                + visible_count.saturating_sub(1) as f32 * SIDEBAR_LIST_GAP
+                + if has_more {
+                    36.0 + SIDEBAR_LIST_GAP
+                } else {
+                    0.0
+                };
             let mut list = div()
                 .flex()
                 .flex_col()
                 .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
                 .gap(px(SIDEBAR_LIST_GAP));
             for chat in rows.into_iter().take(shown) {
-                let id = chat.id.clone();
-                let hovered = self.archived_hover.as_deref() == Some(id.as_str());
-                let is_selected = selected.as_deref() == Some(id.as_str());
-                let title: SharedString = transcript::single_line(
-                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                )
-                .into();
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let brand = if self.settings.sidebar_show_harness {
-                    chat.config
-                        .as_ref()
-                        .map(|c| crate::pickers::harness_brand_icon(c.harness))
-                } else {
-                    None
-                };
-                // Right slot: time at rest; the Unarchive affordance takes
-                // its place on row hover (t3code: "only the time/jump label
-                // yields to the settle affordance").
-                let right: AnyElement = if hovered {
-                    let restore_id = id.clone();
-                    // Metrics match the active rows' Archive pill exactly
-                    // (18px pill, 11px icon, 10px label, padding bled right)
-                    // — two sizes of the same affordance read as a mistake.
-                    div()
-                        .id(SharedString::from(format!("archived-restore-{id}")))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(4.0))
-                        .h(px(18.0))
-                        .px(px(4.0))
-                        .mr(px(-4.0))
-                        .rounded(px(5.0))
-                        .bg(crate::theme::wash(0.10))
-                        .hover(|s| s.bg(crate::theme::wash(0.18)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_chat_archived(restore_id.clone(), false, cx);
-                        }))
-                        .child(
-                            crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::typography::ui_rems(10.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from("Unarchive")),
-                        )
-                        .into_any_element()
-                } else {
-                    div()
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_muted.opacity(0.55))
-                        .child(time_ago)
-                        .into_any_element()
-                };
-                let hover_id = id.clone();
-                let open_id = id.clone();
-                let menu_id = id.clone();
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("archived-{id}")))
-                        .h(px(36.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP))
-                        .px(px(Theme::SPACE_SM))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
-                        .when(is_selected, |el| el.bg(selected_wash))
-                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
-                        .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
-                            if *entered {
-                                if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
-                                    this.archived_hover = Some(hover_id.clone());
-                                    cx.notify();
-                                }
-                            } else if this.archived_hover.as_deref() == Some(hover_id.as_str()) {
-                                this.archived_hover = None;
-                                cx.notify();
-                            }
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_chat(open_id.clone(), cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                this.chat_menu.open(ChatMenuState {
-                                    chat_id: menu_id.clone(),
-                                    position: event.position,
-                                    page: ChatMenuPage::Root,
-                                });
-                                cx.notify();
-                            }),
-                        )
-                        // Archived history recedes: dimmed mark at rest,
-                        // restored on hover (t3code's grayscale favicon).
-                        .when_some(brand, |el, (mark, tint)| {
-                            el.child(
-                                crate::icons::icon(mark)
-                                    .size(px(SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(if hovered || is_selected {
-                                        tint.unwrap_or(theme.text_muted)
-                                    } else {
-                                        tint.unwrap_or(theme.text_muted).opacity(0.4)
-                                    }),
-                            )
-                        })
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(crate::typography::ui_rems(13.0))
-                                .text_color(if hovered || is_selected {
-                                    theme.text
-                                } else {
-                                    theme.text.opacity(0.55)
-                                })
-                                .child(title),
-                        )
-                        .child(right),
-                );
+                list = list.child(self.render_archived_row(
+                    chat,
+                    now,
+                    selected.as_deref(),
+                    selected_wash,
+                    theme,
+                    cx,
+                ));
             }
             let mut body = div().w_full().flex().flex_col().child(list);
             if has_more {
@@ -1544,11 +2088,374 @@ impl Shell {
                         .child(SharedString::from(format!("Show {remaining} more"))),
                 );
             }
-            body.into_any_element()
+            (height, body.into_any_element())
         };
+        // Header (t3code settled-shelf toggle): muted 12px label, a hairline
+        // filling the middle, chevron flipping open/closed. The count only
+        // shows while collapsed — expanded, the rows speak for themselves.
+        let label: SharedString = if open {
+            "Archived".into()
+        } else {
+            format!("Archived ({total})").into()
+        };
+        let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
+        let header = sidebar_disclosure_header(theme, label, chevron)
+            .id("archived-toggle")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let was_open = this.archived_open;
+                this.begin_sidebar_disclosure_motion(
+                    "archived",
+                    if was_open { body_height } else { 0.0 },
+                    if was_open { 0.0 } else { body_height },
+                );
+                this.archived_open = !was_open;
+                this.archived_shown = INITIAL;
+                cx.notify();
+            }));
         let body = self.render_sidebar_disclosure_body("archived", open, body_height, body);
-        let section = section.pt(px(SIDEBAR_SECTION_GAP)).child(body);
+        let section = div()
+            .flex()
+            .flex_col()
+            .pt(px(SIDEBAR_SECTION_GAP))
+            .child(header)
+            .child(body);
         Some(section.into_any_element())
+    }
+
+    /// The archived zone's folder layout: chats nested in project folders
+    /// that mirror the active zone's (same header cloth, disclosure motion,
+    /// per-folder "Show more") but grayed — settled history recedes. Folder
+    /// order is plain recency (first appearance in the sorted walk); nothing
+    /// is persisted and nothing drags — stability serves the workspace, not
+    /// the graveyard. Collapse keys wear the `archived-folder:` prefix so the
+    /// same project's active and archived folders fold independently (the
+    /// same project appearing in both zones is lifecycle, not duplication).
+    /// Returns the zone body's height and element.
+    fn render_archived_folders(
+        &mut self,
+        rows: Vec<comet_proto::Chat>,
+        now: chrono::DateTime<Utc>,
+        selected: Option<&str>,
+        selected_wash: gpui::Hsla,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> (f32, AnyElement) {
+        struct ArchivedFolder {
+            key: String,
+            label: SharedString,
+            no_project: bool,
+            chats: Vec<comet_proto::Chat>,
+        }
+        let mut folders: Vec<ArchivedFolder> = Vec::new();
+        {
+            let state = self.state.read(cx);
+            for chat in rows {
+                let (key, label, no_project) = chat_folder_key(state, &chat);
+                if let Some(folder) = folders.iter_mut().find(|f| f.key == key) {
+                    folder.chats.push(chat);
+                } else {
+                    folders.push(ArchivedFolder {
+                        key,
+                        label: SharedString::from(label),
+                        no_project,
+                        chats: vec![chat],
+                    });
+                }
+            }
+        }
+        folders.sort_by_key(|folder| folder.no_project);
+
+        let mut zone_height: f32 = 0.0;
+        let mut column = div().w_full().flex().flex_col();
+        for folder in folders {
+            let collapse_key = format!("archived-folder:{}", folder.key);
+            let motion_key = format!("group:{collapse_key}");
+            let total = folder.chats.len();
+            let shown = self
+                .sidebar_folder_shown
+                .get(&collapse_key)
+                .copied()
+                .unwrap_or(FOLDER_INITIAL);
+            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+            // A selected archived chat forces its folder to page far enough to
+            // draw it and to render open, so the shelf never highlights a chat
+            // with no row (same rule as the active folders).
+            let ids: Vec<&str> = folder.chats.iter().map(|c| c.id.as_str()).collect();
+            let (expanded, visible_count) = folder_visibility(&ids, shown, collapsed, selected);
+            // The selected chat pins its folder open; the collapse click must
+            // not play a close tween it cannot win (mirrors the active folders).
+            let holds_selected = selected.is_some_and(|s| ids.iter().any(|id| *id == s));
+            let has_more = total > visible_count;
+            let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
+                + visible_count as f32 * 36.0
+                + SIDEBAR_LIST_GAP * visible_count.saturating_sub(1) as f32
+                + if has_more {
+                    PAGER_ROW_HEIGHT + SIDEBAR_LIST_GAP
+                } else {
+                    0.0
+                };
+
+            let mut rows_column = div()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+                .gap(px(SIDEBAR_LIST_GAP));
+            for chat in folder.chats.into_iter().take(visible_count) {
+                rows_column = rows_column.child(self.render_archived_row(
+                    chat,
+                    now,
+                    selected,
+                    selected_wash,
+                    theme,
+                    cx,
+                ));
+            }
+            let mut body_inner = div().w_full().flex().flex_col().child(rows_column);
+            if has_more {
+                let remaining = (total - visible_count).min(FOLDER_PAGE);
+                let more_key = collapse_key.clone();
+                body_inner = body_inner.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "archived-folder-more-{collapse_key}"
+                        )))
+                        .mt(px(SIDEBAR_LIST_GAP))
+                        .h(px(PAGER_ROW_HEIGHT))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(Theme::SPACE_SM))
+                        .rounded(px(8.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let shown = this
+                                .sidebar_folder_shown
+                                .entry(more_key.clone())
+                                .or_insert(FOLDER_INITIAL);
+                            *shown = (*shown).max(FOLDER_INITIAL) + FOLDER_PAGE;
+                            cx.notify();
+                        }))
+                        .child(icon(icons::PLUS).size(px(12.0)).flex_none())
+                        .child(SharedString::from(format!("Show {remaining} more"))),
+                );
+            }
+
+            let visible_label: SharedString = if !expanded {
+                format!("{} ({total})", folder.label).into()
+            } else {
+                folder.label.clone()
+            };
+            let chevron = self.sidebar_disclosure_chevron(&motion_key, expanded, theme);
+            let toggle_key = collapse_key.clone();
+            let toggle_motion = motion_key.clone();
+            // The active folders' exact header, dimmed whole — no attention
+            // dot in the graveyard (settled work has no live status).
+            let header = sidebar_folder_header(theme, visible_label, None, chevron)
+                .opacity(0.55)
+                .id(SharedString::from(format!(
+                    "sidebar-archived-folder-{collapse_key}"
+                )))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let currently_collapsed = this.sidebar_collapsed_groups.contains(&toggle_key);
+                    // A selected archived chat pins this folder open: skip the
+                    // close tween it cannot win, just record the intent.
+                    if holds_selected {
+                        if currently_collapsed {
+                            this.sidebar_collapsed_groups.remove(&toggle_key);
+                        } else {
+                            this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    let was_open = !currently_collapsed;
+                    this.begin_sidebar_disclosure_motion(
+                        &toggle_motion,
+                        if was_open { body_height } else { 0.0 },
+                        if was_open { 0.0 } else { body_height },
+                    );
+                    if was_open {
+                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                    } else {
+                        this.sidebar_collapsed_groups.remove(&toggle_key);
+                    }
+                    cx.notify();
+                }));
+            let body = self.render_sidebar_disclosure_body(
+                &motion_key,
+                expanded,
+                body_height,
+                body_inner.into_any_element(),
+            );
+            // The zone's own frame is not animated, so track a folder's
+            // in-flight tween height — otherwise the shelf snaps to the
+            // target and clips the folder mid-collapse.
+            let resting = if expanded { body_height } else { 0.0 };
+            let effective = self
+                .sidebar_disclosure_motion
+                .get(&motion_key)
+                .copied()
+                .filter(|motion| motion.animating())
+                .map(SidebarDisclosureMotion::current)
+                .unwrap_or(resting);
+            zone_height += SIDEBAR_DISCLOSURE_SECTION_HEIGHT + effective;
+            column = column.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .pt(px(SIDEBAR_SECTION_GAP))
+                    .child(header)
+                    .child(body),
+            );
+        }
+        (zone_height, column.into_any_element())
+    }
+
+    /// One archived 36px slim row (dimmed harness mark, title, time-ago that
+    /// yields to the Unarchive pill on row hover) — shared by the flat shelf
+    /// and the archived project folders.
+    fn render_archived_row(
+        &mut self,
+        chat: comet_proto::Chat,
+        now: chrono::DateTime<Utc>,
+        selected: Option<&str>,
+        selected_wash: gpui::Hsla,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = chat.id.clone();
+        let hovered = self.archived_hover.as_deref() == Some(id.as_str());
+        let is_selected = selected == Some(id.as_str());
+        let title: SharedString =
+            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
+                .into();
+        let time_ago: SharedString =
+            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+        let brand = if self.settings.sidebar_show_harness {
+            chat.config
+                .as_ref()
+                .map(|c| crate::pickers::harness_brand_icon(c.harness))
+        } else {
+            None
+        };
+        // Right slot: time at rest; the Unarchive affordance takes
+        // its place on row hover (t3code: "only the time/jump label
+        // yields to the settle affordance").
+        let right: AnyElement = if hovered {
+            let restore_id = id.clone();
+            // Metrics match the active rows' Archive pill exactly
+            // (18px pill, 11px icon, 10px label, padding bled right)
+            // — two sizes of the same affordance read as a mistake.
+            div()
+                .id(SharedString::from(format!("archived-restore-{id}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .h(px(18.0))
+                .px(px(4.0))
+                .mr(px(-4.0))
+                .rounded(px(5.0))
+                .bg(crate::theme::wash(0.10))
+                .hover(|s| s.bg(crate::theme::wash(0.18)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_chat_archived(restore_id.clone(), false, cx);
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                        .size(px(11.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Unarchive")),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted.opacity(0.55))
+                .child(time_ago)
+                .into_any_element()
+        };
+        let hover_id = id.clone();
+        let open_id = id.clone();
+        let menu_id = id.clone();
+        div()
+            .id(SharedString::from(format!("archived-{id}")))
+            .h(px(36.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP))
+            .px(px(Theme::SPACE_SM))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .when(is_selected, |el| el.bg(selected_wash))
+            .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
+            .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                if *entered {
+                    if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
+                        this.archived_hover = Some(hover_id.clone());
+                        cx.notify();
+                    }
+                } else if this.archived_hover.as_deref() == Some(hover_id.as_str()) {
+                    this.archived_hover = None;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_chat(open_id.clone(), cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.chat_menu.open(ChatMenuState {
+                        chat_id: menu_id.clone(),
+                        position: event.position,
+                        page: ChatMenuPage::Root,
+                    });
+                    cx.notify();
+                }),
+            )
+            // Archived history recedes: dimmed mark at rest,
+            // restored on hover (t3code's grayscale favicon).
+            .when_some(brand, |el, (mark, tint)| {
+                el.child(
+                    crate::icons::icon(mark)
+                        .size(px(SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE))
+                        .flex_none()
+                        .text_color(if hovered || is_selected {
+                            tint.unwrap_or(theme.text_muted)
+                        } else {
+                            tint.unwrap_or(theme.text_muted).opacity(0.4)
+                        }),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .text_color(if hovered || is_selected {
+                        theme.text
+                    } else {
+                        theme.text.opacity(0.55)
+                    })
+                    .child(title),
+            )
+            .child(right)
+            .into_any_element()
     }
 
     // ---- add-space flow (the ⌘K palette) ----
@@ -3042,11 +3949,44 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
+    use std::collections::HashMap;
+
+    use comet_proto::ChatIndicator;
+
+    use super::{
+        FOLDER_INITIAL, FolderActivity, NO_PROJECT_KEY, chat_activity_at, chat_folder_key,
+        compare_archived_chats, compare_sidebar_chats, folder_visibility, hold_order,
+        promote_local_device_group,
+    };
     use crate::settings::SidebarSort;
+    use crate::state::AppState;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])
+    }
+
+    fn space(id: &str, device_id: &str, path: &str, name: &str) -> comet_proto::Space {
+        comet_proto::Space {
+            id: id.into(),
+            device_id: device_id.into(),
+            path: path.into(),
+            name: Some(name.into()),
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc.timestamp_opt(1, 0).unwrap(),
+        }
+    }
+
+    fn device(id: &str, name: &str) -> comet_proto::Device {
+        comet_proto::Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
     }
 
     fn chat(id: &str) -> comet_proto::Chat {
@@ -3067,6 +4007,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            archived_at: None,
             room_gen: None,
         }
     }
@@ -3077,6 +4018,24 @@ mod tests {
         let beta = chat("beta");
         assert!(compare_sidebar_chats(SidebarSort::Created, &alpha, &beta).is_lt());
         assert!(compare_sidebar_chats(SidebarSort::LastUpdated, &alpha, &beta).is_lt());
+    }
+
+    #[test]
+    fn archived_shelf_orders_by_archive_time_with_message_fallback() {
+        // Fixture chats: last message at 10, created at 5.
+        let mut put_away = chat("put-away");
+        put_away.archived_at = Some(Utc.timestamp_opt(50, 0).unwrap());
+        let mut chatty = chat("chatty");
+        chatty.last_message_at = Some(Utc.timestamp_opt(20, 0).unwrap());
+        // The archive stamp beats a newer last message…
+        assert!(compare_archived_chats(SidebarSort::LastUpdated, &put_away, &chatty).is_lt());
+        // …a row without a stamp falls back to its last message…
+        let legacy = chat("legacy");
+        assert!(compare_archived_chats(SidebarSort::LastUpdated, &chatty, &legacy).is_lt());
+        // …and Created ignores both.
+        let mut older = chat("older");
+        older.created_at = Utc.timestamp_opt(1, 0).unwrap();
+        assert!(compare_archived_chats(SidebarSort::Created, &put_away, &older).is_lt());
     }
 
     #[test]
@@ -3104,5 +4063,265 @@ mod tests {
         promote_local_device_group(&mut groups, Some("not-present"));
 
         assert_eq!(groups, before);
+    }
+
+    #[test]
+    fn folder_keys_merge_by_project_name() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![
+            space("s1", "devA", "/home/maps", "gonzocity-maps"),
+            space("s2", "devB", "/home/maps", "gonzocity-maps"),
+            space("s3", "devA", "/home/skills", "skills"),
+        ]);
+        let mut a = chat("a");
+        a.space_id = Some("s1".into());
+        a.device_id = "devA".into();
+        let mut b = chat("b");
+        b.space_id = Some("s2".into());
+        b.device_id = "devB".into();
+        let mut loose = chat("loose");
+        loose.space_id = None;
+
+        // One folder per project name, across devices.
+        assert_eq!(
+            chat_folder_key(&state, &a),
+            (
+                "gonzocity-maps".to_string(),
+                "gonzocity-maps".to_string(),
+                false
+            )
+        );
+        assert_eq!(chat_folder_key(&state, &b).0, "gonzocity-maps");
+        // Project-less chats share the pinned "No project" bucket.
+        assert_eq!(
+            chat_folder_key(&state, &loose),
+            (NO_PROJECT_KEY.to_string(), "No project".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn device_label_marks_the_local_machine() {
+        let mut state = AppState::new();
+        state.apply_devices(vec![device("devA", "Mac Studio"), device("devB", "Air")]);
+        state.local_device_id = Some("devA".into());
+        assert_eq!(state.device_label("devA"), ("Mac Studio".to_string(), true));
+        assert_eq!(state.device_label("devB"), ("Air".to_string(), false));
+    }
+
+    fn keys(list: &[&str]) -> Vec<String> {
+        list.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn at(secs: i64) -> chrono::DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0).unwrap()
+    }
+
+    fn folder(key: &str, activity_secs: i64, no_project: bool) -> FolderActivity {
+        FolderActivity {
+            key: key.into(),
+            activity_at: at(activity_secs),
+            no_project,
+        }
+    }
+
+    const WINDOW_SECS: i64 = 1_000;
+
+    #[test]
+    fn hold_seeds_the_active_block_by_recency_and_pins_no_project_last() {
+        let now = at(10_000);
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let folders = [
+            folder("old", 1_000, false),
+            folder("b", 9_500, false),
+            folder(NO_PROJECT_KEY, 9_999, true),
+            folder("a", 9_900, false),
+            folder("older", 500, false),
+        ];
+        let (order, next) = hold_order(&folders, &HashMap::new(), now, window);
+        assert_eq!(order, keys(&["a", "b", "old", "older", NO_PROJECT_KEY]));
+        // Only the active folders are held, with entered_at = their activity.
+        assert_eq!(next.len(), 2);
+        assert_eq!(next["a"], at(9_900));
+        assert_eq!(next["b"], at(9_500));
+    }
+
+    #[test]
+    fn activity_inside_the_block_never_reorders_it() {
+        let now = at(10_000);
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let mut folders = [folder("a", 9_900, false), folder("b", 9_500, false)];
+        let (_, hold) = hold_order(&folders, &HashMap::new(), now, window);
+        // b (below a) gets the newest activity: it must NOT overtake a.
+        folders[1].activity_at = now;
+        let (order, next) = hold_order(&folders, &hold, now, window);
+        assert_eq!(order, keys(&["a", "b"]));
+        assert_eq!(next["b"], hold["b"], "entered_at stays frozen while active");
+    }
+
+    #[test]
+    fn a_dormant_folder_enters_at_the_top_of_the_block() {
+        let now = at(10_000);
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let mut folders = [
+            folder("a", 9_900, false),
+            folder("b", 9_500, false),
+            folder("d", 100, false),
+        ];
+        let (order, hold) = hold_order(&folders, &HashMap::new(), now, window);
+        assert_eq!(order, keys(&["a", "b", "d"]));
+        // d wakes up: it joins the block on top; a and b keep their order.
+        folders[2].activity_at = now;
+        let (order, next) = hold_order(&folders, &hold, now, window);
+        assert_eq!(order, keys(&["d", "a", "b"]));
+        assert_eq!(next["d"], now);
+    }
+
+    #[test]
+    fn an_expired_folder_drops_into_the_recency_tail() {
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let mut folders = [
+            folder("a", 9_900, false),
+            folder("b", 9_500, false),
+            folder("c", 8_000, false),
+        ];
+        let (order, hold) = hold_order(&folders, &HashMap::new(), at(10_000), window);
+        assert_eq!(order, keys(&["a", "b", "c"]));
+        // Time passes: a keeps working, b goes quiet past the window.
+        folders[0].activity_at = at(10_400);
+        let (order, next) = hold_order(&folders, &hold, at(10_600), window);
+        assert_eq!(
+            order,
+            keys(&["a", "b", "c"]),
+            "b lands right under the block"
+        );
+        assert!(!next.contains_key("b"), "expired folders leave the hold");
+        assert_eq!(next["a"], hold["a"], "a's entry stays frozen");
+    }
+
+    #[test]
+    fn vanished_folders_are_pruned_from_the_hold() {
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let hold = HashMap::from([("gone".to_string(), at(9_900))]);
+        let (_, next) = hold_order(&[folder("a", 9_800, false)], &hold, at(10_000), window);
+        assert!(!next.contains_key("gone"));
+        assert_eq!(next["a"], at(9_800));
+    }
+
+    #[test]
+    fn live_sessions_count_as_activity_now() {
+        let now = at(10_000);
+        let live = chat("x"); // last_message_at 10, created_at 5
+        assert_eq!(chat_activity_at(ChatIndicator::Working, &live, now), now);
+        assert_eq!(
+            chat_activity_at(ChatIndicator::AwaitingInput, &live, now),
+            now
+        );
+        assert_eq!(chat_activity_at(ChatIndicator::Idle, &live, now), at(10));
+        assert_eq!(
+            chat_activity_at(ChatIndicator::Completed, &live, now),
+            at(10)
+        );
+        assert_eq!(chat_activity_at(ChatIndicator::Errored, &live, now), at(10));
+        let mut fresh = chat("y");
+        fresh.last_message_at = None;
+        assert_eq!(
+            chat_activity_at(ChatIndicator::Idle, &fresh, now),
+            fresh.created_at
+        );
+    }
+
+    // A folder's chat ids in draw order.
+    fn seq(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    fn refs(ids: &[String]) -> Vec<&str> {
+        ids.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn folder_shows_all_rows_when_within_the_page() {
+        let ids = seq("c", 3);
+        assert_eq!(
+            folder_visibility(&refs(&ids), FOLDER_INITIAL, false, None),
+            (true, 3)
+        );
+    }
+
+    #[test]
+    fn folder_pages_its_tail_out_of_the_jump_order() {
+        // 10 chats, initial page: the first 8 are the visible / jump rows; 9–10
+        // sit behind "Show more" and must not be in the keyboard order.
+        let ids = seq("c", 10);
+        let (expanded, visible) = folder_visibility(&refs(&ids), FOLDER_INITIAL, false, None);
+        assert_eq!((expanded, visible), (true, FOLDER_INITIAL));
+        assert!(!ids[..visible].contains(&"c8".to_string()));
+        assert!(!ids[..visible].contains(&"c9".to_string()));
+    }
+
+    #[test]
+    fn folder_page_never_drops_below_the_initial_count() {
+        // A stale `shown` below the initial count still shows the full page.
+        let ids = seq("c", 10);
+        assert_eq!(
+            folder_visibility(&refs(&ids), 3, false, None),
+            (true, FOLDER_INITIAL)
+        );
+        // ...capped at the folder's actual size.
+        let few = seq("c", 5);
+        assert_eq!(folder_visibility(&refs(&few), 3, false, None), (true, 5));
+    }
+
+    #[test]
+    fn selected_chat_beyond_the_page_is_forced_into_view() {
+        // Selecting the 13th chat pages the folder just far enough to draw it,
+        // so the sidebar never highlights a chat with no row.
+        let ids = seq("c", 20);
+        assert_eq!(
+            folder_visibility(&refs(&ids), FOLDER_INITIAL, false, Some("c12")),
+            (true, 13)
+        );
+    }
+
+    #[test]
+    fn collapsed_folder_is_excluded_from_the_keyboard_order() {
+        // A collapsed folder draws no rows: the caller skips it entirely when
+        // `expanded` is false.
+        let ids = seq("c", 10);
+        let (expanded, _) = folder_visibility(&refs(&ids), FOLDER_INITIAL, true, None);
+        assert!(!expanded);
+    }
+
+    #[test]
+    fn collapsed_folder_holding_the_selected_chat_renders_open() {
+        // The selected chat wins over a collapse: the folder force-opens and
+        // pages far enough to draw it.
+        let ids = seq("c", 20);
+        assert_eq!(
+            folder_visibility(&refs(&ids), FOLDER_INITIAL, true, Some("c12")),
+            (true, 13)
+        );
+    }
+
+    #[test]
+    fn keyboard_order_is_the_drawn_rows_across_folders() {
+        // The jump/cycle order = the drawn rows: expanded folders contribute
+        // their page (paged tail dropped), a collapsed folder contributes
+        // nothing.
+        let a = seq("a", 10);
+        let b = seq("b", 4);
+        let c = seq("c", 2);
+        let folders = [(&a, false), (&b, true), (&c, false)];
+        let mut order: Vec<String> = Vec::new();
+        for (ids, collapsed) in folders {
+            let (expanded, visible) =
+                folder_visibility(&refs(ids), FOLDER_INITIAL, collapsed, None);
+            if expanded {
+                order.extend(ids.iter().take(visible).cloned());
+            }
+        }
+        let mut expected: Vec<String> = a.iter().take(FOLDER_INITIAL).cloned().collect();
+        expected.extend(c.iter().cloned());
+        assert_eq!(order, expected);
     }
 }

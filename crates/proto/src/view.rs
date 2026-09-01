@@ -135,6 +135,55 @@ pub fn sort_chats(chats: &mut [Chat]) {
     });
 }
 
+/// The archived shelf's recency: when the chat was put away, falling back to
+/// its last message (rows archived before `archived_at` existed), then its
+/// creation. A list's order follows the event that put a row in it —
+/// messages for the active list, the archive action here.
+pub fn archived_recency(chat: &Chat) -> DateTime<Utc> {
+    chat.archived_at
+        .or(chat.last_message_at)
+        .unwrap_or(chat.created_at)
+}
+
+#[cfg(test)]
+mod archived_recency_tests {
+    use super::*;
+
+    fn at(ms: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp_millis(ms).unwrap()
+    }
+
+    fn chat(created: i64, last_message: Option<i64>, archived: Option<i64>) -> Chat {
+        Chat {
+            id: "chat".into(),
+            device_id: "dev".into(),
+            title: None,
+            archived: archived.is_some(),
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: last_message.map(at),
+            created_at: at(created),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            archived_at: archived.map(at),
+            room_gen: None,
+        }
+    }
+
+    #[test]
+    fn archive_stamp_wins_then_last_message_then_creation() {
+        assert_eq!(archived_recency(&chat(1, Some(5), Some(9))), at(9));
+        assert_eq!(archived_recency(&chat(1, Some(5), None)), at(5));
+        assert_eq!(archived_recency(&chat(1, None, None)), at(1));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Boot gate
 // ---------------------------------------------------------------------------

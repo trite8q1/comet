@@ -170,11 +170,16 @@ fn flush_latest(cx: &mut App) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SidebarOrganization {
-    /// Legacy persisted value. Project scope now belongs exclusively to the
-    /// project selector and is normalized to [`Self::InOneList`] on load.
+    /// Legacy persisted value (the short-lived per-device folder mode). It
+    /// recreated duplicate-project confusion and is normalized to
+    /// [`Self::ByProjectMerged`] on load.
     ByProject,
-    ByDevice,
+    /// "By project": one collapsible folder per project *name*, merging a
+    /// repo across devices; chats carry their device when a folder spans
+    /// machines. Folders order by recency, like the flat list's rows.
     #[default]
+    ByProjectMerged,
+    ByDevice,
     InOneList,
 }
 
@@ -184,6 +189,32 @@ pub enum SidebarSort {
     #[default]
     LastUpdated,
     Created,
+}
+
+/// How long a project folder stays in the sidebar's active block after its
+/// last activity ("By project" view, Sort = Last updated) — an Arc-style
+/// archive window. The default matches one working session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum HoldWindow {
+    Hours2,
+    #[default]
+    Hours4,
+    Hours8,
+    Hours12,
+    Day1,
+}
+
+impl HoldWindow {
+    pub fn seconds(self) -> i64 {
+        match self {
+            Self::Hours2 => 2 * 60 * 60,
+            Self::Hours4 => 4 * 60 * 60,
+            Self::Hours8 => 8 * 60 * 60,
+            Self::Hours12 => 12 * 60 * 60,
+            Self::Day1 => 24 * 60 * 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,6 +229,8 @@ pub struct UiSettings {
     pub sidebar_organization: SidebarOrganization,
     /// Timestamp used to order active sessions (newest first).
     pub sidebar_sort: SidebarSort,
+    /// Activity hold window for project folders (see [`HoldWindow`]).
+    pub sidebar_hold_window: HoldWindow,
     /// Optional harness branding and repository metadata shown below each
     /// session title.
     pub sidebar_show_harness: bool,
@@ -271,8 +304,9 @@ impl Default for UiSettings {
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             sidebar_grouped: false,
-            sidebar_organization: SidebarOrganization::InOneList,
+            sidebar_organization: SidebarOrganization::ByProjectMerged,
             sidebar_sort: SidebarSort::LastUpdated,
+            sidebar_hold_window: HoldWindow::Hours4,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
@@ -678,7 +712,7 @@ impl UiSettings {
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
     pub fn clamped(mut self) -> Self {
         if self.sidebar_organization == SidebarOrganization::ByProject {
-            self.sidebar_organization = SidebarOrganization::InOneList;
+            self.sidebar_organization = SidebarOrganization::ByProjectMerged;
         }
         self.sidebar_width = clamp_or(
             self.sidebar_width,
@@ -769,6 +803,7 @@ mod tests {
             sidebar_grouped: true,
             sidebar_organization: SidebarOrganization::ByDevice,
             sidebar_sort: SidebarSort::Created,
+            sidebar_hold_window: HoldWindow::Hours12,
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
@@ -839,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_project_organization_normalizes_to_one_list() {
+    fn legacy_per_device_folders_normalize_to_merged() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
@@ -849,7 +884,7 @@ mod tests {
 
         assert_eq!(
             UiSettings::load(dir.path()).sidebar_organization,
-            SidebarOrganization::InOneList
+            SidebarOrganization::ByProjectMerged
         );
     }
 

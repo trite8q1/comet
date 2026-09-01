@@ -502,9 +502,10 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
 // and with their own test suite. Re-exported here because every call site in
 // this crate reads them as `state::…`.
 pub use comet_proto::view::{
-    ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
-    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, archived_recency,
+    attention_rank, chat_location, display_status, effective_indicator, format_time_ago,
+    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats, sort_spaces,
+    sort_tabs,
 };
 
 // ---------------------------------------------------------------------------
@@ -1254,6 +1255,20 @@ impl AppState {
             .device_name(&space.device_id)
             .unwrap_or("Unknown device");
         (format!("@ {device}"), offline)
+    }
+
+    /// The device label for a folder/chat, matching the composer's device chip
+    /// ([`crate::pickers`]): the device's real name plus a `true` "show Local
+    /// tag" flag when it is this machine (suppressed when the name is already
+    /// the local-only "Local" sentinel, to avoid "Local Local"). Callers render
+    /// the flag as a muted trailing "Local".
+    pub fn device_label(&self, device_id: &str) -> (String, bool) {
+        let name = self
+            .device_name(device_id)
+            .unwrap_or("Unknown device")
+            .to_string();
+        let show_local_tag = self.local_device_id.as_deref() == Some(device_id) && name != "Local";
+        (name, show_local_tag)
     }
 
     /// Does the selected space's folder have git? Drives the branch picker and
@@ -2613,6 +2628,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            archived_at: None,
             room_gen: None,
         }
     }

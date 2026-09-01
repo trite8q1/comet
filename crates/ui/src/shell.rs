@@ -578,7 +578,7 @@ fn sidebar_key_order_changed(old: &[(String, f32)], new: &[(String, f32)]) -> bo
 /// branch / pull-request rows add the exact height of their tallest child.
 /// Keeping this calculation beside the renderer's metrics prevents disclosure
 /// clips when view options alter the row structure.
-pub(super) fn chat_row_height(shows_branch: bool, shows_pull_request: bool) -> f32 {
+pub(super) fn chat_row_height(compact: bool, shows_branch: bool, shows_pull_request: bool) -> f32 {
     let mut metadata_height: f32 = 0.0;
     if shows_branch {
         metadata_height = metadata_height.max(14.0);
@@ -586,10 +586,14 @@ pub(super) fn chat_row_height(shows_branch: bool, shows_pull_request: bool) -> f
     if shows_pull_request {
         metadata_height = metadata_height.max(16.0);
     }
+    // Compact rows (folder views) fold the title onto line 1, so their base is
+    // a single 17px title line plus the 12px vertical padding; the standard
+    // card keeps its "project @ device" subline above the title.
+    let base = if compact { 29.0 } else { 45.0 };
     if metadata_height == 0.0 {
-        45.0
+        base
     } else {
-        47.0 + metadata_height
+        base + 2.0 + metadata_height
     }
 }
 /// Flex gap between sidebar list items.
@@ -1011,6 +1015,15 @@ pub struct Shell {
     pub(super) archived_hover: Option<String>,
     /// Ephemeral collapsed project/device sections, keyed by organization + id.
     pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
+    /// Per-folder "Show more" paging in the project-folder views, keyed by the
+    /// same organization + id folder key as `sidebar_collapsed_groups`. Absent
+    /// = the initial page; each click reveals another page. Session-transient.
+    pub(super) sidebar_folder_shown: std::collections::HashMap<String, usize>,
+    /// Activity hold for the "By project" view: folder key → the moment the
+    /// folder entered the active block (see `spaces::hold_order`). Frozen
+    /// while the folder stays active, so turns inside it never reorder the
+    /// block. Session-transient, like collapse state.
+    pub(super) sidebar_folder_hold: std::collections::HashMap<String, chrono::DateTime<Utc>>,
     /// In-flight disclosure tweens, shared by device groups and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -1315,6 +1328,8 @@ impl Shell {
             archived_shown: 0,
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
+            sidebar_folder_shown: std::collections::HashMap::new(),
+            sidebar_folder_hold: std::collections::HashMap::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
             terminal: None,
@@ -3869,7 +3884,10 @@ impl Shell {
         id: String,
         title: SharedString,
         time_ago: SharedString,
-        space_name: SharedString,
+        // Line-1 context ("project @ device", or just a device tag). `None`
+        // renders the compact folder-view row: the title folds onto line 1 and
+        // the redundant subline is dropped (the folder header carries it).
+        context: Option<SharedString>,
         branch: Option<SharedString>,
         change_request: Option<comet_proto::ChangeRequestSummary>,
         harness: Option<comet_proto::HarnessId>,
@@ -4091,6 +4109,128 @@ impl Shell {
         // dimmed the active row under the pointer (user report).
         let hover_bg = if selected { selected_wash } else { hover };
         let rest_text = if selected { text } else { text.opacity(0.8) };
+        // Harness mark beside the title — shared by both the standard card's
+        // line 2 and the compact folder row's line 1.
+        let title_fragment = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP))
+            .when_some(
+                harness.map(crate::pickers::harness_brand_icon),
+                |el, (path, tint)| {
+                    el.child(
+                        icon(path)
+                            .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                            .flex_none()
+                            .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .line_height(px(17.0))
+                    .child(title),
+            );
+        // Line 3 is structural, not reserved whitespace: compact states omit it
+        // completely when both Branch and Pull request are hidden.
+        let metadata_line: Option<AnyElement> = shows_metadata.then(|| {
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .when_some(branch, |el, branch| {
+                    el.child(
+                        icon(icons::GIT_BRANCH)
+                            .size(px(11.0))
+                            .flex_none()
+                            .text_color(subline),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .line_height(px(14.0))
+                            .text_color(subline)
+                            .child(branch),
+                    )
+                })
+                // Stable invisible spring keeps the optional PR badge pinned
+                // right without changing no-PR paint.
+                .child(div().flex_1().min_w_0())
+                .when_some(change_request, |el, summary| {
+                    el.child(crate::change_requests::pull_request_badge(
+                        format!("chat-pr-{id}").into(),
+                        summary,
+                        crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                        theme,
+                    ))
+                })
+                .into_any_element()
+        });
+        let corner_child = div().text_color(subline).child(corner);
+        let mut line_children: Vec<AnyElement> = Vec::new();
+        match context {
+            // Standard card: "project @ device" (or a device tag) on line 1,
+            // status corner right; the harness + title sit on line 2.
+            Some(context_text) => {
+                line_children.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .line_height(px(14.0))
+                                .text_color(subline)
+                                .child(context_text),
+                        )
+                        .child(corner_child)
+                        .into_any_element(),
+                );
+                line_children.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .child(title_fragment)
+                        .into_any_element(),
+                );
+            }
+            // Compact folder row: harness + title on line 1, status corner
+            // right; the folder header already names project and device.
+            None => {
+                line_children.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .child(title_fragment)
+                        .child(corner_child)
+                        .into_any_element(),
+                );
+            }
+        }
+        if let Some(metadata_line) = metadata_line {
+            line_children.push(metadata_line);
+        }
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
@@ -4137,96 +4277,7 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: "project @ device", status word / time-ago right.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
-                    )
-                    .child(div().text_color(subline).child(corner)),
-            )
-            // Line 2: harness identity belongs directly with the title,
-            // instead of floating as unrelated metadata below it.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(13.0))
-                            .line_height(px(17.0))
-                            .child(title),
-                    ),
-            )
-            // Line 3 is structural, not reserved whitespace: compact states
-            // omit it completely when both Branch and Pull request are hidden.
-            .when(shows_metadata, |row| {
-                row.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(4.0))
-                        .when_some(branch, |el, branch| {
-                            el.child(
-                                icon(icons::GIT_BRANCH)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(subline),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(11.0))
-                                    .line_height(px(14.0))
-                                    .text_color(subline)
-                                    .child(branch),
-                            )
-                        })
-                        // Stable invisible spring keeps the optional PR badge
-                        // pinned right without changing no-PR paint.
-                        .child(div().flex_1().min_w_0())
-                        .when_some(change_request, |el, summary| {
-                            el.child(crate::change_requests::pull_request_badge(
-                                format!("chat-pr-{id}").into(),
-                                summary,
-                                crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                                theme,
-                            ))
-                        }),
-                )
-            })
+            .children(line_children)
             .into_any_element()
     }
 
@@ -8544,10 +8595,16 @@ mod tests {
 
     #[test]
     fn sidebar_chat_height_tracks_visible_metadata() {
-        assert_eq!(chat_row_height(false, false), 45.0);
-        assert_eq!(chat_row_height(true, false), 61.0);
-        assert_eq!(chat_row_height(false, true), 63.0);
-        assert_eq!(chat_row_height(true, true), 63.0);
+        // Standard card (context on line 1, title on line 2).
+        assert_eq!(chat_row_height(false, false, false), 45.0);
+        assert_eq!(chat_row_height(false, true, false), 61.0);
+        assert_eq!(chat_row_height(false, false, true), 63.0);
+        assert_eq!(chat_row_height(false, true, true), 63.0);
+        // Compact folder row (title folds onto line 1): 16px shorter at the base.
+        assert_eq!(chat_row_height(true, false, false), 29.0);
+        assert_eq!(chat_row_height(true, true, false), 45.0);
+        assert_eq!(chat_row_height(true, false, true), 47.0);
+        assert_eq!(chat_row_height(true, true, true), 47.0);
     }
 
     #[test]

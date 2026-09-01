@@ -142,6 +142,12 @@ pub struct Chat {
     /// device clears the badge everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// When the chat was archived; cleared on unarchive, re-stamped on
+    /// re-archive. The archived shelf's recency — a list's order follows the
+    /// event that put a row in it (messages for the active list, the archive
+    /// action here). `None` on rows archived before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
     /// Which sync room generation serves this chat (docs/chat2-sync.md M2):
     /// `None`/1 = legacy s2 loro room, 2 = chat2 dumb relay. The HOST flips
     /// this in the same breath as seeding the chat2 checkpoint; every device

@@ -897,6 +897,7 @@ impl RegistryDoc {
             ),
             ("spaceId", opt_str(chat.space_id.as_deref())),
             ("lastSeenAt", opt_ms(chat.last_seen_at)),
+            ("archivedAt", opt_ms(chat.archived_at)),
             (
                 "roomGen",
                 chat.room_gen.map(|g| json!(g)).unwrap_or(Value::Null),
@@ -981,7 +982,15 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    pub fn set_chat_archived(&mut self, chat_id: &str, archived: bool) -> Result<bool, DocError> {
+    /// Flip the archive flag, stamping `archivedAt = at` on archive and
+    /// clearing it (Null) on unarchive — the archived shelf's recency. One
+    /// op, so the flag and its stamp never disagree.
+    pub fn set_chat_archived(
+        &mut self,
+        chat_id: &str,
+        archived: bool,
+        at: DateTime<Utc>,
+    ) -> Result<bool, DocError> {
         if !self.row_exists(KIND_CHATS, chat_id) {
             return Ok(false);
         }
@@ -989,7 +998,10 @@ impl RegistryDoc {
             KIND_CHATS,
             chat_id,
             OpKind::Update,
-            fields([("archived", json!(archived))]),
+            fields([
+                ("archived", json!(archived)),
+                ("archivedAt", opt_ms(archived.then_some(at))),
+            ]),
         );
         Ok(true)
     }
@@ -1244,6 +1256,7 @@ impl RegistryDoc {
             let ms = newest(&[
                 chat.last_message_at,
                 chat.last_seen_at,
+                chat.archived_at,
                 Some(chat.created_at),
             ]);
             let config = match &chat.config {
@@ -1279,6 +1292,7 @@ impl RegistryDoc {
                     ),
                     ("spaceId", opt_str(chat.space_id.as_deref())),
                     ("lastSeenAt", opt_ms(chat.last_seen_at)),
+                    ("archivedAt", opt_ms(chat.archived_at)),
                 ]),
             );
         }
