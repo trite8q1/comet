@@ -606,6 +606,11 @@ impl Auth {
             )
             .await?;
         let user = updated.user.into_auth_user();
+        // Serialize the store write with refresh(): a refresh that authenticated
+        // just before our PATCH carries the pre-rename profile, and without the
+        // gate its later write would clobber the new name until the next refresh.
+        // Taken after the PATCH (authed_json may refresh, which locks this gate).
+        let _gate = self.inner.refresh_gate.lock().await;
         let org_id = {
             let mut stored = lock(&self.inner.stored);
             let Some(session) = stored.as_mut() else {

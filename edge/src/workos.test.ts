@@ -7,7 +7,7 @@ describe("splitName", () => {
   });
 
   it("leaves lastName empty for a single word", () => {
-    expect(splitName("Cher")).toEqual({ firstName: "Cher", lastName: null });
+    expect(splitName("Cher")).toEqual({ firstName: "Cher", lastName: "" });
   });
 
   it("ignores surrounding and repeated whitespace", () => {

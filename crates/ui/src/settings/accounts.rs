@@ -1218,7 +1218,11 @@ impl AccountsPage {
         self.state.read(cx).auth_user()?;
         let current = self.current_name(cx);
         let typed = self.name_input.read(cx).text().trim().to_string();
-        let can_save = !self.saving_name && !typed.is_empty() && typed != current;
+        // Mirror `submit_display_name`'s guard: empty, >80, or unchanged can't be
+        // saved. Without the length bound, a too-long name lit Save up and the
+        // click was then a silent no-op.
+        let can_save =
+            !self.saving_name && !typed.is_empty() && typed.chars().count() <= 80 && typed != current;
 
         // Same fill and metrics as btn_primary, but hover/cursor/click only when
         // there is something to save — btn_primary bakes in a hover that would

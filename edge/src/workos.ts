@@ -101,12 +101,15 @@ const toUser = (u: WireUser): AuthUser => ({
 
 /** One display name → WorkOS's split fields: the first word is the first
  * name, the rest (if any) the last name. Comet only ever shows them joined,
- * so the display round-trips exactly. */
-export const splitName = (name: string): { firstName: string; lastName: string | null } => {
+ * so the display round-trips exactly. A single-word name yields an empty
+ * `lastName` (never `null`): "Update a User" types `last_name` as an optional
+ * string, so an empty string clears a prior last name, while JSON `null` is
+ * off-spec and can 400 or be treated as "unchanged". */
+export const splitName = (name: string): { firstName: string; lastName: string } => {
   const words = name.trim().split(/\s+/);
   const firstName = words[0] ?? "";
-  const rest = words.slice(1).join(" ");
-  return { firstName, lastName: rest.length > 0 ? rest : null };
+  const lastName = words.slice(1).join(" ");
+  return { firstName, lastName };
 };
 
 /** `authenticateWithCode`: WorkOS code → tokens + user. */

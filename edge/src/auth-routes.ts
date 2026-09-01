@@ -124,7 +124,12 @@ export const handleAuthRoute = async (
     try {
       return json({ user: await updateUser(apiKey, caller.userId, trimmed) });
     } catch (e) {
-      return authFailed(e);
+      // The caller already cleared the bearer gate above, so a failure here is
+      // WorkOS rejecting the update, not an auth problem — 502, not 401.
+      return json(
+        { error: e instanceof WorkOsAuthFailed ? e.message : "profile update failed" },
+        502
+      );
     }
   }
 
