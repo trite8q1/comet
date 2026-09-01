@@ -1034,6 +1034,7 @@ impl AuthRpc {
                 | methods::LIST_ORGS
                 | methods::CREATE_ORG
                 | methods::SELECT_ORG
+                | methods::UPDATE_PROFILE
         )
     }
 }
@@ -1100,6 +1101,18 @@ impl RpcService for AuthRpc {
                 let p: P = parse_params(params)?;
                 self.auth
                     .select_org(&p.organization_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::UPDATE_PROFILE => {
+                #[derive(Deserialize)]
+                struct P {
+                    name: String,
+                }
+                let p: P = parse_params(params)?;
+                self.auth
+                    .update_name(&p.name)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))

@@ -189,21 +189,42 @@ pub struct AccountsPage {
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
+    /// The always-visible Display name field, plus the value it was last seeded
+    /// with — the field follows the live account name until the user edits it.
+    name_input: Entity<ComposerInput>,
+    name_seed: String,
+    /// UpdateProfile in flight.
+    saving_name: bool,
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
+    name_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
+    _name_events: Subscription,
 }
 
 impl AccountsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        // The Display name field follows the live account name (see
+        // `sync_name_input`), so a state change re-seeds it, not just repaints.
+        let observe = cx.observe(&state, |this, _, cx| {
+            this.sync_name_input(cx);
+            cx.notify();
+        });
         let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.submit_code(cx);
             }
+        });
+        let name_input = cx.new(|cx| ComposerInput::new("Your name", cx));
+        let name_events = cx.subscribe(&name_input, |this: &mut Self, _, event, cx| match event {
+            // Enter commits; every edit repaints so the Save button tracks
+            // whether there is an unsaved, non-empty change.
+            ComposerInputEvent::Submitted => this.submit_display_name(cx),
+            ComposerInputEvent::Edited => cx.notify(),
+            _ => {}
         });
         let mut page = Self {
             state,
@@ -214,12 +235,21 @@ impl AccountsPage {
             login: None,
             error: None,
             code_input,
+            name_input,
+            name_seed: String::new(),
+            saving_name: false,
             load_task: None,
             action_task: None,
             poll_task: None,
+            name_task: None,
             _observe: observe,
             _code_events: code_events,
+            _name_events: name_events,
         };
+        // Seed the field if the account is already known at mount (the common
+        // case — Settings opens from a signed-in shell); otherwise `observe`
+        // seeds it when the AuthStatus frame arrives.
+        page.sync_name_input(cx);
         // Force the usage probe on the visit's first list — a plain list
         // returns no usage windows on a cold engine cache, which rendered
         // every account as "Usage unavailable" until a manual Refresh. The
@@ -1113,6 +1143,133 @@ impl AccountsPage {
         Some(popover::modal("add-account-dialog", viewport, card))
     }
 
+    /// The account's current name, per the live AuthStatus frame.
+    fn current_name(&self, cx: &Context<Self>) -> String {
+        self.state
+            .read(cx)
+            .auth_user()
+            .and_then(|user| user.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Keep the Display name field in step with the live account name — but only
+    /// while it is untouched since the last seed, so an in-progress edit is never
+    /// clobbered by the AuthStatus frame our own save triggers (or a rename from
+    /// another device).
+    fn sync_name_input(&mut self, cx: &mut Context<Self>) {
+        let current = self.current_name(cx);
+        let text = self.name_input.read(cx).text().to_string();
+        if text == self.name_seed && text != current {
+            self.name_input
+                .update(cx, |input, cx| input.set_text(current.clone(), cx));
+            self.name_seed = current;
+        }
+    }
+
+    fn submit_display_name(&mut self, cx: &mut Context<Self>) {
+        if self.saving_name {
+            return;
+        }
+        let current = self.current_name(cx);
+        let name = self.name_input.read(cx).text().trim().to_string();
+        // Nothing to save: empty, too long, or unchanged.
+        if name.is_empty() || name.chars().count() > 80 || name == current {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.saving_name = true;
+        self.error = None;
+        self.name_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::UPDATE_PROFILE,
+                    serde_json::json!({ "name": name.clone() }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                page.saving_name = false;
+                match result {
+                    // The AuthStatus stream carries the new name back; treat the
+                    // saved value as the new baseline so the field follows future
+                    // (e.g. cross-device) changes again.
+                    Ok(_) => page.name_seed = name,
+                    Err(err) => {
+                        page.error = Some(format!("Couldn\u{2019}t save your name: {err}").into())
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// The Display name field: the current name pre-filled, with an inline Save
+    /// button. Hidden until the account is known (no row while signed out/local).
+    fn render_display_name_section(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use crate::settings::widgets;
+        self.state.read(cx).auth_user()?;
+        let current = self.current_name(cx);
+        let typed = self.name_input.read(cx).text().trim().to_string();
+        // Mirror `submit_display_name`'s guard: empty, >80, or unchanged can't be
+        // saved. Without the length bound, a too-long name lit Save up and the
+        // click was then a silent no-op.
+        let can_save =
+            !self.saving_name && !typed.is_empty() && typed.chars().count() <= 80 && typed != current;
+
+        // Same fill and metrics as btn_primary, but hover/cursor/click only when
+        // there is something to save — btn_primary bakes in a hover that would
+        // otherwise light the button up in its disabled state.
+        // No fixed height: the row stretches it to match the input field.
+        let mut save = div()
+            .id("save-display-name")
+            .flex_none()
+            .px(px(14.0))
+            .flex()
+            .items_center()
+            .rounded(px(8.0))
+            .bg(theme.text)
+            .text_size(crate::typography::ui_rems(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.on_solid)
+            .child(SharedString::from("Save"));
+        save = if can_save {
+            save.cursor_pointer()
+                .hover(|s| s.opacity(0.9))
+                .on_click(cx.listener(|this, _, _, cx| this.submit_display_name(cx)))
+        } else {
+            save.opacity(0.4)
+        };
+
+        Some(
+            div()
+                .mt(px(24.0))
+                .flex()
+                .flex_col()
+                .child(widgets::field_label(theme, "Display name"))
+                .child(
+                    div()
+                        .mt(px(8.0))
+                        .flex()
+                        .flex_row()
+                        .items_stretch()
+                        .gap(px(8.0))
+                        .child(div().flex_1().min_w_0().child(popover::dialog_field(
+                            self.name_input.clone().into_any_element(),
+                        )))
+                        .child(save),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// A ghost account row (comet settings.agents.tsx `SkeletonRow`): avatar,
     /// email line, two usage-meter ghosts, a badge — same geometry as the real
     /// row so loaded data lands without a layout jump. `dim` fades row two.
@@ -1204,6 +1361,7 @@ impl Render for AccountsPage {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
+        let display_name = self.render_display_name_section(&theme, cx);
         let refreshing = matches!(self.snapshot, Loadable::Loading);
         let account_count = self
             .snapshot
@@ -1460,6 +1618,7 @@ impl Render for AccountsPage {
                                 })),
                         )
                     })
+                    .when_some(display_name, |el, section| el.child(section))
                     .children(sections)
                     // Footer note (comet: `mt-6 text-[12px] leading-relaxed
                     // text-muted-foreground/60`).
