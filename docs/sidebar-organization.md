@@ -1,26 +1,30 @@
 # Sidebar organization: philosophies, options, decisions
 
 Living design doc for the left sidebar's project/chat organization.
-Companion to the `left-sidebar-v1` branch. ADRs get extracted to `docs/adr/`
+Companion to the `left-sidebar-v2` branch. ADRs get extracted to `docs/adr/`
 once a direction is locked.
 
-- Status: synthesis locked (see ADR 0003), implemented on `left-sidebar-v1`
-- Updated: 2026-08-31
+- Status: synthesis locked (see ADR 0003, 0004), implemented on `left-sidebar-v2`
+- Updated: 2026-09-01
 
-## Where we are (after left-sidebar-v1)
+## Where we are (after left-sidebar-v2)
 
 Organize modes in the sidebar view-options menu:
 
 | Mode | Origin | Behavior |
 |---|---|---|
-| Group by project (default) | this branch | One folder per Space (device-scoped). Same repo on two machines = two folders, device named in the header. |
-| Group by project, all devices | this branch | One folder per project name, merged across devices. Device tagged per chat when a folder spans machines. |
+| By project (default) | this branch | One folder per project name, merged across devices. Same repo on two machines = one folder; a chat wears a device tag only when its folder spans machines. |
 | By device | pre-existing | Sections per device, local promoted first. |
 | In one list | pre-existing (old default) | Flat recency feed. |
 
+The short-lived per-device "Group by project" mode was dropped; its persisted
+value normalizes to the merged mode on load (ADR 0003).
+
 Sort (Last updated / Created) and Show (Branch / Pull request / Harness) are
-pre-existing and unchanged. Folder rank = its most-recent chat under the
-current Sort, so activity moves whole folders ("folder jump").
+pre-existing. Folders order by recency (their most-recent chat); under Last
+updated an activity hold keeps active projects in a stable block so parallel
+runs stop reshuffling them ("Active for" window, ADR 0004). Chats inside a
+folder stay pure recency.
 
 ## The tension
 
