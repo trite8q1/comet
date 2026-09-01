@@ -133,6 +133,12 @@ const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
 const FOLDER_INITIAL: usize = 8;
 const FOLDER_PAGE: usize = 25;
 const PAGER_ROW_HEIGHT: f32 = 32.0;
+/// Activity hold for project folders (Sort = Last updated only): a folder
+/// with activity inside this window sits in a stable "active" block ordered
+/// by entry, so turns inside active projects never reorder them. The tuning
+/// knob — too short and projects churn in and out, too long and abandoned
+/// work lingers on top.
+const FOLDER_HOLD_SECS: i64 = 4 * 60 * 60;
 pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(120);
 
@@ -244,6 +250,74 @@ fn chat_folder_key(
         label.to_lowercase()
     };
     (key, label, no_project)
+}
+
+/// When a chat last "did work", for the folder hold: a live session (working,
+/// or waiting on the user — an in-flight send already reads as Working) is
+/// happening NOW; otherwise its last persisted message (creation when none).
+/// Selecting a chat, picking a project in the composer, hovering, collapsing:
+/// none of these touch the inputs, so they never count as activity.
+fn chat_activity_at(
+    status: ChatIndicator,
+    chat: &comet_proto::Chat,
+    now: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    match status {
+        ChatIndicator::Working | ChatIndicator::AwaitingInput => now,
+        _ => chat.last_message_at.unwrap_or(chat.created_at),
+    }
+}
+
+/// One folder's inputs to [`hold_order`].
+#[derive(Clone)]
+struct FolderActivity {
+    key: String,
+    activity_at: chrono::DateTime<Utc>,
+    no_project: bool,
+}
+
+/// Folder display order under the activity hold, plus the next hold map.
+/// Folders active inside `window` form a block ordered by the moment they
+/// entered it (newest entrant on top; `entered_at` is frozen while they stay
+/// active, so activity inside the block never reorders it — active projects
+/// behave like tabs). The rest follow by recency (a feed); "No project" is
+/// pinned last and never held. Pure and deterministic: the render path
+/// stores the returned map, the keyboard order recomputes and discards it,
+/// so screen and keys cannot disagree.
+fn hold_order(
+    folders: &[FolderActivity],
+    hold: &std::collections::HashMap<String, chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+    window: chrono::Duration,
+) -> (
+    Vec<String>,
+    std::collections::HashMap<String, chrono::DateTime<Utc>>,
+) {
+    let threshold = now - window;
+    let mut next = std::collections::HashMap::new();
+    let mut active: Vec<(chrono::DateTime<Utc>, &str)> = Vec::new();
+    let mut dormant: Vec<(chrono::DateTime<Utc>, &str)> = Vec::new();
+    let mut no_project: Option<&str> = None;
+    for folder in folders {
+        if folder.no_project {
+            no_project = Some(&folder.key);
+        } else if folder.activity_at >= threshold {
+            let entered_at = hold.get(&folder.key).copied().unwrap_or(folder.activity_at);
+            next.insert(folder.key.clone(), entered_at);
+            active.push((entered_at, &folder.key));
+        } else {
+            dormant.push((folder.activity_at, &folder.key));
+        }
+    }
+    active.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    dormant.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let order = active
+        .into_iter()
+        .chain(dormant)
+        .map(|(_, key)| key.to_string())
+        .chain(no_project.map(str::to_string))
+        .collect();
+    (order, next)
 }
 
 /// One row of the open dropdown, in display order.
@@ -1145,40 +1219,65 @@ impl Shell {
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
         let filter = self.settings.space_filter.clone();
         let organization = self.settings.sidebar_organization;
+        let sort = self.settings.sidebar_sort;
+        let now = Utc::now();
         let state = self.state.read(cx);
-        let mut chats: Vec<comet_proto::Chat> = state
-            .sidebar_chats(Utc::now(), filter.as_deref())
+        let mut chats: Vec<(ChatIndicator, comet_proto::Chat)> = state
+            .sidebar_chats(now, filter.as_deref())
             .into_iter()
-            .map(|(_, chat)| chat.clone())
+            .map(|(status, chat)| (status, chat.clone()))
             .collect();
-        chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        chats.sort_by(|left, right| compare_sidebar_chats(sort, &left.1, &right.1));
         // Project folders (the "All projects" view): flatten folder-by-folder
-        // in the exact order `render_folder_rows` draws them (No project last),
-        // so ⌘-jump and cycling never drift from the screen.
+        // in the exact order `render_folder_rows` draws them (the activity
+        // hold under Last updated, No project last), so ⌘-jump and cycling
+        // never drift from the screen. Read-only: the hold map is recomputed
+        // and discarded here; only the render path stores it.
         if filter.is_none()
             && matches!(
                 organization,
                 SidebarOrganization::ByProject | SidebarOrganization::ByProjectMerged
             )
         {
-            let mut folders: Vec<(String, Vec<comet_proto::Chat>)> = Vec::new();
-            for chat in chats {
-                let (key, _label, _no_project) = chat_folder_key(state, &chat);
-                if let Some((_, rows)) = folders.iter_mut().find(|(k, _)| k == &key) {
+            let mut folders: Vec<(FolderActivity, Vec<comet_proto::Chat>)> = Vec::new();
+            for (status, chat) in chats {
+                let (key, _label, no_project) = chat_folder_key(state, &chat);
+                let activity_at = chat_activity_at(status, &chat, now);
+                if let Some((folder, rows)) = folders.iter_mut().find(|(f, _)| f.key == key) {
+                    folder.activity_at = folder.activity_at.max(activity_at);
                     rows.push(chat);
                 } else {
-                    folders.push((key, vec![chat]));
+                    folders.push((
+                        FolderActivity {
+                            key,
+                            activity_at,
+                            no_project,
+                        },
+                        vec![chat],
+                    ));
                 }
             }
-            // Same order `render_folder_rows` draws ("No project" last) so
-            // keyboard order never drifts from the screen.
-            folders.sort_by_key(|(key, _)| key.as_str() == NO_PROJECT_KEY);
+            if sort == SidebarSort::LastUpdated {
+                let inputs: Vec<FolderActivity> = folders.iter().map(|(f, _)| f.clone()).collect();
+                let (order, _next) = hold_order(
+                    &inputs,
+                    &self.sidebar_folder_hold,
+                    now,
+                    chrono::Duration::seconds(FOLDER_HOLD_SECS),
+                );
+                folders.sort_by_key(|(f, _)| {
+                    order.iter().position(|k| k == &f.key).unwrap_or(usize::MAX)
+                });
+            } else {
+                folders.sort_by_key(|(f, _)| f.no_project);
+            }
             return folders
                 .into_iter()
                 .flat_map(|(_, rows)| rows)
                 .map(|chat| chat.id)
                 .collect();
         }
+        let chats: Vec<comet_proto::Chat> = chats.into_iter().map(|(_, chat)| chat).collect();
         if organization != SidebarOrganization::ByDevice {
             return chats.into_iter().map(|chat| chat.id).collect();
         }
@@ -1462,6 +1561,9 @@ impl Shell {
             key: String,
             label: SharedString,
             no_project: bool,
+            /// Newest activity across ALL the folder's chats (not just the
+            /// paged-visible ones) — the hold's input.
+            activity_at: chrono::DateTime<Utc>,
             rows: Vec<FolderRow>,
         }
 
@@ -1490,6 +1592,7 @@ impl Shell {
                     None
                 };
                 let device_id = chat.device_id.clone();
+                let activity_at = chat_activity_at(status, &chat, now);
                 let row = FolderRow {
                     status,
                     chat,
@@ -1498,20 +1601,42 @@ impl Shell {
                     device_id,
                 };
                 if let Some(folder) = folders.iter_mut().find(|f| f.key == key) {
+                    folder.activity_at = folder.activity_at.max(activity_at);
                     folder.rows.push(row);
                 } else {
                     folders.push(Folder {
                         key,
                         label: SharedString::from(label),
                         no_project,
+                        activity_at,
                         rows: vec![row],
                     });
                 }
             }
         }
-        // "No project" sinks to the bottom; the rest keep the recency/created
-        // order their top chat sorted into (first appearance wins).
-        folders.sort_by_key(|folder| folder.no_project);
+        // Sort = Last updated: the activity hold keeps active projects in a
+        // stable block (see `hold_order`). Otherwise "No project" sinks to the
+        // bottom and the rest keep the order their top chat sorted into.
+        if sort == SidebarSort::LastUpdated {
+            let inputs: Vec<FolderActivity> = folders
+                .iter()
+                .map(|f| FolderActivity {
+                    key: f.key.clone(),
+                    activity_at: f.activity_at,
+                    no_project: f.no_project,
+                })
+                .collect();
+            let (order, next_hold) = hold_order(
+                &inputs,
+                &self.sidebar_folder_hold,
+                now,
+                chrono::Duration::seconds(FOLDER_HOLD_SECS),
+            );
+            self.sidebar_folder_hold = next_hold;
+            folders.sort_by_key(|f| order.iter().position(|k| k == &f.key).unwrap_or(usize::MAX));
+        } else {
+            folders.sort_by_key(|folder| folder.no_project);
+        }
 
         let mut rendered: Vec<(String, f32, AnyElement)> = Vec::new();
         for folder in folders {
@@ -3647,8 +3772,13 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
+    use std::collections::HashMap;
+
+    use comet_proto::ChatIndicator;
+
     use super::{
-        NO_PROJECT_KEY, chat_folder_key, compare_sidebar_chats, promote_local_device_group,
+        FolderActivity, NO_PROJECT_KEY, chat_activity_at, chat_folder_key, compare_sidebar_chats,
+        hold_order, promote_local_device_group,
     };
     use crate::settings::SidebarSort;
     use crate::state::AppState;
@@ -3779,5 +3909,127 @@ mod tests {
         state.local_device_id = Some("devA".into());
         assert_eq!(state.device_label("devA"), ("Mac Studio".to_string(), true));
         assert_eq!(state.device_label("devB"), ("Air".to_string(), false));
+    }
+
+    fn keys(list: &[&str]) -> Vec<String> {
+        list.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn at(secs: i64) -> chrono::DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0).unwrap()
+    }
+
+    fn folder(key: &str, activity_secs: i64, no_project: bool) -> FolderActivity {
+        FolderActivity {
+            key: key.into(),
+            activity_at: at(activity_secs),
+            no_project,
+        }
+    }
+
+    const WINDOW_SECS: i64 = 1_000;
+
+    #[test]
+    fn hold_seeds_the_active_block_by_recency_and_pins_no_project_last() {
+        let now = at(10_000);
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let folders = [
+            folder("old", 1_000, false),
+            folder("b", 9_500, false),
+            folder(NO_PROJECT_KEY, 9_999, true),
+            folder("a", 9_900, false),
+            folder("older", 500, false),
+        ];
+        let (order, next) = hold_order(&folders, &HashMap::new(), now, window);
+        assert_eq!(order, keys(&["a", "b", "old", "older", NO_PROJECT_KEY]));
+        // Only the active folders are held, with entered_at = their activity.
+        assert_eq!(next.len(), 2);
+        assert_eq!(next["a"], at(9_900));
+        assert_eq!(next["b"], at(9_500));
+    }
+
+    #[test]
+    fn activity_inside_the_block_never_reorders_it() {
+        let now = at(10_000);
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let mut folders = [folder("a", 9_900, false), folder("b", 9_500, false)];
+        let (_, hold) = hold_order(&folders, &HashMap::new(), now, window);
+        // b (below a) gets the newest activity: it must NOT overtake a.
+        folders[1].activity_at = now;
+        let (order, next) = hold_order(&folders, &hold, now, window);
+        assert_eq!(order, keys(&["a", "b"]));
+        assert_eq!(next["b"], hold["b"], "entered_at stays frozen while active");
+    }
+
+    #[test]
+    fn a_dormant_folder_enters_at_the_top_of_the_block() {
+        let now = at(10_000);
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let mut folders = [
+            folder("a", 9_900, false),
+            folder("b", 9_500, false),
+            folder("d", 100, false),
+        ];
+        let (order, hold) = hold_order(&folders, &HashMap::new(), now, window);
+        assert_eq!(order, keys(&["a", "b", "d"]));
+        // d wakes up: it joins the block on top; a and b keep their order.
+        folders[2].activity_at = now;
+        let (order, next) = hold_order(&folders, &hold, now, window);
+        assert_eq!(order, keys(&["d", "a", "b"]));
+        assert_eq!(next["d"], now);
+    }
+
+    #[test]
+    fn an_expired_folder_drops_into_the_recency_tail() {
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let mut folders = [
+            folder("a", 9_900, false),
+            folder("b", 9_500, false),
+            folder("c", 8_000, false),
+        ];
+        let (order, hold) = hold_order(&folders, &HashMap::new(), at(10_000), window);
+        assert_eq!(order, keys(&["a", "b", "c"]));
+        // Time passes: a keeps working, b goes quiet past the window.
+        folders[0].activity_at = at(10_400);
+        let (order, next) = hold_order(&folders, &hold, at(10_600), window);
+        assert_eq!(
+            order,
+            keys(&["a", "b", "c"]),
+            "b lands right under the block"
+        );
+        assert!(!next.contains_key("b"), "expired folders leave the hold");
+        assert_eq!(next["a"], hold["a"], "a's entry stays frozen");
+    }
+
+    #[test]
+    fn vanished_folders_are_pruned_from_the_hold() {
+        let window = chrono::Duration::seconds(WINDOW_SECS);
+        let hold = HashMap::from([("gone".to_string(), at(9_900))]);
+        let (_, next) = hold_order(&[folder("a", 9_800, false)], &hold, at(10_000), window);
+        assert!(!next.contains_key("gone"));
+        assert_eq!(next["a"], at(9_800));
+    }
+
+    #[test]
+    fn live_sessions_count_as_activity_now() {
+        let now = at(10_000);
+        let live = chat("x"); // last_message_at 10, created_at 5
+        assert_eq!(chat_activity_at(ChatIndicator::Working, &live, now), now);
+        assert_eq!(
+            chat_activity_at(ChatIndicator::AwaitingInput, &live, now),
+            now
+        );
+        assert_eq!(chat_activity_at(ChatIndicator::Idle, &live, now), at(10));
+        assert_eq!(
+            chat_activity_at(ChatIndicator::Completed, &live, now),
+            at(10)
+        );
+        assert_eq!(chat_activity_at(ChatIndicator::Errored, &live, now), at(10));
+        let mut fresh = chat("y");
+        fresh.last_message_at = None;
+        assert_eq!(
+            chat_activity_at(ChatIndicator::Idle, &fresh, now),
+            fresh.created_at
+        );
     }
 }

@@ -1019,6 +1019,11 @@ pub struct Shell {
     /// same organization + id folder key as `sidebar_collapsed_groups`. Absent
     /// = the initial page; each click reveals another page. Session-transient.
     pub(super) sidebar_folder_shown: std::collections::HashMap<String, usize>,
+    /// Activity hold for the "By project" view: folder key → the moment the
+    /// folder entered the active block (see `spaces::hold_order`). Frozen
+    /// while the folder stays active, so turns inside it never reorder the
+    /// block. Session-transient, like collapse state.
+    pub(super) sidebar_folder_hold: std::collections::HashMap<String, chrono::DateTime<Utc>>,
     /// In-flight disclosure tweens, shared by device groups and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -1324,6 +1329,7 @@ impl Shell {
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
             sidebar_folder_shown: std::collections::HashMap::new(),
+            sidebar_folder_hold: std::collections::HashMap::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
             terminal: None,
