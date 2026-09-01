@@ -1963,7 +1963,7 @@ impl Shell {
             let toggle_key = collapse_key.clone();
             let toggle_motion = motion_key.clone();
             // The active folders' exact header, dimmed whole — no attention
-            // dot and no drag handle in the graveyard.
+            // dot in the graveyard (settled work has no live status).
             let header = sidebar_folder_header(theme, visible_label, None, chevron)
                 .opacity(0.55)
                 .id(SharedString::from(format!(

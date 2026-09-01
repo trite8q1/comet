@@ -176,7 +176,7 @@ pub enum SidebarOrganization {
     ByProject,
     /// "By project": one collapsible folder per project *name*, merging a
     /// repo across devices; chats carry their device when a folder spans
-    /// machines. Folder positions are manual ([`UiSettings::sidebar_folder_order`]).
+    /// machines. Folders order by recency, like the flat list's rows.
     #[default]
     ByProjectMerged,
     ByDevice,
