@@ -209,7 +209,7 @@ fn comet_dark() -> ThemeVariant {
         terminal_background: "#090909",
         ansi: ANSI_DARK,
         syntax: [
-            "#92929a", "#8b7cf6", "#34d399", "#facc15", "#c084fc", "#60a5fa", "#f472b6", "#e8e8ea",
+            "#92929a", "#60a5fa", "#34d399", "#facc15", "#c084fc", "#8b7cf6", "#f472b6", "#e8e8ea",
             "#a1a1aa", "#f472b6", "#22d3ee", "#f87171",
         ],
         source: source(
@@ -243,7 +243,7 @@ fn comet_light() -> ThemeVariant {
         terminal_background: "#fafafa",
         ansi: ANSI_LIGHT,
         syntax: [
-            "#6b7280", "#5b43e8", "#15803d", "#a16207", "#7e22ce", "#2563eb", "#be185d", "#303035",
+            "#6b7280", "#2563eb", "#15803d", "#a16207", "#7e22ce", "#5b43e8", "#be185d", "#303035",
             "#52525b", "#be185d", "#0e7490", "#b91c1c",
         ],
         source: source(
