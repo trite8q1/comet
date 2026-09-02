@@ -12,7 +12,7 @@ Code workbench ids and TextMate selectors stop at the source compiler.
 - `AccentSelection::ThemeDefault` preserves the variant's authored accent.
 - `AccentSelection::Preset` derives a contrast-checked interaction overlay.
 - Every variant records a recommended `SurfaceTreatment`: Comet recommends
-  frost, while VS Code-derived themes recommend opaque surfaces because that is
+  frost, while imported VS Code themes record opaque surfaces because that is
   what their authors targeted.
 - `SurfacePreference` is a separate device-local choice: `Theme default`,
   `Frosted`, or `Opaque`. It does not change appearance, theme, or accent
@@ -39,30 +39,13 @@ because compositor blur is not guaranteed; supported floating surfaces can
 still frost on macOS and Linux. The preference remains portable even where a
 particular surface cannot honor blur.
 
-The built-in registry contains 30 variants across 19 families:
+The built-in registry contains two variants in a single family:
 
 - Comet Light and Dark
-- VS Code Light+ and Dark+
-- Catppuccin Latte and Mocha
-- Tokyo Night Light and Tokyo Night
-- Dracula
-- GitHub Light and Dark
-- Ayu Light, Dark, and Mirage
-- Gruvbox Light and Dark
-- Rosé Pine Dawn and Moon
-- Nord
-- One Dark Pro
-- Atom One Dark
-- Night Owl and Night Owl Light
-- Winter is Coming Dark Blue and Light
-- Palenight
-- SynthWave '84
-- Shades of Purple
-- Cobalt2
-- Andromeda
 
-Every bundled variant records source URL, exact upstream revision, license, and
-a SHA-256 hash of the resolved curated definition.
+Additional themes are added by importing VS Code themes into the custom
+library. Every bundled variant records source URL, exact upstream revision,
+license, and a SHA-256 hash of the resolved curated definition.
 
 Appearance settings keep light and dark choices in ordinary settings rows.
 Each row opens a palette-preview menu, which allows the catalog to grow without

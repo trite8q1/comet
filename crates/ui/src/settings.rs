@@ -830,8 +830,8 @@ mod tests {
             ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
             ui_font_size: crate::typography::UiFontSize::ALL[5],
             theme_selection: comet_theme::ThemeSelection {
-                light: "catppuccin-latte".into(),
-                dark: "catppuccin-mocha".into(),
+                light: "comet-light".into(),
+                dark: "comet-dark".into(),
             },
             diff_split: true,
             accent: comet_theme::AccentSelection::Preset(comet_theme::AccentPreset::Cyan),

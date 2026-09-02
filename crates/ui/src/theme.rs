@@ -1818,27 +1818,32 @@ mod tests {
 
     #[test]
     fn theme_recommendation_and_surface_override_resolve_independently() {
-        let catppuccin = Theme::for_selection(
-            Appearance::Dark,
-            "catppuccin-mocha",
+        // No bundled variant recommends opaque surfaces anymore, so synthesize
+        // one from Comet to prove the authored recommendation and the
+        // device-local surface preference resolve independently.
+        let mut opaque_recommended = ThemeRegistry::builtin()
+            .variant("comet-dark")
+            .unwrap()
+            .clone();
+        opaque_recommended.recommended_surface_treatment = SurfaceTreatment::Opaque;
+
+        let recommended = Theme::from_variant(
+            &opaque_recommended,
             AccentSelection::ThemeDefault,
             SurfacePreference::ThemeDefault,
         );
-        let comet = Theme::dark();
-        assert_ne!(catppuccin.surface, comet.surface);
-        assert_eq!(catppuccin.busy, catppuccin.accent);
-        assert_eq!(catppuccin.glyph.mid, catppuccin.accent);
-        assert_eq!(catppuccin.surface_treatment, SurfaceTreatment::Opaque);
-        assert!(!catppuccin.is_glass());
+        assert_eq!(recommended.surface_treatment, SurfaceTreatment::Opaque);
+        assert!(!recommended.is_glass());
+        assert_eq!(recommended.busy, recommended.accent);
+        assert_eq!(recommended.glyph.mid, recommended.accent);
 
-        let frosted = Theme::for_selection(
-            Appearance::Dark,
-            "catppuccin-mocha",
+        let frosted = Theme::from_variant(
+            &opaque_recommended,
             AccentSelection::ThemeDefault,
             SurfacePreference::Frosted,
         );
-        assert_eq!(frosted.variant_id, catppuccin.variant_id);
-        assert_eq!(frosted.accent, catppuccin.accent);
+        assert_eq!(frosted.variant_id, recommended.variant_id);
+        assert_eq!(frosted.accent, recommended.accent);
         assert_eq!(frosted.surface_treatment, SurfaceTreatment::Frosted);
         assert_eq!(frosted.glass().h, frosted.surface.h);
         assert_eq!(frosted.glass().s, frosted.surface.s);

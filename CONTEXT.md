@@ -2,7 +2,7 @@
 
 ## Theme vocabulary
 
-- **Theme family** — A named collection of related theme variants that share an origin, such as Night Owl and Night Owl Light.
+- **Theme family** — A named collection of related theme variants that share an origin, such as Comet Light and Comet Dark.
 - **Theme variant** — One complete, resolved palette for a single appearance (`light` or `dark`). Runtime UI consumes variants, not source-format tokens.
 - **Theme source** — The durable origin of a custom family: an imported snapshot, linked file, linked package, or editable native file.
 - **Imported snapshot** — A self-contained copy of a compiled theme family. It no longer follows changes to its original source.
