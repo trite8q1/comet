@@ -107,19 +107,15 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         "{events:?}"
     );
 
-    // Initialize-advertised commands surface before the turn.
-    let commands: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            AgentEvent::AvailableCommands { commands } => Some(commands.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(commands.len(), 2, "{events:?}");
-    assert_eq!(commands[0][0].name, "compact");
-    assert_eq!(commands[0][1].input_hint.as_deref(), Some("the goal"));
-    // Mid-run advertisement replaces the list.
-    assert_eq!(commands[1][0].name, "deep-research");
+    // The catalog is the probe's alone (§10.4 "One discovery path"): the
+    // fixture advertises commands in the handshake AND mid-run, and neither
+    // reaches the run stream.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AvailableCommands { .. })),
+        "the retired run-time catalog event was emitted: {events:?}"
+    );
 
     // Chunks; the wrong-session and non-text chunks never surface.
     assert!(events.contains(&AgentEvent::TextDelta {

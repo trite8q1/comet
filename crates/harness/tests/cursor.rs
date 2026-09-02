@@ -508,10 +508,11 @@ async fn commands_add_the_project_skills_for_a_cwd() {
     );
 }
 
-/// A run advertises the catalog for ITS cwd, so a project's skills reach the
-/// popup exactly as the agent loaded them for that run.
+/// §10.4 "One discovery path": `commands()` is the only catalog source, so a
+/// project's skills reach the popup through the probe and the run stream
+/// carries no catalog event of its own.
 #[tokio::test]
-async fn run_advertises_project_skill_commands() {
+async fn run_stream_carries_no_catalog_event() {
     let home = tempfile::tempdir().expect("home");
     let project = tempfile::tempdir().expect("project");
     write_skill(
@@ -533,13 +534,38 @@ async fn run_advertises_project_skill_commands() {
     let (controls, _steer, _token) = controls();
     let events = run_to_first_done(&harness, req, controls).await;
 
-    match events.first() {
-        Some(AgentEvent::AvailableCommands { commands }) => {
-            let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-            assert_eq!(names, vec!["project-skill", "user-skill"], "{commands:?}");
-        }
-        other => panic!("expected the run to advertise its catalog, got {other:?}"),
-    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AvailableCommands { .. })),
+        "the retired run-time catalog event was emitted: {events:?}"
+    );
+    let catalog = harness.commands(Some(project.path())).await.unwrap();
+    let names: Vec<&str> = catalog.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["project-skill", "user-skill"],
+        "the probe still carries the run's cwd-scoped catalog"
+    );
+}
+
+/// Tripwire (ARCHITECTURE.md §10.4): Cursor is the ONE harness whose skills
+/// come from a filesystem scan instead of the agent's wire, and that
+/// exception is licensed only by the pinned SDK carrying no listing.
+#[test]
+fn cursor_sdk_pin_revalidates_the_skill_scan() {
+    assert_eq!(
+        comet_harness::cursor::CURSOR_SDK_PIN,
+        "@cursor/sdk@1.0.28",
+        "the @cursor/sdk pin moved. Before bumping the string in this test, \
+         re-validate crates/harness/src/cursor/skills.rs against the new \
+         SDK/CLI: the roots it walks, their precedence order, and its filters \
+         (`metadata.surfaces` without `cli`, Codex's built-in skill names) — \
+         and, above all, whether the SDK now LISTS skills. If it does, the \
+         scan must be deleted and replaced by that wire: ARCHITECTURE.md \
+         §10.4 permits a SKILL.md scan only for a harness whose wire exposes \
+         no listing at all."
+    );
 }
 
 /// Slash parity (§10.5): the invocation reaches the SDK verbatim, on the run

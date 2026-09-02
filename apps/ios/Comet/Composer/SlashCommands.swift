@@ -190,8 +190,8 @@ struct SlashCommandsModel {
     private(set) var token: SlashToken?
 
     /// Track the token on every edit / caret move / harness or folder switch.
-    /// Returns the key needing a `ListCommands` (nil = cached, in flight, or
-    /// nothing open).
+    /// Returns the key needing a `ListCommands` (nil = no open to revalidate,
+    /// a probe already in flight for it, or nothing open).
     mutating func update(text: String, cursor: Int, key: SlashCatalogKey?) -> SlashCatalogKey? {
         let token = slashToken(text, cursor: cursor)
         if let token, let dismissed, slashTokenText(text, token) == dismissed {
@@ -200,13 +200,16 @@ struct SlashCommandsModel {
         }
         dismissed = nil
         let keyChanged = self.key != key
+        let wasOpen = self.token != nil
         self.key = key
-        if token == self.token, !keyChanged { return nil }
         self.token = token
         guard token != nil, let key else { return nil }
-        if catalogs[key] != nil || inFlight.contains(key) { return nil }
-        // First open for this key: one probe, and a retry on the next open
-        // after a failure (the desktop clears its error the same way).
+        // Every open revalidates the key's list (§10.4 "Freshness"): the token
+        // appearing, or the key changing while the popup is open. Keystrokes
+        // inside one open never probe, and neither does an open while this
+        // key's probe is still in flight — the cached rows show meanwhile, and
+        // the reply replaces them.
+        guard !wasOpen || keyChanged, !inFlight.contains(key) else { return nil }
         errors[key] = nil
         inFlight.insert(key)
         return key
@@ -241,7 +244,9 @@ struct SlashCommandsModel {
         guard let token else { return .hidden }
         let commands = key.flatMap { catalogs[$0] } ?? []
         if let key, inFlight.contains(key), commands.isEmpty { return .loading }
-        if let key, let message = errors[key] { return .failed(message) }
+        // A failed revalidation never blanks a list that was fine a moment ago
+        // (§10.4): the error shows only when the key has no rows at all.
+        if let key, let message = errors[key], commands.isEmpty { return .failed(message) }
         let filtered = slashFilterIndices(query: token.query, commands: commands)
         if filtered.isEmpty { return commands.isEmpty ? .noCommands : .noMatches }
         return .commands(filtered.map { commands[$0] })

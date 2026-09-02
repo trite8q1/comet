@@ -318,8 +318,9 @@ func slashCaret(in text: String, selection: TextSelection?) -> Int {
 }
 
 /// Both composers drive the popup the same way: re-read the token on every
-/// edit / caret move / harness or folder switch, and probe `ListCommands` the
-/// first time a (device, harness, cwd) key is asked for.
+/// edit / caret move / harness or folder switch, and probe `ListCommands` once
+/// per open of a (device, harness, cwd) key — the model decides which opens
+/// need one (§10.4 "Freshness").
 @MainActor
 func syncSlash(_ slash: Binding<SlashCommandsModel>, text: String, selection: TextSelection?,
                key: SlashCatalogKey?, model: AppModel) {

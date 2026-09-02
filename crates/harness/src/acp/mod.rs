@@ -1844,7 +1844,6 @@ async fn run_session(session: Session) {
             .request("initialize", initialize_params(harness))
             .await?;
         let steer_ext = steering_supported(&init);
-        let init_commands = scan_available_commands(&init);
 
         let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
         let (session_id, session_response) = if let Some(resume) = &request.resume {
@@ -1947,13 +1946,9 @@ async fn run_session(session: Session) {
                 );
             }
         }
-        Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
-            session_id,
-            steer_ext,
-            init_commands,
-        ))
+        Ok::<(String, bool), HarnessError>((session_id, steer_ext))
     };
-    let (session_id, steer_ext, init_commands) = tokio::select! {
+    let (session_id, steer_ext) = tokio::select! {
         res = tokio::time::timeout(handshake_timeout, setup) => {
             let res = res.unwrap_or_else(|_| {
                 // A hung handshake (agent waiting on a login it can never
@@ -2032,18 +2027,6 @@ async fn run_session(session: Session) {
         },
     )
     .await
-    {
-        shutdown_child(&mut child, kill_grace).await;
-        return;
-    }
-    if !init_commands.is_empty()
-        && !send(
-            &event_tx,
-            AgentEvent::AvailableCommands {
-                commands: init_commands,
-            },
-        )
-        .await
     {
         shutdown_child(&mut child, kill_grace).await;
         return;

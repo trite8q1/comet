@@ -324,8 +324,9 @@ does not offer a skill on a harness whose CLI would not offer it either.
 Both surfaces behave identically: the popup lists the catalog filtered by the typed prefix
 (name match, plus aliases where the harness advertises them), each row shows description and
 argument hint, accept replaces the token with `/name ` and leaves the cursor for arguments,
-Escape dismisses for that token only, and the prompt is sent as plain text through the durable
-command queue (`QueueCommand{run|steer}`) — no new RPC, no new doc field. `comet headless`
+Escape dismisses for that token only, every open revalidates the key's list (§10.4
+"Freshness"), and the prompt is sent as plain text through the durable command queue
+(`QueueCommand{run|steer}`) — no new RPC, no new doc field. `comet headless`
 has no composer and therefore no surface here; the binary's subcommands never send prompts.
 
 The popup is a completion aid, not a gate: a user may type `/name args` in full and send. The
@@ -360,12 +361,30 @@ inside that adapter, and must follow that harness's documented paths and precede
 | Codex | app-server JSON-RPC | `skills/list` → `data[].skills[]` (`name`, `description`, `path`, `scope`, `enabled`, `pluginId`, optional `interface.{displayName, shortDescription, …}`) | `name`; repo-scoped copies listed first, so dedupe-by-name keeps the one Codex would run | `skills/list` returns disabled skills flagged `enabled: false` (`[[skills.config]]` opt-out in `config.toml`); the adapter drops them. `policy.allow_implicit_invocation` affects model activation only, not listing |
 | OpenCode | HTTP | `GET /command` | `name`, tagged `source: "skill"` beside `command` and `mcp` entries — skills are explicitly invocable in OpenCode | Server-side; comet applies no `source` filter |
 | Grok, Hermes, Pi (ACP) | ACP v1 | `session/new` → `session/update: available_commands_update`; the `initialize` `_meta` scan is only a fallback for an agent that refuses sessions before login (Grok's handshake list is a partial, skill-free 7 entries) | Grok: bare `name`, qualified (`user:goal`, `vercel:workflow`) only where names collide, `_meta` carrying scope/path/pluginName; Pi: `skill:name`; Hermes: none — its ACP adapter advertises nine built-ins only | Agent-side (Pi drops `skill:` under `enableSkillCommands: false` and hides `source: "extension"`; Hermes reaches its skills through the model's skills tool, never as invocables). Grok's catalog is cwd-dependent |
-| Cursor | `@cursor/sdk` shim | No wire listing (1.0.28 exposes no skills API or skill input; `cursor-agent`'s own listing needs `cursor-agent login`, separate from the SDK's credentials) → adapter-local `SKILL.md` scan under this section's exception, over Cursor's documented roots: built-in `~/.cursor/skills-cursor`, then project, then user `.agents/skills` + `.cursor/skills` (+ `.claude`/`.codex` compat), later root winning a shared name | the `SKILL.md`'s directory name — what Cursor's own palette submits | `metadata.surfaces` without `cli` dropped; Codex's built-in skill names dropped; `disable-model-invocation` skills kept (user-invocable only). Custom commands are not offered: the CLI expands their body client-side |
+| Cursor | `@cursor/sdk` shim | No wire listing (1.0.28 exposes no skills API or skill input; `cursor-agent`'s own listing needs `cursor-agent login`, separate from the SDK's credentials) → adapter-local `SKILL.md` scan under this section's exception — the one place Comet reads `SKILL.md`, to be replaced by the wire the moment the SDK lists skills; a tripwire test fails on any SDK pin bump until the scan is re-validated against that version — over Cursor's documented roots: built-in `~/.cursor/skills-cursor`, then project, then user `.agents/skills` + `.cursor/skills` (+ `.claude`/`.codex` compat), later root winning a shared name | the `SKILL.md`'s directory name — what Cursor's own palette submits | `metadata.surfaces` without `cli` dropped; Codex's built-in skill names dropped; `disable-model-invocation` skills kept (user-invocable only). Custom commands are not offered: the CLI expands their body client-side |
 | Mock | — | Tests register their own `Harness` impls with fixed catalogs | — | — |
 
 Discovery is a short-lived probe (no model turn, no API cost), cached per harness instance,
-and never blocks a run. A failing probe surfaces as the popup's error row; it never falls
-back to another harness's list or to a comet-side scan.
+and never blocks a run. A failing probe surfaces as the popup's error row when there is no
+list to show; it never falls back to another harness's list or to a comet-side scan.
+
+**Freshness.** Every CLI re-reads its skills on launch; Comet's analogue is the popup open.
+The adapter cache (`comet_harness::commands::CommandCache`) holds one entry per cwd with a
+30-second time-to-live: within it a call is answered from memory, after it the next call
+re-probes. A re-probe that fails keeps serving the last good entry and logs the failure, so
+a transient CLI hiccup never blanks a list that was fine a moment ago; a probe that never
+succeeded is retried on every call. Cursor's scan is a directory walk and stays uncached.
+Both composers revalidate on open: cached rows for the key show immediately, one
+`ListCommands` is sent per open (never per keystroke, and never a second one while the
+first is in flight), and the reply replaces the rows. An error is displayed only when the
+key has no rows at all.
+
+**One discovery path.** The probe is the only source of the catalog. The former
+`AgentEvent::AvailableCommands` run-time event (ACP `available_commands_update`, OpenCode's
+and Cursor's per-run lists) was consumed by nobody and is retired: adapters no longer emit
+it. The enum variant stays decode-only: the run journal skips a line it cannot decode and
+reuses its sequence number, which would hide the next real event from subscribers, so an
+old journal line must still decode (and fold to nothing) — pinned by a journal test.
 
 **Discovery is cwd-scoped.** Every CLI that lists invocables resolves project-level skills
 relative to a directory (Claude Code `.claude/skills` and `.claude/commands`, Codex

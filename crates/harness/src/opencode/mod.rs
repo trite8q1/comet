@@ -944,7 +944,9 @@ async fn run_session(session: Session) {
         return;
     }
 
-    // Advertise slash commands (composer popup); a warm cache skips the call.
+    // This run's own catalog, for routing a `/name` to the command endpoint
+    // (§10.5) — the composer's list comes from `commands()`, never from here
+    // (§10.4 "One discovery path"). A warm cache skips the call.
     let commands = match known_commands {
         Some(commands) => commands,
         None => server
@@ -953,18 +955,6 @@ async fn run_session(session: Session) {
             .map(|v| commands_from_wire(&v))
             .unwrap_or_default(),
     };
-    if !commands.is_empty()
-        && !send(
-            &event_tx,
-            AgentEvent::AvailableCommands {
-                commands: commands.clone(),
-            },
-        )
-        .await
-    {
-        server.shutdown(kill_grace).await;
-        return;
-    }
 
     // ---- SSE bus ----------------------------------------------------------
     let (bus_tx, mut bus_rx) = mpsc::channel::<BusMsg>(256);

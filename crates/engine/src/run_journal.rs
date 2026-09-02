@@ -327,6 +327,41 @@ mod tests {
         assert!(journal.stale_sessions().unwrap().is_empty());
     }
 
+    /// A journal written before the run-time catalog event was retired
+    /// (ARCHITECTURE.md §10.4 "One discovery path") stays readable: the line
+    /// decodes, so it keeps its seq — a line the decoder rejected would be
+    /// skipped as malformed and its seq handed to the NEXT append, hiding
+    /// that event from every replay cursor past it — and it folds to nothing.
+    #[test]
+    fn retired_available_commands_line_replays_and_folds_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat-1.jsonl");
+        std::fs::write(
+            &path,
+            "{\"seq\":1,\"event\":{\"type\":\"textDelta\",\"text\":\"a\"}}\n\
+             {\"seq\":2,\"event\":{\"type\":\"availableCommands\",\"commands\":\
+             [{\"name\":\"compact\",\"description\":\"Compact\"}]}}\n",
+        )
+        .unwrap();
+
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let replayed = journal.replay("chat-1", 0).unwrap();
+        assert_eq!(replayed.len(), 2, "{replayed:?}");
+        assert!(matches!(
+            replayed[1].1,
+            AgentEvent::AvailableCommands { .. }
+        ));
+        // Seq continuity: the next event gets 3, not the stale line's 2, so a
+        // subscriber holding cursor 2 still receives it.
+        assert_eq!(journal.append("chat-1", &text("b")).unwrap(), 3);
+        assert_eq!(journal.replay("chat-1", 2).unwrap().len(), 1);
+
+        // And it contributes nothing to the transcript.
+        let mut parts = Vec::new();
+        comet_doc::fold_event_into_parts(&mut parts, &replayed[1].1);
+        assert!(parts.is_empty(), "{parts:?}");
+    }
+
     #[test]
     fn torn_tail_line_is_tolerated() {
         let dir = tempfile::tempdir().unwrap();

@@ -386,9 +386,13 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
-    /// The agent advertised (or changed) its slash-command set — ACP
-    /// `available_commands_update`. The engine caches the latest list per
-    /// harness for the composer's `/` popup; never persisted to docs.
+    /// RETIRED (ARCHITECTURE.md §10.4 "One discovery path"): the run-time
+    /// slash-command advertisement. `Harness::commands()` is the only catalog
+    /// source now, so no adapter constructs this any more — it stays
+    /// DECODE-ONLY because run journals written before the retirement still
+    /// carry these lines, and a line the journal cannot decode is skipped as
+    /// malformed, which silently reuses its seq for the next append and hides
+    /// that event from every replay cursor past it. Folds to nothing.
     #[serde(rename_all = "camelCase")]
     AvailableCommands {
         commands: Vec<SlashCommand>,

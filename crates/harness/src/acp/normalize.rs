@@ -408,16 +408,16 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                 },
             ]
         }
-        "available_commands_update" => {
-            let commands = parse_commands(update.get("availableCommands"));
-            vec![AgentEvent::AvailableCommands { commands }]
-        }
+        // The catalog reaches the composer through `Harness::commands()`
+        // alone (§10.4 "One discovery path"); the run stream carries none.
         // Context-window gauge, not per-turn input/output tokens — comet's
         // Usage event feeds rate-limit probes, so a wrong mapping is worse
         // than none. Mode/config/session-info updates carry nothing we render.
-        "usage_update" | "current_mode_update" | "config_option_update" | "session_info_update" => {
-            Vec::new()
-        }
+        "available_commands_update"
+        | "usage_update"
+        | "current_mode_update"
+        | "config_option_update"
+        | "session_info_update" => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -652,8 +652,11 @@ mod tests {
         );
     }
 
+    /// The catalog is the probe's alone (§10.4 "One discovery path"): the
+    /// parser still reads the agents' shapes for `commands()`, but the run
+    /// stream maps the same update to nothing.
     #[test]
-    fn available_commands_parse_with_hint() {
+    fn available_commands_parse_with_hint_but_emit_nothing() {
         let update = json!({
             "sessionUpdate": "available_commands_update",
             "availableCommands": [
@@ -663,24 +666,23 @@ mod tests {
             ],
         });
         assert_eq!(
-            map_update(&update),
-            vec![AgentEvent::AvailableCommands {
-                commands: vec![
-                    SlashCommand {
-                        name: "compact".into(),
-                        description: "Compact the session".into(),
-                        input_hint: None,
-                        aliases: Vec::new(),
-                    },
-                    SlashCommand {
-                        name: "goal".into(),
-                        description: "Set a goal".into(),
-                        input_hint: Some("the goal".into()),
-                        aliases: Vec::new(),
-                    },
-                ]
-            }]
+            parse_commands(update.get("availableCommands")),
+            vec![
+                SlashCommand {
+                    name: "compact".into(),
+                    description: "Compact the session".into(),
+                    input_hint: None,
+                    aliases: Vec::new(),
+                },
+                SlashCommand {
+                    name: "goal".into(),
+                    description: "Set a goal".into(),
+                    input_hint: Some("the goal".into()),
+                    aliases: Vec::new(),
+                },
+            ]
         );
+        assert_eq!(map_update(&update), Vec::new());
     }
 
     #[test]

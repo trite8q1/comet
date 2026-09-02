@@ -3350,8 +3350,9 @@ fn list_commands_params(key: &SlashKey) -> serde_json::Value {
 }
 
 /// Slash-command completion state: like [`FileMentionState`] but the candidate
-/// list is fetched once per `(device, harness, cwd)` (`ListCommands`) and filtered
-/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
+/// list is fetched per popup open for one `(device, harness, cwd)`
+/// (`ListCommands`) and filtered locally per keystroke — no RPC, debounce, or
+/// skeleton churn while typing.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
@@ -3361,6 +3362,11 @@ struct SlashState {
     /// Catalog the popup is showing commands for (cache key).
     key: Option<SlashKey>,
     request: u64,
+    /// Key of the `ListCommands` in flight, so a reopen while it is pending
+    /// waits for that reply instead of sending a second request.
+    inflight: Option<SlashKey>,
+    /// Fetching with nothing to show yet — the popup's skeleton. A
+    /// revalidation over cached rows renders the rows and never sets this.
     loading: bool,
     error: Option<SharedString>,
     dismissed: Option<(Range<usize>, String)>,
@@ -3414,6 +3420,40 @@ fn slash_error_message(err: &RpcError) -> SharedString {
     }
 }
 
+/// What one [`Composer::update_slash`] pass owes the popup while a `/` token
+/// is live (§10.4 "Freshness").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashPlan {
+    /// A keystroke inside an already-open popup: re-rank the rows the key
+    /// already has. Never an RPC — the catalog is revalidated once per open,
+    /// never once per keystroke.
+    Filter,
+    /// A popup open, or the key changing under an open one: show the key's
+    /// cached rows straight away (`loading` only when it has none) and
+    /// revalidate, unless that key's request is already in flight.
+    Open { loading: bool, fetch: bool },
+}
+
+/// `opened` is a `/` token appearing or the key changing under a live popup,
+/// `cached` is "this key already has rows", and `inflight_same_key` is "a
+/// `ListCommands` for this very key has not answered yet".
+fn slash_plan(opened: bool, cached: bool, inflight_same_key: bool) -> SlashPlan {
+    if !opened {
+        return SlashPlan::Filter;
+    }
+    SlashPlan::Open {
+        loading: !cached,
+        fetch: !inflight_same_key,
+    }
+}
+
+/// A failed discovery reaches the popup only when the key has no rows at all
+/// (§10.4): a revalidation that fails over a cached list keeps the list, and
+/// the failure stays a log line.
+fn slash_failure_error(cached: bool, err: &RpcError) -> Option<SharedString> {
+    (!cached).then(|| slash_error_message(err))
+}
+
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
@@ -3440,8 +3480,9 @@ pub struct Composer {
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
     slash: SlashState,
-    /// Advertised commands per `(harness, cwd)` (one `ListCommands` per key
-    /// per composer lifetime; the engine caches discovery on its side too).
+    /// Advertised commands per `(device, harness, cwd)`, kept for the
+    /// composer's life: the rows show immediately while each popup open
+    /// revalidates the key with one `ListCommands` (§10.4 "Freshness").
     slash_cache: HashMap<SlashKey, Vec<SlashCommand>>,
     /// Slash-popup row scroll — the stack overflows into a wheel/keyboard-
     /// scrollable list once it outgrows the card.
@@ -4250,8 +4291,8 @@ impl Composer {
         })
     }
 
-    /// Track the `/` token on every edit: open/refresh the popup, fetch the
-    /// key's command list on first open, filter locally per keystroke.
+    /// Track the `/` token on every edit: open/refresh the popup, revalidate
+    /// the key's command list once per open, filter locally per keystroke.
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
         let token = slash_token(text, cursor);
         let still_dismissed = token.as_ref().is_some_and(|token| {
@@ -4271,9 +4312,14 @@ impl Composer {
             self.refilter_slash(cx);
             return;
         }
+        // A `/` appearing, or the key changing under a live popup, is an
+        // open (§10.4 "Freshness"); any other token change is a keystroke.
+        let opened = self.slash.token.is_none() || key_changed;
         self.slash.token = token.clone();
         self.slash.key = key.clone();
-        self.slash.error = None;
+        if opened {
+            self.slash.error = None;
+        }
         if token.is_none() {
             self.slash.active = None;
             self.sync_mention_controls(cx);
@@ -4285,20 +4331,31 @@ impl Composer {
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&key) {
-            self.slash.loading = false;
-            self.refilter_slash(cx);
-            return;
+        match slash_plan(
+            opened,
+            self.slash_cache.contains_key(&key),
+            self.slash.inflight.as_ref() == Some(&key),
+        ) {
+            SlashPlan::Filter => {
+                self.refilter_slash(cx);
+                return;
+            }
+            SlashPlan::Open { loading, fetch } => {
+                self.slash.loading = loading;
+                self.refilter_slash(cx);
+                if !fetch {
+                    return;
+                }
+            }
         }
-        // First open for this (device, harness, cwd): one ListCommands,
+        // One ListCommands for this open of this (device, harness, cwd),
         // targeted like file search (the key's device owns the agent binary).
         self.slash.request = self.slash.request.wrapping_add(1);
-        self.slash.loading = true;
-        self.refilter_slash(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.slash.loading = false;
             return;
         };
+        self.slash.inflight = Some(key.clone());
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
             let params = list_commands_params(&key);
@@ -4307,17 +4364,20 @@ impl Composer {
                 if composer.slash.request != request {
                     return;
                 }
+                composer.slash.inflight = None;
                 composer.slash.loading = false;
                 match result {
                     Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
                         Ok(commands) => {
+                            // The reply replaces the key's rows (§10.4).
                             composer.slash_cache.insert(key, commands);
                         }
                         Err(err) => tracing::warn!(%err, "slash command decode failed"),
                     },
                     Err(err) => {
                         tracing::debug!(%err, "slash command discovery failed");
-                        composer.slash.error = Some(slash_error_message(&err));
+                        composer.slash.error =
+                            slash_failure_error(composer.slash_cache.contains_key(&key), &err);
                     }
                 }
                 composer.refilter_slash(cx);
@@ -6626,6 +6686,53 @@ mod tests {
         assert_eq!(
             list_commands_params(&local_no_project),
             serde_json::json!({ "harness": "mock" })
+        );
+    }
+
+    /// §10.4 "Freshness": every popup open revalidates its key exactly
+    /// once, and a failed revalidation never blanks a list that was fine a
+    /// moment ago.
+    #[test]
+    fn slash_open_revalidates_once_and_keeps_rows_on_failure() {
+        // First open of a key: nothing to show, so the skeleton, and one
+        // request.
+        assert_eq!(
+            slash_plan(true, false, false),
+            SlashPlan::Open {
+                loading: true,
+                fetch: true
+            }
+        );
+        // Open with the key cached: its rows show at once (no skeleton
+        // flash) and the revalidation still goes out.
+        assert_eq!(
+            slash_plan(true, true, false),
+            SlashPlan::Open {
+                loading: false,
+                fetch: true
+            }
+        );
+        // Reopened while this key's request is still in flight: no second
+        // request — the pending reply already owns the rows. A key change
+        // under the popup is the first case again, since the request in
+        // flight is the old key's.
+        assert_eq!(
+            slash_plan(true, false, true),
+            SlashPlan::Open {
+                loading: true,
+                fetch: false
+            }
+        );
+        // A keystroke inside the open popup only re-ranks the rows.
+        assert_eq!(slash_plan(false, false, false), SlashPlan::Filter);
+        assert_eq!(slash_plan(false, true, true), SlashPlan::Filter);
+
+        // A failed revalidation with rows cached keeps them (a log line
+        // only); with no rows it is the popup's error.
+        assert!(slash_failure_error(true, &RpcError::Closed).is_none());
+        assert_eq!(
+            slash_failure_error(false, &RpcError::Closed),
+            Some(slash_error_message(&RpcError::Closed))
         );
     }
 

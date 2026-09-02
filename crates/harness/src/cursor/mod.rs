@@ -57,7 +57,7 @@ pub mod skills;
 
 /// The pinned SDK (public beta 1.0.x line; inspected against 1.0.28's
 /// typings). Bump deliberately — see the module header.
-const CURSOR_SDK_PIN: &str = "@cursor/sdk@1.0.28";
+pub const CURSOR_SDK_PIN: &str = "@cursor/sdk@1.0.28";
 const SHIM_NAME: &str = "comet-cursor-shim.mjs";
 const SHIM_SOURCE: &str = include_str!("shim.mjs");
 
@@ -318,18 +318,6 @@ impl Harness for CursorHarness {
         });
         let _ = stdin_tx.send(first.to_string());
 
-        // The run knows its cwd, so its catalog can carry the project's skill
-        // roots too — the same list the SDK's own workspace scan loads for
-        // this run (ACP/opencode advertise theirs the same way).
-        let commands = self
-            .skills_home()
-            .map(|home| {
-                let project = (!request.cwd.is_empty())
-                    .then(|| skills::project_root(Path::new(&request.cwd)));
-                skills::scan(&home, project.as_deref())
-            })
-            .unwrap_or_default();
-
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             child,
@@ -337,7 +325,6 @@ impl Harness for CursorHarness {
             stdin_tx,
             event_tx,
             controls,
-            commands,
             request_cwd: request.cwd,
             request_model: request.model.unwrap_or_default(),
             interrupt_grace: self.interrupt_grace,
@@ -478,7 +465,6 @@ struct Session {
     stdin_tx: mpsc::UnboundedSender<String>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
-    commands: Vec<SlashCommand>,
     request_cwd: String,
     request_model: String,
     interrupt_grace: Duration,
@@ -497,7 +483,6 @@ async fn run_session(session: Session) {
         stdin_tx,
         event_tx,
         controls,
-        commands,
         request_cwd,
         request_model,
         interrupt_grace,
@@ -526,12 +511,6 @@ async fn run_session(session: Session) {
         let tx = event_tx.clone();
         async move { tx.send(Ok(ev)).await.is_ok() }
     };
-
-    // Advertise this run's skills (project roots included) before anything
-    // else, so the composer's popup matches what the agent just loaded.
-    if !commands.is_empty() && !send(AgentEvent::AvailableCommands { commands }).await {
-        return;
-    }
 
     'main: loop {
         tokio::select! {

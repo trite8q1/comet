@@ -116,7 +116,7 @@ final class SlashCommandsTests: XCTestCase {
         XCTAssertEqual(wrapped.cursor, 9)
     }
 
-    func testFetchesOncePerDeviceAndHarness() {
+    func testFetchesSeparatelyPerDeviceAndHarness() {
         var model = SlashCommandsModel()
         XCTAssertEqual(model.update(text: "/", cursor: 1, key: claudeKey), claudeKey)
         // Still loading: no second probe, and no rows from anywhere else.
@@ -124,7 +124,7 @@ final class SlashCommandsTests: XCTestCase {
         XCTAssertEqual(model.popup, .loading)
         model.received([command("compact"), command("clear")], for: claudeKey)
         XCTAssertEqual(model.popup, .commands([command("compact"), command("clear")]))
-        // Cached: reopening the same pair never probes again.
+        // A keystroke inside the same open never probes again.
         XCTAssertNil(model.update(text: "/co", cursor: 3, key: claudeKey))
         XCTAssertEqual(model.popup, .commands([command("compact")]))
 
@@ -140,6 +140,71 @@ final class SlashCommandsTests: XCTestCase {
                                      cwd: otherKey.cwd)
         XCTAssertEqual(model.update(text: "/co", cursor: 3, key: remote), remote)
         XCTAssertEqual(model.popup, .loading)
+    }
+
+    /// §10.4 "Freshness": every open revalidates the key's list — the token
+    /// appearing, or the key changing while the popup is open — and nothing
+    /// else does. Never one probe per keystroke, never a second one while the
+    /// key's probe is in flight; the reply replaces the cached rows.
+    func testRevalidatesOnEveryOpenAndNeverPerKeystroke() {
+        var model = SlashCommandsModel()
+        XCTAssertEqual(model.update(text: "/", cursor: 1, key: claudeKey), claudeKey)
+        // Keystrokes inside one open never probe — while it loads...
+        XCTAssertNil(model.update(text: "/c", cursor: 2, key: claudeKey))
+        model.received([command("compact"), command("clear")], for: claudeKey)
+        // ...and with the rows on screen.
+        XCTAssertNil(model.update(text: "/cl", cursor: 3, key: claudeKey))
+        XCTAssertEqual(model.popup, .commands([command("clear")]))
+
+        // Closing (the caret leaves the token) and opening again revalidates:
+        // the cached rows show immediately, with no loading state.
+        XCTAssertNil(model.update(text: "/clear now", cursor: 10, key: claudeKey))
+        XCTAssertEqual(model.popup, .hidden)
+        XCTAssertEqual(model.update(text: "/", cursor: 1, key: claudeKey), claudeKey)
+        XCTAssertEqual(model.popup, .commands([command("compact"), command("clear")]))
+
+        // Another open while that probe is still in flight sends nothing, and
+        // the reply replaces the rows it revalidated.
+        XCTAssertNil(model.update(text: "", cursor: 0, key: claudeKey))
+        XCTAssertNil(model.update(text: "/", cursor: 1, key: claudeKey))
+        model.received([command("compact")], for: claudeKey)
+        XCTAssertEqual(model.popup, .commands([command("compact")]))
+    }
+
+    /// A key change while a probe is out opens the new key: it probes now, and
+    /// the reply still owed by the old key is keyed to it, never rendered here.
+    func testKeyChangeWhileInFlightProbesTheNewKeyAndDropsTheStaleReply() {
+        var model = SlashCommandsModel()
+        XCTAssertEqual(model.update(text: "/c", cursor: 2, key: claudeKey), claudeKey)
+        XCTAssertEqual(model.update(text: "/c", cursor: 2, key: otherKey), otherKey)
+        XCTAssertEqual(model.popup, .loading)
+        // The first harness answers late: its rows belong to its own key.
+        model.received([command("compact")], for: claudeKey)
+        XCTAssertEqual(model.popup, .loading)
+        model.received([command("code")], for: otherKey)
+        XCTAssertEqual(model.popup, .commands([command("code")]))
+        // Switching back is another open: those rows show at once, revalidated.
+        XCTAssertEqual(model.update(text: "/c", cursor: 2, key: claudeKey), claudeKey)
+        XCTAssertEqual(model.popup, .commands([command("compact")]))
+    }
+
+    /// A transient probe failure never blanks a list that was fine a moment
+    /// ago; the error row shows only when the key has no rows at all (§10.4).
+    func testAFailedRevalidationKeepsTheRows() {
+        var model = SlashCommandsModel()
+        XCTAssertEqual(model.update(text: "/", cursor: 1, key: claudeKey), claudeKey)
+        model.received([command("compact")], for: claudeKey)
+        XCTAssertNil(model.update(text: "", cursor: 0, key: claudeKey))
+        XCTAssertEqual(model.update(text: "/", cursor: 1, key: claudeKey), claudeKey)
+        XCTAssertEqual(model.popup, .commands([command("compact")]))
+        model.failed("The device is offline", for: claudeKey)
+        XCTAssertEqual(model.popup, .commands([command("compact")]))
+
+        // No rows for the key: the same failure is the popup's error row.
+        var cold = SlashCommandsModel()
+        XCTAssertEqual(cold.update(text: "/", cursor: 1, key: claudeKey), claudeKey)
+        cold.failed("The device is offline", for: claudeKey)
+        XCTAssertEqual(cold.popup, .failed("The device is offline"))
     }
 
     /// Discovery is cwd-scoped (§10.4): the same harness on the same device in
@@ -164,8 +229,9 @@ final class SlashCommandsTests: XCTestCase {
         model.received([command("other-only")], for: other)
         XCTAssertEqual(model.popup, .commands([command("other-only")]))
 
-        // Back to the first folder: cached, and its own list again.
-        XCTAssertNil(model.update(text: "/r", cursor: 2, key: repo))
+        // Back to the first folder: its cached list shows at once (no loading
+        // state) while the open's own probe revalidates it (§10.4).
+        XCTAssertEqual(model.update(text: "/r", cursor: 2, key: repo), repo)
         XCTAssertEqual(model.popup, .commands([command("repo-only")]))
 
         // A cwd-less key (no space picked yet) is a third catalog.
@@ -192,7 +258,11 @@ final class SlashCommandsTests: XCTestCase {
         _ = failing.update(text: "/", cursor: 1, key: claudeKey)
         failing.failed("The device is offline", for: claudeKey)
         XCTAssertEqual(failing.popup, .failed("The device is offline"))
+        // A keystroke inside the same open is not an open: no retry.
+        XCTAssertNil(failing.update(text: "/c", cursor: 2, key: claudeKey))
+        XCTAssertEqual(failing.popup, .failed("The device is offline"))
         // The next open retries (the desktop clears its error the same way).
+        XCTAssertNil(failing.update(text: "", cursor: 0, key: claudeKey))
         XCTAssertEqual(failing.update(text: "/c", cursor: 2, key: claudeKey), claudeKey)
         XCTAssertEqual(failing.popup, .loading)
         failing.received([command("compact")], for: claudeKey)
@@ -215,8 +285,9 @@ final class SlashCommandsTests: XCTestCase {
         // Same token, caret moved: still dismissed.
         XCTAssertNil(model.update(text: "/co", cursor: 2, key: claudeKey))
         XCTAssertEqual(model.popup, .hidden)
-        // Editing the token reopens it.
-        XCTAssertNil(model.update(text: "/com", cursor: 4, key: claudeKey))
+        // Editing the token reopens it — an open, so it revalidates the list
+        // while the cached rows stay on screen (§10.4 "Freshness").
+        XCTAssertEqual(model.update(text: "/com", cursor: 4, key: claudeKey), claudeKey)
         XCTAssertEqual(model.popup, .commands([command("compact")]))
     }
 

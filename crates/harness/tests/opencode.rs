@@ -395,13 +395,6 @@ async fn thinking_streams_and_the_turn_settles_only_on_idle() {
         &started,
         AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_test"
     ));
-    // AvailableCommands from /command — commands and skills alike, scoped to
-    // the run's own directory (so the project entry rides along).
-    let commands = next_event(&mut stream).await;
-    assert!(matches!(
-        &commands,
-        AgentEvent::AvailableCommands { commands } if commands.len() == 3
-    ));
 
     assistant_message(&fake, "ses_test", "msg_1");
     // Reasoning part: open snapshot → deltas → closing snapshot (full text,
@@ -474,7 +467,6 @@ async fn foreign_session_idle_never_settles_our_turn() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
-    let _ = next_event(&mut stream).await; // AvailableCommands
 
     assistant_message(&fake, "ses_test", "msg_1");
     idle(&fake, "ses_OTHER");
@@ -507,8 +499,7 @@ async fn model_and_advertised_variant_ride_the_prompt() {
     req.model = Some("anthropic/opus".into());
     req.reasoning = Some(ReasoningLevel::XHigh);
     let mut stream = harness(&fake).run(req, controls).await.expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
     assert_eq!(prompts[0]["model"]["providerID"], "anthropic");
@@ -530,8 +521,7 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
         .run(request("hi"), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     assistant_message(&fake, "ses_test", "msg_1");
     fake.emit(json!({
@@ -584,8 +574,7 @@ async fn interrupt_aborts_and_settles_interrupted() {
         .run(request("hi"), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     assistant_message(&fake, "ses_test", "msg_1");
     token.cancel();
@@ -609,8 +598,7 @@ async fn provider_retries_surface_and_cap_out() {
         .run(request("hi"), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     let retry = |attempt: u64| {
         json!({
@@ -661,8 +649,7 @@ async fn session_error_with_no_content_settles_errored() {
         .run(request("hi"), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     fake.emit(json!({
         "type": "session.error",
@@ -711,8 +698,7 @@ async fn subagent_task_streams_tagged_and_settles_from_the_task_part() {
         .run(request("spawn"), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     assistant_message(&fake, "ses_test", "msg_1");
     // The task tool part registers the chip and binds by metadata.
@@ -831,7 +817,6 @@ async fn resume_reuses_the_durable_session() {
         &started,
         AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_resume"
     ));
-    let _ = next_event(&mut stream).await;
     wait_posts(&fake, "/session/ses_resume/prompt_async", 1).await;
 
     assistant_message(&fake, "ses_resume", "msg_1");
@@ -847,8 +832,7 @@ async fn slash_command_routes_through_the_command_endpoint() {
         .run(request("/init the repo"), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     let commands = wait_posts(&fake, "/session/ses_test/command", 1).await;
     assert_eq!(commands[0]["command"], "init");
@@ -871,8 +855,7 @@ async fn skill_invocation_routes_through_the_command_endpoint() {
         .run(request("/cometalpha  do it "), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     let commands = wait_posts(&fake, "/session/ses_test/command", 1).await;
     assert_eq!(commands[0]["command"], "cometalpha");
@@ -894,8 +877,7 @@ async fn unknown_invocation_stays_prompt_text() {
         .run(request("/imagegen a cat"), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
 
     let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
     let text = prompts[0]["parts"][0]["text"]
@@ -921,8 +903,7 @@ async fn first_prompt_waits_for_the_live_event_subscription() {
         .run(request("hi"), controls)
         .await
         .expect("run starts");
-    let _ = next_event(&mut stream).await;
-    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await; // SessionStarted
     wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
     assert_eq!(
         *fake.first_prompt_had_subscriber.lock().unwrap(),
@@ -980,6 +961,37 @@ async fn models_discover_from_the_provider_catalog() {
     // Commands were primed off the same probe.
     let commands = harness.commands(None).await.expect("commands");
     assert_eq!(commands[0].name, "init");
+}
+
+/// §10.4 "One discovery path": the run fetches `/command` for its own slash
+/// routing, but the catalog never rides the run stream — `commands()` is the
+/// only source the composer has.
+#[tokio::test]
+async fn run_stream_carries_no_catalog_event() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AvailableCommands { .. })),
+        "the retired run-time catalog event was emitted: {events:?}"
+    );
+    // The catalog itself is still reachable — through the probe alone.
+    assert!(
+        !harness(&fake)
+            .commands(None)
+            .await
+            .expect("commands")
+            .is_empty()
+    );
 }
 
 /// §10.4: the catalog is cwd-scoped, so the probe asks `/command` about the

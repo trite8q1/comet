@@ -197,7 +197,18 @@ impl Frontmatter {
                             .collect::<Vec<_>>()
                             .join(joiner)
                     } else {
-                        unquote(value).to_owned()
+                        // A plain scalar, possibly continued on indented lines
+                        // (`description:` followed by an indented paragraph is
+                        // the shape skills written by hand often take); YAML
+                        // folds those continuation lines with single spaces.
+                        let mut text = unquote(value).to_owned();
+                        for line in take_indented(&block, &mut i) {
+                            if !text.is_empty() {
+                                text.push(' ');
+                            }
+                            text.push_str(line.trim());
+                        }
+                        text
                     });
                 }
                 "metadata" => {
@@ -281,5 +292,41 @@ pub fn project_root(cwd: &Path) -> PathBuf {
             Some(parent) => dir = parent,
             None => return cwd.to_path_buf(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Frontmatter;
+
+    #[test]
+    fn skill_description_scalars_parse_like_yaml() {
+        // Plain one-liner, quoted or not.
+        assert_eq!(
+            Frontmatter::parse("---\ndescription: \"Review a PR\"\n---\n").description,
+            Some("Review a PR".into())
+        );
+        // Plain scalar continued on indented lines (a hand-written
+        // paragraph after a bare `description:`): folded with spaces.
+        let plain = "---\nname: x\ndescription:\n  React composition patterns.\n  Use when refactoring.\nlicense: MIT\n---\n";
+        assert_eq!(
+            Frontmatter::parse(plain).description,
+            Some("React composition patterns. Use when refactoring.".into())
+        );
+        // The same with text on the first line too.
+        let mixed =
+            "---\ndescription: First line\n  second line\nmetadata:\n  surfaces: [cli]\n---\n";
+        let front = Frontmatter::parse(mixed);
+        assert_eq!(front.description, Some("First line second line".into()));
+        assert_eq!(front.surfaces, vec!["cli".to_string()]);
+        // Folded and literal block scalars keep their own joining rules.
+        assert_eq!(
+            Frontmatter::parse("---\ndescription: >\n  a\n  b\n---\n").description,
+            Some("a b".into())
+        );
+        assert_eq!(
+            Frontmatter::parse("---\ndescription: |\n  a\n  b\n---\n").description,
+            Some("a\nb".into())
+        );
     }
 }
