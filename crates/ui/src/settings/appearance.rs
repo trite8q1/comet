@@ -2346,17 +2346,17 @@ mod tests {
     }
 
     #[test]
-    fn registry_offers_both_appearances_and_keeps_single_dark_families_valid() {
+    fn registry_offers_both_comet_appearances() {
         let registry = ThemeRegistry::builtin();
         assert_eq!(
             registry
                 .variants_for(comet_theme::Appearance::Light)
                 .count(),
-            10
+            1
         );
         assert_eq!(
             registry.variants_for(comet_theme::Appearance::Dark).count(),
-            20
+            1
         );
     }
 

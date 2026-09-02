@@ -4810,8 +4810,8 @@ rename to new_name.rs
         use comet_theme::{AccentSelection, SurfacePreference};
 
         for (appearance, variant_id) in [
-            (crate::theme::Appearance::Dark, "gruvbox-dark"),
-            (crate::theme::Appearance::Light, "gruvbox-light"),
+            (crate::theme::Appearance::Dark, "comet-dark"),
+            (crate::theme::Appearance::Light, "comet-light"),
         ] {
             let opaque = Theme::for_selection(
                 appearance,
@@ -4851,11 +4851,17 @@ rename to new_name.rs
                     Some(tint),
                     "{variant_id} content-plane tint"
                 );
-                assert_ne!(
-                    tint,
-                    frosted.glass_overlay(),
-                    "{variant_id} must not borrow the elevated overlay plane"
-                );
+                // The frost tint must come from the content plane, never the
+                // elevated overlay. Comet Light paints both planes pure white,
+                // so they are indistinguishable there; only assert distinctness
+                // where the two planes are actually different colors.
+                if frosted.bg != frosted.surface_overlay {
+                    assert_ne!(
+                        tint,
+                        frosted.glass_overlay(),
+                        "{variant_id} must not borrow the elevated overlay plane"
+                    );
+                }
                 assert_eq!(tint.a, expected_alpha, "{variant_id} tint coverage");
                 assert_eq!(
                     frosted_paint.hover_bg,

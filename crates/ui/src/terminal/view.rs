@@ -948,9 +948,9 @@ mod tests {
     fn registered_theme_owns_terminal_background_foreground_selection_and_ansi() {
         let theme = Theme::for_selection(
             Appearance::Dark,
-            "dracula",
+            "comet-dark",
             comet_theme::AccentSelection::ThemeDefault,
-            comet_theme::SurfacePreference::ThemeDefault,
+            comet_theme::SurfacePreference::Opaque,
         );
         assert_eq!(terminal_panel_bg(&theme), theme.terminal.background);
         assert_eq!(
