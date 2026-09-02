@@ -48,38 +48,39 @@ use comet_theme::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AccentColor {
-    /// The exact upstream Comet indigo.
-    #[default]
-    #[serde(alias = "violet", alias = "indigo", alias = "red", alias = "purple")]
-    Comet,
+    /// The prior default violet, kept as a selectable preset labeled "Violet".
+    #[serde(alias = "comet", alias = "indigo", alias = "red", alias = "purple")]
+    Violet,
     Orange,
     Amber,
     Green,
     #[serde(alias = "teal")]
     Cyan,
+    /// Comet's default accent (the existing blue); its swatch is labeled "Comet".
+    #[default]
     Blue,
     Pink,
 }
 
 impl AccentColor {
     pub const ALL: [Self; 7] = [
-        Self::Comet,
+        Self::Blue,
         Self::Orange,
         Self::Amber,
         Self::Green,
         Self::Cyan,
-        Self::Blue,
+        Self::Violet,
         Self::Pink,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Comet => "Comet",
+            Self::Blue => "Comet",
             Self::Orange => "Orange",
             Self::Amber => "Amber",
             Self::Green => "Green",
             Self::Cyan => "Cyan",
-            Self::Blue => "Blue",
+            Self::Violet => "Violet",
             Self::Pink => "Pink",
         }
     }
@@ -89,10 +90,10 @@ impl AccentColor {
         // used to gamut-clip OKLCH into sRGB and then mutate HSL lightness,
         // producing different chroma and apparent hues across light/dark.
         let (primary, strong) = match (self, appearance) {
-            (Self::Comet, Appearance::Dark) => {
+            (Self::Violet, Appearance::Dark) => {
                 (oklch(0.673, 0.182, 276.935), oklch(0.585, 0.233, 277.117))
             }
-            (Self::Comet, Appearance::Light) => {
+            (Self::Violet, Appearance::Light) => {
                 (oklch(0.511, 0.262, 276.966), oklch(0.511, 0.262, 276.966))
             }
             (Self::Orange, Appearance::Dark) => (oklch(0.75, 0.18, 55.0), oklch(0.54, 0.19, 55.0)),
@@ -133,7 +134,7 @@ impl AccentColor {
 impl From<AccentColor> for AccentPreset {
     fn from(value: AccentColor) -> Self {
         match value {
-            AccentColor::Comet => Self::Comet,
+            AccentColor::Violet => Self::Violet,
             AccentColor::Orange => Self::Orange,
             AccentColor::Amber => Self::Amber,
             AccentColor::Green => Self::Green,
@@ -147,7 +148,7 @@ impl From<AccentColor> for AccentPreset {
 impl From<AccentPreset> for AccentColor {
     fn from(value: AccentPreset) -> Self {
         match value {
-            AccentPreset::Comet => Self::Comet,
+            AccentPreset::Violet => Self::Violet,
             AccentPreset::Orange => Self::Orange,
             AccentPreset::Amber => Self::Amber,
             AccentPreset::Green => Self::Green,
@@ -1164,7 +1165,7 @@ impl Theme {
     ) -> Self {
         let appearance = model_appearance(variant.appearance);
         let accent_color = match accent_selection {
-            AccentSelection::ThemeDefault => AccentColor::Comet,
+            AccentSelection::ThemeDefault => AccentColor::Blue,
             AccentSelection::Preset(preset) => preset.into(),
         };
         let mut theme = Self::for_preferences(appearance, accent_color);
@@ -1784,18 +1785,18 @@ mod tests {
     }
 
     #[test]
-    fn comet_accent_is_the_exact_upstream_default() {
+    fn default_accent_is_the_blue_preset() {
         let dark = Theme::dark();
         let light = Theme::light();
-        assert_eq!(dark.accent_color, AccentColor::Comet);
-        assert_eq!(dark.accent, oklch(0.673, 0.182, 276.935));
-        assert_eq!(dark.accent_strong, oklch(0.585, 0.233, 277.117));
+        assert_eq!(dark.accent_color, AccentColor::Blue);
+        assert_eq!(dark.accent, oklch(0.70, 0.17, 255.0));
+        assert_eq!(dark.accent_strong, oklch(0.50, 0.20, 255.0));
         assert_eq!(dark.code_text, dark.accent);
         assert_eq!(dark.busy, dark.accent);
         assert_eq!(dark.glyph.mid, dark.accent);
         assert_eq!(dark.caret, dark.accent);
-        assert_eq!(light.accent, oklch(0.511, 0.262, 276.966));
-        assert_eq!(light.accent_strong, oklch(0.511, 0.262, 276.966));
+        assert_eq!(light.accent, oklch(0.47, 0.21, 255.0));
+        assert_eq!(light.accent_strong, oklch(0.47, 0.21, 255.0));
         assert_eq!(light.code_text, light.accent);
         assert_eq!(light.busy, light.accent);
         assert_eq!(light.glyph.mid, light.accent);
@@ -1804,10 +1805,10 @@ mod tests {
 
     #[test]
     fn previous_preview_accent_names_migrate_without_resetting_settings() {
-        for old_default in ["violet", "indigo", "red", "purple"] {
+        for old_name in ["comet", "violet", "indigo", "red", "purple"] {
             assert_eq!(
-                serde_json::from_str::<AccentColor>(&format!(r#""{old_default}""#)).unwrap(),
-                AccentColor::Comet
+                serde_json::from_str::<AccentColor>(&format!(r#""{old_name}""#)).unwrap(),
+                AccentColor::Violet
             );
         }
         assert_eq!(
@@ -2010,7 +2011,7 @@ mod tests {
                 assert_eq!(theme.success, baseline.success);
                 assert_eq!(theme.diff_add, baseline.diff_add);
                 assert_eq!(theme.diff_del, baseline.diff_del);
-                if accent != AccentColor::Comet {
+                if accent != AccentColor::Blue {
                     assert_ne!(theme.code_text, baseline.code_text);
                     assert_ne!(theme.busy, baseline.busy);
                     assert_ne!(theme.selection, baseline.selection);
