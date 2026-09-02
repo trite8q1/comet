@@ -447,8 +447,9 @@ pub struct AcpHarness {
     /// picker. OpenCode shares this with its real startup budget because both
     /// paths wait for the same plugin-heavy boot.
     model_discovery_timeout: Duration,
-    /// Discovery result cache: the advertised commands survive across calls.
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Discovery result cache, per probe cwd: the advertised commands
+    /// survive across calls.
+    commands: crate::commands::CommandCache,
     /// Model discovery cache: only a successful, non-empty probe is cached,
     /// so a mis-authed agent retries on the next picker open.
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
@@ -470,7 +471,7 @@ impl AcpHarness {
             // wedged agent, not a slow one.
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
-            commands: tokio::sync::OnceCell::new(),
+            commands: crate::commands::CommandCache::default(),
             models_cache: tokio::sync::OnceCell::new(),
             models_probe: tokio::sync::Mutex::new(()),
         }
@@ -674,8 +675,24 @@ impl AcpHarness {
     /// briefly for `available_commands_update`. Best-effort — an agent that
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+    ///
+    /// Grok, Hermes and pi-acp all publish their real catalog on the session
+    /// channel (verified live: grok 1.0.13 — 97 entries including every
+    /// skill; Hermes 0.13.0 — 9 built-ins, no skills; pi-acp 0.0.33 — 33
+    /// entries, 25 of them `skill:<name>`), so the `session/new` leg is the
+    /// one that matters. Its cwd is `cwd`: grok's catalog includes that
+    /// project's own skills (`.agents/skills`, `.cursor/skills`). Without one
+    /// the probe stands in `$HOME`, the way the agent's own CLI would when
+    /// started outside a project.
+    async fn discover_commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
+        let probe_cwd = cwd
+            .map(|p| p.display().to_string())
+            .or_else(|| std::env::var("HOME").ok())
+            .unwrap_or_else(|| "/".into());
+        let (mut child, _stderr) = self.spawn_agent(Some(&probe_cwd), false, &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -687,39 +704,47 @@ impl AcpHarness {
             let init = client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
+            // The handshake list is a FALLBACK, never the answer: grok
+            // advertises a partial `_meta.availableCommands` there (7
+            // built-ins on 1.0.13 — no plugin commands, no skills at all)
+            // and only completes it on the session channel, where its own
+            // TUI reads it. So the session leg always runs and its catalog
+            // wins; the handshake list survives only for an agent that
+            // refuses `session/new` before login.
             let mut commands = scan_available_commands(&init);
-            if commands.is_empty() {
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-                let session = client
-                    .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
-                    .await;
-                if session.is_ok() {
-                    // The update usually arrives within milliseconds of the
-                    // session response; 2s bounds a quiet agent.
-                    let deadline = tokio::time::sleep(Duration::from_secs(2));
-                    tokio::pin!(deadline);
-                    loop {
-                        tokio::select! {
-                            inc = incoming.recv() => match inc {
-                                Some(Incoming::Notification { method, params })
-                                    if method == "session/update" =>
+            let session = client
+                .request("session/new", json!({ "cwd": probe_cwd, "mcpServers": [] }))
+                .await;
+            if session.is_ok() {
+                // The update usually arrives within milliseconds of the
+                // session response; 2s bounds a quiet agent.
+                let deadline = tokio::time::sleep(Duration::from_secs(2));
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        inc = incoming.recv() => match inc {
+                            Some(Incoming::Notification { method, params })
+                                if method == "session/update" =>
+                            {
+                                let update = params.get("update").cloned().unwrap_or(Value::Null);
+                                if update.get("sessionUpdate").and_then(Value::as_str)
+                                    == Some("available_commands_update")
                                 {
-                                    let update = params.get("update").cloned().unwrap_or(Value::Null);
-                                    if update.get("sessionUpdate").and_then(Value::as_str)
-                                        == Some("available_commands_update")
-                                    {
-                                        commands = parse_commands(update.get("availableCommands"));
-                                        break;
+                                    let advertised =
+                                        parse_commands(update.get("availableCommands"));
+                                    if !advertised.is_empty() {
+                                        commands = advertised;
                                     }
+                                    break;
                                 }
-                                Some(Incoming::Request { id, .. }) => {
-                                    client.respond_error(&id, -32601, "unsupported during discovery");
-                                }
-                                Some(_) => {}
-                                None => break,
-                            },
-                            _ = &mut deadline => break,
-                        }
+                            }
+                            Some(Incoming::Request { id, .. }) => {
+                                client.respond_error(&id, -32601, "unsupported during discovery");
+                            }
+                            Some(_) => {}
+                            None => break,
+                        },
+                        _ = &mut deadline => break,
                     }
                 }
             }
@@ -1090,11 +1115,13 @@ impl Harness for AcpHarness {
         }
     }
 
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands
-            .get_or_try_init(|| self.discover_commands())
+            .get_or_try_init(cwd, async || self.discover_commands(cwd).await)
             .await
-            .cloned()
     }
 
     async fn run(

@@ -106,9 +106,32 @@ case "$first" in
   # stdin line (no user message ever follows). Shape mirrors 2.1.228's
   # control_response: commands under response.response.
   rid=$(printf '%s\n' "$first" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
-  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"
+  # The catalog is cwd-scoped (ARCHITECTURE.md §10.4): the CLI lists the
+  # `.claude/skills` of the directory it was STARTED in. A `comet-probe-tag`
+  # file there stands in for one such project skill, and every probe appends a
+  # line to `comet-probe-log` beside it, so a test can count probes per cwd.
+  project=''
+  if [ -f ./comet-probe-tag ]; then
+    project=",{\"name\":\"$(cat ./comet-probe-tag)\",\"description\":\"project skill under the probe cwd\"}"
+    printf 'probe\n' >>./comet-probe-log
+  fi
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"vercel:deploy\",\"description\":\"(vercel) Deploy the current project to Vercel.\",\"argumentHint\":\"[prod]\",\"aliases\":[\"deploy\",\"\"]},{\"name\":\"\",\"description\":\"nameless: dropped\"}$project],\"output_style\":\"default\"}}}"
   # Stay alive until the driver tears us down, like the real CLI would.
   exec sleep 30
+  ;;
+
+*'"content":"/review 42"'*)
+  # Slash parity (ARCHITECTURE.md §10.5): Claude Code expands `/name args`
+  # out of ordinary prompt text ("include /skill-name in the prompt string and
+  # Claude Code expands it before running" — headless docs), so the adapter
+  # must hand the invocation over untouched. Append the raw stdin user lines
+  # (the run prompt, then the steer) to a log in the run's cwd; the test
+  # compares them byte for byte.
+  printf '%s\n' "$first" >>slash-parity.jsonl
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-slash"}'
+  read -r steer || steer=''
+  [ -n "$steer" ] && printf '%s\n' "$steer" >>slash-parity.jsonl
+  emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-slash"}'
   ;;
 
 *scenario:error*)

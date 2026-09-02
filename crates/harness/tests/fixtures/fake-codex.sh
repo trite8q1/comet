@@ -9,6 +9,25 @@ emit() { printf '%s\n' "$1"; }
 rid() { printf '%s' "$1" | sed 's/.*"id":\([0-9]*\).*/\1/'; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
+# One `skills/list` answer, reused by the discovery probe and by the live-run
+# probe: two cwd groups sharing one skill (dedupe by name), one skill without
+# an interface block, and one turned off by `[[skills.config]]` in
+# config.toml, which the adapter must drop everywhere.
+SKILLS='{"data":[{"cwd":"/w","skills":[
+{"name":"imagegen","description":"Model-facing paragraph about images.","interface":{"displayName":"Image Gen","shortDescription":"Generate or edit images"},"path":"/w/.agents/skills/imagegen/SKILL.md","scope":"repo","enabled":true},
+{"name":"bare","description":"No interface block","path":"/w/.agents/skills/bare/SKILL.md","scope":"user","enabled":true},
+{"name":"switched-off","description":"Disabled in config.toml","path":"/w/.agents/skills/switched-off/SKILL.md","scope":"user","enabled":false}]},
+{"cwd":"/x","skills":[{"name":"imagegen","description":"dupe","interface":{"shortDescription":"dupe"},"path":"/x/.agents/skills/imagegen/SKILL.md","scope":"user","enabled":true}]}]}'
+SKILLS=$(printf '%s' "$SKILLS" | tr -d '\n')
+
+# Turn frames are recorded for the slash-parity tests, which pre-create an empty
+# `comet-turns.jsonl` in the run cwd (a plain sentinel: no other scenario has
+# one, so no other run writes anywhere).
+record_turn() {
+  if [ -f comet-turns.jsonl ]; then printf '%s\n' "$1" >>comet-turns.jsonl; fi
+  return 0
+}
+
 fail_turn() { # $1 = request id, $2 = message
   emit "{\"id\":$1,\"result\":{\"turn\":{\"id\":\"t-bad\"}}}"
   emit "{\"method\":\"turn/failed\",\"params\":{\"turn\":{\"id\":\"t-bad\",\"error\":{\"message\":\"$2\"}}}}"
@@ -28,9 +47,17 @@ has "$line" '"method":"initialized"' || exit 1
 read -r line || exit 1
 thread_line="$line"
 if has "$line" '"method":"skills/list"'; then
-  # Command discovery probe: answer with two cwd groups sharing one skill
-  # (dedupe by name) and settle; no thread ever starts.
-  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"cwd\":\"/w\",\"skills\":[{\"name\":\"imagegen\",\"description\":\"Model-facing paragraph about images.\",\"interface\":{\"displayName\":\"Image Gen\",\"shortDescription\":\"Generate or edit images\"}},{\"name\":\"bare\",\"description\":\"No interface block\"}]},{\"cwd\":\"/x\",\"skills\":[{\"name\":\"imagegen\",\"description\":\"dupe\",\"interface\":{\"shortDescription\":\"dupe\"}}]}]}}"
+  # Command discovery probe: answer and settle; no thread ever starts.
+  # `cwds` scopes the listing (ARCHITECTURE.md §10.4): answer a request that
+  # carries one with an extra repo-scoped group for that directory, the way
+  # codex reports the project's own `.agents/skills`.
+  answer="$SKILLS"
+  if has "$line" '"cwds"'; then
+    want=$(printf '%s' "$line" | sed 's/.*"cwds":\["\([^"]*\)".*/\1/')
+    group="{\"cwd\":\"$want\",\"skills\":[{\"name\":\"project-skill\",\"description\":\"$want\",\"path\":\"$want/.agents/skills/project-skill/SKILL.md\",\"scope\":\"repo\",\"enabled\":true}]}"
+    answer=$(printf '%s' "$SKILLS" | sed "s|\"data\":\[|\"data\":[$group,|")
+  fi
+  emit "{\"id\":$(rid "$line"),\"result\":$answer}"
   exec sleep 30
 fi
 if has "$line" '"method":"thread/resume"'; then
@@ -50,7 +77,14 @@ else
 fi
 
 # ---- first turn ------------------------------------------------------------
+# A prompt that looks like `/name ...` makes the harness probe skills/list on
+# this live session before its first turn.
 read -r turnline || exit 1
+if has "$turnline" '"method":"skills/list"'; then
+  emit "{\"id\":$(rid "$turnline"),\"result\":$SKILLS}"
+  read -r turnline || exit 1
+fi
+record_turn "$turnline"
 tid=$(rid "$turnline")
 
 case "$turnline" in
@@ -225,6 +259,29 @@ case "$turnline" in
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
   emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"boom"}}}}'
+  ;;
+
+*scenario:parity-steer*)
+  # Slash parity on the STEER path: the first turn is plain text, the steer
+  # carries the invocation and is recorded for the test to assert on.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  read -r steerline || exit 1
+  if has "$steerline" '"method":"skills/list"'; then
+    emit "{\"id\":$(rid "$steerline"),\"result\":$SKILLS}"
+    read -r steerline || exit 1
+  fi
+  record_turn "$steerline"
+  sid=$(rid "$steerline")
+  emit "{\"id\":$sid,\"result\":{}}"
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
+*scenario:parity*)
+  # Slash parity on the RUN path: the turn frame is already recorded above.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 
 *scenario:resumed*)

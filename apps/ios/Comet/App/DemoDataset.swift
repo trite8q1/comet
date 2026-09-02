@@ -110,6 +110,20 @@ final class DemoDataset {
                            chats: chats, sessions: sessions, changeRequests: changeRequests)
     }
 
+    // MARK: Fake catalog (slash-command popup demo)
+
+    /// Stand-in for a device's `ListCommands` reply — skills, custom commands
+    /// and built-ins, exactly as a CLI advertises them.
+    static let slashCommands: [SlashCommand] = [
+        SlashCommand(name: "compact", description: "Compact the conversation",
+                     inputHint: "instructions"),
+        SlashCommand(name: "review", description: "Review the working tree",
+                     aliases: ["pr"]),
+        SlashCommand(name: "architect", description: "Plan the work before touching code"),
+        SlashCommand(name: "changelog", description: "Draft release notes",
+                     inputHint: "range"),
+    ]
+
     // MARK: Fake filesystem (folder browser demo)
 
     static let fileTree: [String: [String]] = [

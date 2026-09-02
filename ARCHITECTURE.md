@@ -289,3 +289,164 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 4. Text shaping performance for analytic row heights: gpui measures shaped text natively (Rust ⇒
    cheap), so we start with gpui `list()` measurement + memoization rather than porting pretext's
    full analytic kernel; revisit only if cold-open of huge transcripts measures slow.
+
+## 10. Agent Skills as slash commands (every surface, native CLI parity)
+
+Goal: whatever a user can invoke by name in the active agent's own CLI — Agent Skills
+(`SKILL.md` + optional `scripts/`, `references/`, `assets/`), custom commands, and the CLI's
+built-ins — is invocable from every comet composer under the same name, with the same
+arguments, discovered the same way, and activated the same way (explicit vs. model-driven).
+Nothing more: comet does not invent a skills catalog, does not read `SKILL.md` itself, and
+does not offer a skill on a harness whose CLI would not offer it either.
+
+### 10.1 Vocabulary
+
+- **Invocable** — one entry the harness lets the user invoke by name from the prompt. Wire
+  type: `comet_proto::SlashCommand { name, description, input_hint }`. Skills, custom
+  commands, and built-ins are all invocables; comet carries no separate "skill" type because
+  no CLI exposes one on its wire (Claude's `initialize` lists them together, ACP's
+  `availableCommands` likewise). Skills are the invocables whose backing is a `SKILL.md`; the
+  harness knows that, comet does not need to.
+- **Catalog** — the ordered invocable list for one `(device, HarnessId)`. Never merged across
+  harnesses.
+- **Invocation** — the prompt text `/name` or `/name args` as the user sends it. It is what
+  persists in the session doc as the user message (the CLIs' own transcripts show the same).
+- **Translation** — the adapter-side mapping from an invocation to that harness's native
+  wire form, applied at run time inside `Harness::run`.
+
+### 10.2 Surfaces
+
+| Surface | Code | Trigger | Catalog source |
+| --- | --- | --- | --- |
+| Desktop composer (gpui) | `crates/ui/src/composer.rs` (`SlashState`, `slash_cache`) | `/` as the first character of the prompt (`slash_token`) | `ListCommands {harness, cwd}` targeted at the chat's (or picked space's) host device; cached per `(device, harness, cwd)` for the composer's life |
+| Phone composer (SwiftUI) | `apps/ios/Comet/Composer/SlashCommands.swift` (logic) + `ComposerView.swift` (view) | same rule, same token grammar | same RPC over the device-room relay (`WorkspaceStore.listCommands`, the `listModels` pattern); cached per `(deviceId, harness, cwd)` |
+
+Both surfaces behave identically: the popup lists the catalog filtered by the typed prefix
+(name match, plus aliases where the harness advertises them), each row shows description and
+argument hint, accept replaces the token with `/name ` and leaves the cursor for arguments,
+Escape dismisses for that token only, and the prompt is sent as plain text through the durable
+command queue (`QueueCommand{run|steer}`) — no new RPC, no new doc field. `comet headless`
+has no composer and therefore no surface here; the binary's subcommands never send prompts.
+
+The popup is a completion aid, not a gate: a user may type `/name args` in full and send. The
+harness decides what an unknown `/foo` means, exactly as its CLI would.
+
+### 10.3 Harness registry — which catalog
+
+The active harness is an *input* to this layer, never derived by it: `ChatConfig.harness`
+for an existing chat, `ResolvedRunConfig.harness` on the new-chat canvas (desktop), and
+`chat.config.harness` (phone). Models are catalogued per harness (`ListModels {harness}`,
+`HarnessCatalog` on the phone), so picking a model family picks its harness — Claude models
+run on Claude Code, GPT models on Codex, Grok on Grok Build, and so on. The skill layer asks
+"which `HarnessId`?" and nothing else; it never falls back to a default harness's catalog
+when the resolved harness is unknown (the popup stays empty until resolution).
+
+The engine's `HarnessRegistry` maps `HarnessId → Arc<dyn Harness>`. `ListCommands {harness}`
+resolves exactly that one slot and calls its `commands()`. No other harness is instantiated,
+probed, or consulted for the request.
+
+### 10.4 Discovery — the CLI is the authority
+
+`Harness::commands()` is the single discovery seam. Every adapter answers it from the
+agent's **own wire**, so the agent process applies its documented discovery paths,
+precedence, enablement, and user-invocable filtering — comet inherits them instead of
+re-implementing them (and cannot drift from them across CLI versions). A filesystem scan of
+`SKILL.md` trees is permitted only for a harness whose wire exposes no listing at all, lives
+inside that adapter, and must follow that harness's documented paths and precedence order.
+
+| Harness | Wire | Discovery call | Skills appear as | Enablement / filtering |
+| --- | --- | --- | --- | --- |
+| Claude Code | stream-json control channel | `initialize` control request → `response.commands[]` (`name`, `description`, `argumentHint`, `aliases`) | `name` (user/project skills), `plugin:name` (plugin skills, bare name in `aliases`); indistinguishable from custom commands and built-ins on the wire | The CLI omits `user-invocable: false` skills and disabled plugins; `disable-model-invocation: true` skills are listed (explicit invocation is their point). cwd-dependent: the probe's directory decides which project skills appear |
+| Codex | app-server JSON-RPC | `skills/list` → `data[].skills[]` (`name`, `description`, `path`, `scope`, `enabled`, `pluginId`, optional `interface.{displayName, shortDescription, …}`) | `name`; repo-scoped copies listed first, so dedupe-by-name keeps the one Codex would run | `skills/list` returns disabled skills flagged `enabled: false` (`[[skills.config]]` opt-out in `config.toml`); the adapter drops them. `policy.allow_implicit_invocation` affects model activation only, not listing |
+| OpenCode | HTTP | `GET /command` | `name`, tagged `source: "skill"` beside `command` and `mcp` entries — skills are explicitly invocable in OpenCode | Server-side; comet applies no `source` filter |
+| Grok, Hermes, Pi (ACP) | ACP v1 | `session/new` → `session/update: available_commands_update`; the `initialize` `_meta` scan is only a fallback for an agent that refuses sessions before login (Grok's handshake list is a partial, skill-free 7 entries) | Grok: bare `name`, qualified (`user:goal`, `vercel:workflow`) only where names collide, `_meta` carrying scope/path/pluginName; Pi: `skill:name`; Hermes: none — its ACP adapter advertises nine built-ins only | Agent-side (Pi drops `skill:` under `enableSkillCommands: false` and hides `source: "extension"`; Hermes reaches its skills through the model's skills tool, never as invocables). Grok's catalog is cwd-dependent |
+| Cursor | `@cursor/sdk` shim | No wire listing (1.0.28 exposes no skills API or skill input; `cursor-agent`'s own listing needs `cursor-agent login`, separate from the SDK's credentials) → adapter-local `SKILL.md` scan under this section's exception, over Cursor's documented roots: built-in `~/.cursor/skills-cursor`, then project, then user `.agents/skills` + `.cursor/skills` (+ `.claude`/`.codex` compat), later root winning a shared name | the `SKILL.md`'s directory name — what Cursor's own palette submits | `metadata.surfaces` without `cli` dropped; Codex's built-in skill names dropped; `disable-model-invocation` skills kept (user-invocable only). Custom commands are not offered: the CLI expands their body client-side |
+| Mock | — | Tests register their own `Harness` impls with fixed catalogs | — | — |
+
+Discovery is a short-lived probe (no model turn, no API cost), cached per harness instance,
+and never blocks a run. A failing probe surfaces as the popup's error row; it never falls
+back to another harness's list or to a comet-side scan.
+
+**Discovery is cwd-scoped.** Every CLI that lists invocables resolves project-level skills
+relative to a directory (Claude Code `.claude/skills` and `.claude/commands`, Codex
+`.agents/skills` and `.codex/skills`, OpenCode `.opencode/skill`, Grok `.agents/skills` and
+`.cursor/skills`, Cursor's project roots). The catalog therefore carries the directory the
+run would execute in: `ListCommands {harness, cwd?}` → `Harness::commands(cwd: Option<&Path>)`.
+`cwd` is the chat's `cwd` for an existing chat and the picked space's path on the new-chat
+canvas; `None` (an old caller) probes the way the CLI would when started from the engine's
+own directory. Adapters run their probe in `cwd` (child process directory, `skills/list
+{cwds}`, `GET /command?directory=`, `session/new {cwd}`, the scan's project root) and cache
+per `cwd`. Both composers key their cache by `(device, harness, cwd)`.
+
+### 10.5 Slash routing — translation lives in the adapter
+
+The composer sends `/name args` as text. Each adapter's `run()` (and steer path) translates
+a leading invocation into the form its CLI would send for the same user action:
+
+| Harness | Native user action | Comet translation |
+| --- | --- | --- |
+| Claude Code | `/name args` typed in the TUI; the CLI expands skills/commands from prompt text (documented for `-p` too: "include `/skill-name` in the prompt string and Claude Code expands it before running") | Pass through unchanged as the user message, on the first prompt and on every steer |
+| Codex | `$name args` typed in the TUI → `input` = a text item (mention left inline) FOLLOWED BY a `skill` item (`name`, `path`) | `/name` matching a listed, enabled skill → text item `$name args` then `{"type":"skill", name, path}` in that order, on `turn/start` and `turn/steer`; otherwise plain text. The skill list comes from `skills/list` on the live session (its cwd is the run's cwd) |
+| OpenCode | `/name args` in the TUI → `POST /session/{id}/command`; the endpoint resolves commands and skills alike | Known `/name` (via `known_invocation`) → command endpoint with the catalog's own name + trimmed `arguments`; anything else → `prompt_async` |
+| ACP agents | `/name args` as `session/prompt` text — ACP defines no command RPC, and each agent parses the leading `/` itself (Grok natively; pi-acp intercepts its built-ins and forwards the rest, `skill:name` included, to pi; Hermes runs its nine built-ins and sends anything else to the model) | Pass through unchanged, prompt and steer paths alike |
+| Cursor | `/name args` typed in the CLI: its palette submits the invocation as plain user text, and its ACP server forwards an unmatched `/name` untouched | Pass through unchanged as the user message |
+
+The invocation grammar is shared: `comet_harness::commands::split_invocation(prompt) ->
+Option<(name, args)>` (leading `/`, name to the first whitespace, rest trimmed). Adapters use
+it and match the name against **their own** catalog; a `/name` unknown to the catalog is left
+as text so the CLI can react as it would natively. Activation semantics are the harness's:
+comet never injects `SKILL.md` content, never pre-expands a command, and never marks a skill
+as model-invocable or not.
+
+### 10.6 Isolation
+
+- One catalog per `(device, HarnessId, cwd)`: the adapter cache is per harness instance on
+  that device, per cwd; the engine's `ListCommands` touches one registry slot on the
+  targeted device; both composers key their cache by `(device, harness, cwd)`.
+- Switching device swaps the list the same way switching harness does: a request goes to
+  the new device, and the previous device's entries are never shown, even while it loads.
+- Switching the harness in the composer swaps the list; the previous harness's entries are
+  never shown under the new one, even while the new catalog loads.
+- The mock harness is the only harness allowed to carry an injected catalog, and only in
+  tests.
+- No shared skill root: a skill installed for Codex (`~/.codex/skills`) is not offered on
+  Claude Code unless Claude Code's own CLI reports it, and vice versa. Cross-agent roots such
+  as `~/.agents/skills` are visible only through the CLIs that read them.
+
+### 10.7 Verification — the loop every workstream runs
+
+`scripts/verify-skills.sh` is the gate; `scripts/verify-skills.sh --live` adds the ignored
+real-CLI tests for whichever agents are installed on the machine. It proves:
+
+1. **Correct catalog per harness** — fixture CLIs (`crates/harness/tests/fixtures/fake-*.sh`)
+   answer discovery with harness-shaped payloads including skills; tests assert names, hints,
+   dedupe, and enablement filtering per adapter.
+2. **No cross-harness leakage** — an engine test registers two harnesses with disjoint
+   catalogs and asserts `ListCommands` returns exactly the resolved harness's list; a composer
+   test asserts a harness switch never renders the previous list; adapter tests assert an
+   unknown `/name` is not translated.
+3. **Slash parity** — per adapter, the fixture CLI records the wire frame produced for
+   `/name args` and the test asserts it matches the native shape (Claude: unchanged text;
+   Codex: skill input item + text; OpenCode: command endpoint; ACP: unchanged text).
+4. **Architecture and code quality** — `cargo fmt --check`, clippy with no new diagnostics on
+   lines added relative to `main` (`scripts/clippy-new-warnings.py`), and a guard that fails when a `HarnessId` variant is matched inside the
+   slash paths of `crates/ui`, `crates/engine/src/rpc.rs`, or the phone composer, or when
+   `SKILL.md` is parsed outside `crates/harness` — the "adapters only, no feature forks" rule
+   as an executable check.
+
+Rule: no feature lands without a test in this loop that failed before the change and passes
+after it. Live tests are additive evidence, never the only evidence.
+
+### 10.8 Workstreams (parallel, isolated)
+
+Each workstream owns one adapter or surface, touches nothing outside it except its fixture
+and its rows in the tables above, and ships through §10.7:
+
+- **Codex** — `enabled` filtering; native skill input item on invocation; fixture + tests.
+- **Cursor** — determine the SDK's listing/invocation surface for skills; implement discovery
+  and translation per finding, or record implicit-only parity (empty catalog) with evidence.
+- **ACP (Grok, Hermes, Pi)** — live-verify skills in `availableCommands`, hint fields, and
+  invocation forms; extend `parse_commands` and fixtures where the agents differ.
+- **Claude Code + OpenCode** — verify skills in the handshake list and passthrough; add
+  fixture skills and parity tests; aliases if the CLI's own popup matches on them.
+- **Phone composer** — the `/` popup over relayed `ListCommands`.

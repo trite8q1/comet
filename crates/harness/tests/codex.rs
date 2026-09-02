@@ -780,7 +780,7 @@ async fn live_real_app_server_single_turn() {
 #[tokio::test]
 async fn commands_come_from_skills_list() {
     let h = harness();
-    let commands = h.commands().await.expect("discovery succeeds");
+    let commands = h.commands(None).await.expect("discovery succeeds");
     assert_eq!(
         commands.len(),
         2,
@@ -796,15 +796,220 @@ async fn commands_come_from_skills_list() {
         commands[1].description, "No interface block",
         "top-level description is the fallback"
     );
-    assert_eq!(h.commands().await.expect("cache hit"), commands);
+    assert_eq!(h.commands(None).await.expect("cache hit"), commands);
+}
+
+/// §10.4: the catalog is cwd-scoped, so the probe asks `skills/list` about the
+/// directory the run would use — `{"cwds": [cwd]}` — and the repo-scoped group
+/// codex answers with leads the list, ahead of the user-scoped copies.
+#[tokio::test]
+async fn commands_probe_scopes_skills_list_to_the_requested_cwd() {
+    let h = harness();
+    let project = h
+        .commands(Some(std::path::Path::new("/w/project")))
+        .await
+        .expect("discovery succeeds");
+    assert_eq!(project[0].name, "project-skill");
+    assert_eq!(
+        project[0].description, "/w/project",
+        "the probe named the requested cwd in `cwds`: {project:?}"
+    );
+    // Same instance, another directory: its own catalog, not the cached one.
+    let other = h
+        .commands(Some(std::path::Path::new("/w/other")))
+        .await
+        .expect("discovery succeeds");
+    assert_eq!(other[0].description, "/w/other");
+    // And without a cwd the request carries no `cwds` at all, so codex answers
+    // with the groups it lists on its own.
+    let none = h.commands(None).await.expect("discovery succeeds");
+    assert!(none.iter().all(|c| c.name != "project-skill"), "{none:?}");
+}
+
+/// `enabled: false` is a `[[skills.config]]` opt-out in `config.toml`; codex's
+/// own pickers do not offer those, so neither does the catalog.
+#[tokio::test]
+async fn disabled_skills_never_reach_the_commands_catalog() {
+    let commands = harness().commands(None).await.expect("discovery succeeds");
+    assert!(
+        !commands.iter().any(|c| c.name == "switched-off"),
+        "a skill the wire reports as enabled:false must not be offered: {commands:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slash parity (ARCHITECTURE.md §10.5)
+// ---------------------------------------------------------------------------
+
+/// Runs `prompt` (and optionally one steer) against the fake app server in a
+/// fresh cwd carrying the `comet-turns.jsonl` sentinel, and returns the turn
+/// frames the fixture recorded there.
+async fn recorded_turn_frames(prompt: &str, steer: Option<&str>) -> Vec<serde_json::Value> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("comet-turns.jsonl");
+    std::fs::write(&log, "").expect("recording sentinel");
+    let (controls, steer_tx, _token) = controls("Yes");
+    if let Some(text) = steer {
+        steer_tx
+            .send(SteerMessage {
+                prompt: text.into(),
+                message_id: None,
+            })
+            .await
+            .expect("steer queued");
+    }
+    let mut req = request(prompt);
+    req.cwd = dir.path().to_string_lossy().into_owned();
+    run_to_end(&harness(), req, controls).await;
+    std::fs::read_to_string(&log)
+        .expect("recorded turns")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("turn frame is json"))
+        .collect()
+}
+
+/// The codex TUI submits the typed text first and appends a `skill` item for
+/// every skill the text mentions with `$name`; `/name args` must produce that
+/// exact frame.
+#[tokio::test]
+async fn slash_invocation_parity_sends_the_native_skill_input_item() {
+    let frames = recorded_turn_frames("/imagegen scenario:parity a cat", None).await;
+    let frame = frames.first().expect("a turn was recorded");
+    assert_eq!(frame["method"], "turn/start");
+    assert_eq!(
+        frame["params"]["input"],
+        serde_json::json!([
+            { "type": "text", "text": "$imagegen scenario:parity a cat" },
+            { "type": "skill", "name": "imagegen", "path": "/w/.agents/skills/imagegen/SKILL.md" },
+        ])
+    );
+}
+
+/// A `/name` the session's own catalog does not list is sent verbatim, so the
+/// CLI reacts exactly as it would natively.
+#[tokio::test]
+async fn unknown_slash_invocation_stays_plain_text() {
+    let frames = recorded_turn_frames("/nope scenario:parity hi", None).await;
+    let frame = frames.first().expect("a turn was recorded");
+    assert_eq!(
+        frame["params"]["input"],
+        serde_json::json!([{ "type": "text", "text": "/nope scenario:parity hi" }])
+    );
+}
+
+/// A disabled skill is not in the catalog, so its name is not translated
+/// either — the enablement filter gates invocation, not just the picker.
+#[tokio::test]
+async fn disabled_skill_slash_invocation_stays_plain_text() {
+    let frames = recorded_turn_frames("/switched-off scenario:parity go", None).await;
+    let frame = frames.first().expect("a turn was recorded");
+    assert_eq!(
+        frame["params"]["input"],
+        serde_json::json!([{ "type": "text", "text": "/switched-off scenario:parity go" }])
+    );
+}
+
+/// The steer path translates too: `turn/steer` carries the same native frame.
+#[tokio::test]
+async fn steered_slash_invocation_parity_sends_the_native_skill_item() {
+    let frames = recorded_turn_frames("scenario:parity-steer", Some("/imagegen a cat")).await;
+    let steer = frames.get(1).expect("a steer was recorded");
+    assert_eq!(steer["method"], "turn/steer");
+    assert_eq!(steer["params"]["expectedTurnId"], "t-1");
+    assert_eq!(
+        steer["params"]["input"],
+        serde_json::json!([
+            { "type": "text", "text": "$imagegen a cat" },
+            { "type": "skill", "name": "imagegen", "path": "/w/.agents/skills/imagegen/SKILL.md" },
+        ])
+    );
 }
 
 /// Live smoke against the real CLI: `cargo test -p comet-harness --test
-/// codex -- --ignored live_commands`.
+/// codex -- --ignored live_commands`. Every skill turned off with
+/// `[[skills.config]] enabled = false` in `~/.codex/config.toml` must be
+/// absent — `skills/list` still reports those, flagged `enabled: false`.
 #[tokio::test]
 #[ignore]
 async fn live_commands_discovery() {
     let h = CodexHarness::new();
-    let commands = h.commands().await.expect("live discovery");
-    eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
+    let commands = h.commands(None).await.expect("live discovery");
+    let disabled = disabled_skill_names();
+    eprintln!(
+        "{} commands, {} disabled in config.toml, first: {:?}",
+        commands.len(),
+        disabled.len(),
+        commands.first()
+    );
+    for name in disabled {
+        assert!(
+            !commands.iter().any(|c| c.name == name),
+            "disabled skill {name:?} leaked into the catalog"
+        );
+    }
+
+    // §10.4 evidence that the catalog is cwd-scoped and codex, not comet,
+    // resolves it: a skill dropped into the probe directory's `.agents/skills`
+    // is offered only for the probe that names that directory in `cwds`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let skill = dir
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("comet-live-probe");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: comet-live-probe\ndescription: comet live codex discovery probe.\n---\n\nProbe body.\n",
+    )
+    .expect("SKILL.md");
+    let scoped = h
+        .commands(Some(dir.path()))
+        .await
+        .expect("cwd-scoped live discovery");
+    assert!(
+        scoped.iter().any(|c| c.name == "comet-live-probe"),
+        "the project skill under the probe cwd is missing: {:?}",
+        scoped.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    assert!(
+        commands.iter().all(|c| c.name != "comet-live-probe"),
+        "the cwd-less catalog must not carry a project skill"
+    );
+}
+
+/// Names from `[[skills.config]]` blocks with `enabled = false` in the user's
+/// `~/.codex/config.toml` (a flat two-key block; no toml dependency needed).
+fn disabled_skill_names() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let Ok(config) = std::fs::read_to_string(PathBuf::from(home).join(".codex/config.toml")) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut in_block = false;
+    let mut disabled = false;
+    let mut name: Option<String> = None;
+    for line in config.lines().chain(std::iter::once("[end]")) {
+        let line = line.trim();
+        if line.starts_with('[') {
+            if in_block
+                && disabled
+                && let Some(name) = name.take()
+            {
+                names.push(name);
+            }
+            in_block = line == "[[skills.config]]";
+            disabled = false;
+            name = None;
+        } else if in_block {
+            if line == "enabled = false" {
+                disabled = true;
+            } else if let Some(value) = line.strip_prefix("name = ") {
+                name = Some(value.trim_matches('"').to_owned());
+            }
+        }
+    }
+    names
 }

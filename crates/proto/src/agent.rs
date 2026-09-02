@@ -273,8 +273,9 @@ pub struct TodoItem {
     pub done: bool,
 }
 
-/// A slash command advertised by the agent (ACP `availableCommands`): typed as
-/// `/name` at the start of the composer, sent to the agent as prompt text.
+/// One invocable the agent advertises — a built-in command, a custom command,
+/// or an Agent Skill (ARCHITECTURE.md §10.1): typed as `/name` at the start
+/// of the composer, sent to the agent as prompt text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlashCommand {
@@ -284,6 +285,17 @@ pub struct SlashCommand {
     /// Placeholder hint for the command's argument, when it takes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
+    /// Alternative names the agent's own popup also matches (claude
+    /// `aliases`). Additive + serde-defaulted for wire compat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+impl SlashCommand {
+    /// Whether `name` invokes this command — its name or one of its aliases.
+    pub fn matches(&self, name: &str) -> bool {
+        self.name == name || self.aliases.iter().any(|a| a == name)
+    }
 }
 
 /// A file modification carried inline on a tool result (ACP

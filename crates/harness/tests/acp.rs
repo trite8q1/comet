@@ -801,3 +801,242 @@ async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() 
     // the parent's own turn settled cleanly with its single untagged Done.
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
+
+// ---------------------------------------------------------------------------
+// Agent Skills as slash commands (ARCHITECTURE.md §10) — ACP agents.
+//
+// Grok, Hermes and pi-acp all advertise their invocables the same way: never
+// in the handshake, always through `session/update: available_commands_update`
+// after `session/new`. The shapes the fixture replays were captured live from
+// grok 1.0.13, Hermes Agent 0.13.0, and pi-acp 0.0.33 driving pi 0.84.3.
+// ---------------------------------------------------------------------------
+
+/// `commands()` reads the agents' real `availableCommands` shapes: grok's
+/// `_meta`-tagged skills with `input: null`, pi's `skill:<name>` entries with
+/// no `input` key at all, and hermes' description-first built-ins.
+///
+/// Also the precedence: grok's handshake `_meta` carries a partial catalog
+/// with no skills in it, so the session channel's list has to win.
+#[tokio::test]
+async fn discovery_lists_the_agents_real_skill_commands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Puts the fixture in "real agent" mode: a partial handshake catalog, the
+    // complete one on the session channel.
+    std::fs::write(dir.path().join("comet-skill-probe"), "").expect("marker");
+
+    let commands = harness()
+        .commands(Some(dir.path()))
+        .await
+        .expect("discovery");
+    let named = |n: &str| {
+        commands
+            .iter()
+            .find(|c| c.name == n)
+            .unwrap_or_else(|| panic!("{n} missing from {commands:#?}"))
+    };
+
+    // grok: a workflow carrying an argument hint, a bare-named user skill
+    // (`input: null`), and the qualified names grok itself minted for the
+    // names that collide with a built-in or another scope.
+    assert_eq!(
+        named("deep-research").input_hint.as_deref(),
+        Some("<query>")
+    );
+    assert_eq!(named("automate").input_hint, None);
+    assert_eq!(
+        named("user:goal").description,
+        "Set a goal that Cursor will pursue to completion."
+    );
+    named("vercel:workflow");
+    // pi advertises every skill as `skill:<name>`, with no `input` member.
+    assert_eq!(named("skill:rename-chat").input_hint, None);
+    // hermes serializes description-first and hints its argument-takers.
+    assert_eq!(
+        named("model").input_hint.as_deref(),
+        Some("model name to switch to")
+    );
+    named("help");
+
+    // Comet adds nothing: no aliasing, no re-qualification, no filtering —
+    // the catalog is the agent's list, in the agent's order (§10.4).
+    assert_eq!(commands.len(), 9, "{commands:#?}");
+    assert_eq!(commands[0].name, "compact");
+    assert!(commands.iter().all(|c| c.aliases.is_empty()));
+    // The session catalog REPLACES the handshake's partial one — a name only
+    // the handshake advertised must not linger beside the real list.
+    assert!(
+        commands.iter().all(|c| c.name != "session-info"),
+        "the partial handshake catalog leaked into the result: {commands:#?}"
+    );
+
+    // The probe stood in the project, not in $HOME: grok's catalog is
+    // cwd-scoped (a project's `.agents/skills` joins the user-level ones).
+    let seen = std::fs::read_to_string(dir.path().join("probe-cwd.txt")).expect("probe cwd");
+    assert_eq!(seen, dir.path().display().to_string());
+}
+
+/// The other side of that precedence: an agent that refuses to advertise on
+/// the session channel (no provider, not logged in) still surfaces whatever
+/// its handshake carried, rather than an empty popup.
+#[tokio::test]
+async fn discovery_keeps_the_handshake_skill_commands_when_the_session_advertises_none() {
+    let commands = harness().commands(None).await.expect("discovery");
+    assert_eq!(commands.len(), 2, "{commands:#?}");
+    assert_eq!(commands[0].name, "compact");
+    assert_eq!(commands[1].name, "goal");
+    assert_eq!(commands[1].input_hint.as_deref(), Some("the goal"));
+}
+
+/// §10.5 parity: ACP has no command RPC — an invocation IS the prompt text.
+/// A `/name args` the catalog advertises must reach `session/prompt` byte for
+/// byte, for grok's bare names and for pi's `skill:` ones alike.
+#[tokio::test]
+async fn slash_invocation_parity_sends_a_known_command_as_plain_text() {
+    for prompt in ["/deep-research the acp command wire", "/skill:rename-chat"] {
+        let (controls, _steer, _token) = controls();
+        let events = run_to_end(&harness(), request(prompt), controls).await;
+        assert!(
+            events.contains(&AgentEvent::TextDelta {
+                text: format!("invocation:{prompt}")
+            }),
+            "{prompt} was rewritten on the wire: {events:?}"
+        );
+        assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    }
+}
+
+/// The other half of §10.5: a `/name` the catalog does not know is left
+/// alone too, so the agent reacts exactly as it would in its own CLI.
+#[tokio::test]
+async fn slash_invocation_parity_leaves_an_unknown_command_as_text() {
+    let (controls, _steer, _token) = controls();
+    let prompt = "/not-a-command with args";
+    let events = run_to_end(&harness(), request(prompt), controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: format!("invocation:{prompt}")
+        }),
+        "{events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live discovery against the real agents: `cargo test -p comet-harness --test
+// acp -- --ignored live_commands`. Initialize + session/new only — no prompt,
+// no model turn, no API cost.
+// ---------------------------------------------------------------------------
+
+/// Run the real probe, skipping cleanly where the agent is not installed on
+/// this machine. Any other failure is a real one.
+async fn live_catalog(
+    h: &AcpHarness,
+    cwd: Option<&std::path::Path>,
+    agent: &str,
+) -> Option<Vec<comet_proto::SlashCommand>> {
+    match h.commands(cwd).await {
+        Ok(commands) => Some(commands),
+        Err(comet_harness::HarnessError::NotInstalled(hint)) => {
+            eprintln!("skipping live {agent} discovery: not installed ({hint})");
+            None
+        }
+        // A managed npm adapter that has not been fetched yet installs in the
+        // background and errors this probe; that is a missing CLI, not a bug.
+        Err(e) if e.to_string().contains("installing in the background") => {
+            eprintln!("skipping live {agent} discovery: adapter still installing ({e})");
+            None
+        }
+        Err(e) => panic!("live {agent} discovery failed: {e}"),
+    }
+}
+
+fn report(agent: &str, commands: &[comet_proto::SlashCommand]) {
+    eprintln!(
+        "{agent}: {} commands, {} advertised as skill:<name>, first: {:?}",
+        commands.len(),
+        commands
+            .iter()
+            .filter(|c| c.name.starts_with("skill:"))
+            .count(),
+        commands.first(),
+    );
+}
+
+/// §10.4 evidence for grok: the catalog is the CLI's and it is cwd-scoped —
+/// a skill dropped into the probe directory's `.agents/skills` shows up
+/// beside the built-ins, because grok read it, not because comet did.
+#[tokio::test]
+#[ignore]
+async fn live_commands_grok() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let skill = dir
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("comet-live-probe");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: comet-live-probe\ndescription: comet live ACP discovery probe.\n---\n\nProbe body.\n",
+    )
+    .expect("SKILL.md");
+
+    let h = AcpHarness::grok();
+    let Some(commands) = live_catalog(&h, Some(dir.path()), "grok").await else {
+        return;
+    };
+    assert!(
+        commands.iter().any(|c| c.name == "compact"),
+        "grok ships /compact: {commands:#?}"
+    );
+    assert!(
+        commands.iter().any(|c| c.name == "comet-live-probe"),
+        "the project skill under the probe cwd is missing: {:?}",
+        commands.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    report("grok", &commands);
+}
+
+/// §10.4 evidence for Hermes: its ACP adapter advertises a fixed built-in
+/// list and no skills at all — `~/.hermes/skills` reaches the model through
+/// the skills tool, never as an invocable. Comet must not invent them.
+#[tokio::test]
+#[ignore]
+async fn live_commands_hermes() {
+    let h = AcpHarness::hermes();
+    let Some(commands) = live_catalog(&h, None, "hermes").await else {
+        return;
+    };
+    if commands.is_empty() {
+        eprintln!(
+            "hermes advertised nothing: its ACP adapter refuses session/new \
+             until a provider is configured (`hermes model`)"
+        );
+        return;
+    }
+    assert!(
+        commands.iter().any(|c| c.name == "help"),
+        "hermes advertises /help: {commands:#?}"
+    );
+    assert!(
+        commands.iter().all(|c| !c.name.starts_with("skill:")),
+        "hermes' ACP surface exposes no skills: {commands:#?}"
+    );
+    report("hermes", &commands);
+}
+
+/// §10.4 evidence for pi: pi-acp advertises pi's own `get_commands` list,
+/// where every skill is prefixed `skill:` and extension-sourced commands are
+/// already filtered out agent-side.
+#[tokio::test]
+#[ignore]
+async fn live_commands_pi() {
+    let h = AcpHarness::pi();
+    let Some(commands) = live_catalog(&h, None, "pi").await else {
+        return;
+    };
+    assert!(
+        commands.iter().any(|c| c.name == "compact"),
+        "pi-acp ships /compact: {commands:#?}"
+    );
+    report("pi", &commands);
+}

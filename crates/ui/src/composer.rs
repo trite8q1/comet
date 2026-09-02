@@ -3297,8 +3297,60 @@ fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
-/// Slash-command completion state: like [`FileMentionState`] but the
-/// candidate list is fetched once per harness (`ListCommands`) and filtered
+/// Filter-rank a command catalog for the popup query, like
+/// [`crate::popover::filter_indices`] but matching each entry's aliases as
+/// well as its name — the agents' own popups do (`/review` finds
+/// `code-review`, `/deploy` finds `vercel:deploy`). The best rank across a
+/// command's names wins; ties keep catalog order.
+fn filter_commands(query: &str, commands: &[SlashCommand]) -> Vec<usize> {
+    let mut ranked: Vec<(usize, usize)> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, command)| {
+            std::iter::once(&command.name)
+                .chain(&command.aliases)
+                .filter_map(|label| crate::popover::match_rank(query, label))
+                .min()
+                .map(|rank| (rank, ix))
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, ix)| (rank, ix));
+    ranked.into_iter().map(|(_, ix)| ix).collect()
+}
+
+/// One catalog per `(harness, cwd)` — §10.4/§10.6. Discovery is cwd-scoped:
+/// every CLI resolves project-level skills relative to a directory, so the
+/// same harness in two folders is two catalogs, and a folder switch swaps the
+/// list exactly like a harness switch does.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SlashKey {
+    /// The device that owns the agent binary — the chat's host for an
+    /// existing chat, the picked space's device on the new-chat canvas.
+    /// `None` is the local engine (no project, no chat).
+    device: Option<String>,
+    harness: HarnessId,
+    /// The chat's cwd for an existing chat, the picked space's path on the
+    /// new-chat canvas; `None` probes from the engine's own directory.
+    cwd: Option<String>,
+}
+
+/// `ListCommands` params for one key: `cwd` rides only when the surface has
+/// one (§10.4 — an omitted `cwd` is the old caller's engine-directory probe),
+/// `targetDeviceId` only when the key names a device.
+fn list_commands_params(key: &SlashKey) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    params.insert("harness".into(), serde_json::json!(key.harness));
+    if let Some(cwd) = &key.cwd {
+        params.insert("cwd".into(), cwd.clone().into());
+    }
+    if let Some(target) = &key.device {
+        params.insert("targetDeviceId".into(), target.clone().into());
+    }
+    serde_json::Value::Object(params)
+}
+
+/// Slash-command completion state: like [`FileMentionState`] but the candidate
+/// list is fetched once per `(device, harness, cwd)` (`ListCommands`) and filtered
 /// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
@@ -3306,8 +3358,8 @@ struct SlashState {
     /// Indices into the cached command list, filter-ranked for the query.
     filtered: Vec<usize>,
     active: Option<usize>,
-    /// Harness the popup is showing commands for (cache key).
-    harness: Option<HarnessId>,
+    /// Catalog the popup is showing commands for (cache key).
+    key: Option<SlashKey>,
     request: u64,
     loading: bool,
     error: Option<SharedString>,
@@ -3388,9 +3440,9 @@ pub struct Composer {
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
     slash: SlashState,
-    /// Advertised commands per harness (one `ListCommands` per harness per
-    /// composer lifetime; the engine caches discovery on its side too).
-    slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
+    /// Advertised commands per `(harness, cwd)` (one `ListCommands` per key
+    /// per composer lifetime; the engine caches discovery on its side too).
+    slash_cache: HashMap<SlashKey, Vec<SlashCommand>>,
     /// Slash-popup row scroll — the stack overflows into a wheel/keyboard-
     /// scrollable list once it outgrows the card.
     slash_scroll: gpui::ScrollHandle,
@@ -4178,8 +4230,28 @@ impl Composer {
 
     // ---- slash commands ---------------------------------------------------
 
+    /// The catalog the composer is asking for right now: the resolved harness
+    /// plus the directory a run would execute in — the chat's cwd for an
+    /// existing chat, the picked space's path on the new-chat canvas (§10.4).
+    fn slash_key(&self, cx: &App) -> Option<SlashKey> {
+        let harness = self.pickers.read(cx).resolved(cx).harness?;
+        let state = self.state.read(cx);
+        let (device, cwd) = match state.selected_chat_row() {
+            Some(chat) => (Some(chat.device_id.clone()), chat.cwd.clone()),
+            None => match state.selected_space_row() {
+                Some(space) => (Some(space.device_id.clone()), Some(space.path.clone())),
+                None => (None, None),
+            },
+        };
+        Some(SlashKey {
+            device,
+            harness,
+            cwd,
+        })
+    }
+
     /// Track the `/` token on every edit: open/refresh the popup, fetch the
-    /// harness's command list on first open, filter locally per keystroke.
+    /// key's command list on first open, filter locally per keystroke.
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
         let token = slash_token(text, cursor);
         let still_dismissed = token.as_ref().is_some_and(|token| {
@@ -4193,14 +4265,14 @@ impl Composer {
             return;
         }
         self.slash.dismissed = None;
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let harness_changed = self.slash.harness != harness;
-        if token == self.slash.token && !harness_changed {
+        let key = self.slash_key(cx);
+        let key_changed = self.slash.key != key;
+        if token == self.slash.token && !key_changed {
             self.refilter_slash(cx);
             return;
         }
         self.slash.token = token.clone();
-        self.slash.harness = harness;
+        self.slash.key = key.clone();
         self.slash.error = None;
         if token.is_none() {
             self.slash.active = None;
@@ -4208,18 +4280,18 @@ impl Composer {
             return;
         }
         // No resolved harness (catalog still loading): empty popup, no fetch.
-        let Some(harness) = harness else {
+        let Some(key) = key else {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&harness) {
+        if self.slash_cache.contains_key(&key) {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         }
-        // First open for this harness: one ListCommands, targeted like file
-        // search (the chat/space host device owns the agent binary).
+        // First open for this (device, harness, cwd): one ListCommands,
+        // targeted like file search (the key's device owns the agent binary).
         self.slash.request = self.slash.request.wrapping_add(1);
         self.slash.loading = true;
         self.refilter_slash(cx);
@@ -4227,19 +4299,9 @@ impl Composer {
             self.slash.loading = false;
             return;
         };
-        let target = {
-            let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .map(|chat| chat.device_id.clone())
-                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
-        };
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
-                object.insert("targetDeviceId".into(), target.clone().into());
-            }
+            let params = list_commands_params(&key);
             let result = engine.client().call(methods::LIST_COMMANDS, params).await;
             this.update(cx, |composer, cx| {
                 if composer.slash.request != request {
@@ -4249,7 +4311,7 @@ impl Composer {
                 match result {
                     Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
                         Ok(commands) => {
-                            composer.slash_cache.insert(harness, commands);
+                            composer.slash_cache.insert(key, commands);
                         }
                         Err(err) => tracing::warn!(%err, "slash command decode failed"),
                     },
@@ -4275,12 +4337,12 @@ impl Composer {
             .unwrap_or_default();
         let commands = self
             .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .key
+            .as_ref()
+            .and_then(|key| self.slash_cache.get(key))
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-        self.slash.filtered = crate::popover::filter_indices(&query, &names);
+        self.slash.filtered = filter_commands(&query, commands);
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
         // A fresh query/reopen restarts the row stack at the top.
         reset_scroll_offset(&self.slash_scroll);
@@ -4321,8 +4383,9 @@ impl Composer {
             .and_then(|active| self.slash.filtered.get(active))
             .and_then(|&ix| {
                 self.slash
-                    .harness
-                    .and_then(|h| self.slash_cache.get(&h))
+                    .key
+                    .as_ref()
+                    .and_then(|key| self.slash_cache.get(key))
                     .and_then(|c| c.get(ix))
             })
             .cloned()
@@ -4343,7 +4406,7 @@ impl Composer {
         self.slash = SlashState {
             request,
             dismissed,
-            harness: self.slash.harness,
+            key: self.slash.key.clone(),
             ..SlashState::default()
         };
         self.sync_mention_controls(cx);
@@ -4358,8 +4421,9 @@ impl Composer {
         self.slash.token.as_ref()?;
         let commands = self
             .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .key
+            .as_ref()
+            .and_then(|key| self.slash_cache.get(key))
             .map(Vec::as_slice)
             .unwrap_or_default();
         // Full pill width at the mention card's height budget — both composer
@@ -6487,6 +6551,82 @@ mod tests {
         // Bare "/" with cursor at 0 → closed; cursor after it → open-all.
         assert!(slash_token("/", 0).is_none());
         assert_eq!(slash_token("/", 1).map(|t| t.query), Some(String::new()));
+    }
+
+    #[test]
+    fn slash_filter_ranks_names_and_aliases() {
+        fn command(name: &str, aliases: &[&str]) -> SlashCommand {
+            SlashCommand {
+                name: name.into(),
+                description: String::new(),
+                input_hint: None,
+                aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+            }
+        }
+        let commands = [
+            command("predeploy-check", &[]),
+            command("vercel:deploy", &["deploy"]),
+            command("clear", &["reset", "new"]),
+        ];
+
+        // An alias the name doesn't contain still finds the command.
+        assert_eq!(filter_commands("reset", &commands), vec![2]);
+        // The alias's prefix rank beats a substring hit on another name, so
+        // `/deploy` offers the command that alias actually invokes first.
+        assert_eq!(filter_commands("deploy", &commands), vec![1, 0]);
+        // Namespaced names still match on their own.
+        assert_eq!(filter_commands("vercel:", &commands), vec![1]);
+        // Empty query keeps catalog order; a miss matches nothing.
+        assert_eq!(filter_commands("", &commands), vec![0, 1, 2]);
+        assert!(filter_commands("zzz", &commands).is_empty());
+    }
+
+    /// Discovery is cwd-scoped (§10.4): the same harness in two folders is two
+    /// catalogs, so a space switch on the new-chat canvas must miss the cache
+    /// and re-probe instead of re-showing the previous folder's entries.
+    #[test]
+    fn slash_catalog_keys_by_device_harness_and_cwd() {
+        // Off the wire, so the slash path still names no harness variant.
+        let harness: HarnessId = serde_json::from_value(serde_json::json!("mock")).unwrap();
+        let key = |device: Option<&str>, cwd: Option<&str>| SlashKey {
+            device: device.map(str::to_string),
+            harness,
+            cwd: cwd.map(str::to_string),
+        };
+        let repo = key(Some("dev-a"), Some("/work/repo"));
+        let other = key(Some("dev-a"), Some("/work/other"));
+        let engine_dir = key(Some("dev-a"), None);
+        // Same harness, same path, another device: another catalog — a VPS
+        // and a laptop can share `/home/me/repo` without sharing skills.
+        let same_path_other_device = key(Some("dev-b"), Some("/work/repo"));
+        let local_no_project = key(None, None);
+        assert_ne!(repo, other);
+        assert_ne!(repo, engine_dir);
+        assert_ne!(repo, same_path_other_device);
+        assert_ne!(engine_dir, local_no_project);
+
+        let mut cache: HashMap<SlashKey, Vec<SlashCommand>> = HashMap::new();
+        cache.insert(repo.clone(), Vec::new());
+        assert!(cache.contains_key(&repo));
+        assert!(!cache.contains_key(&other));
+        assert!(!cache.contains_key(&engine_dir));
+        assert!(!cache.contains_key(&same_path_other_device));
+
+        // `cwd` and `targetDeviceId` ride the request only when the key has
+        // them; an omitted `cwd` is the engine-directory probe, an omitted
+        // target is the local engine.
+        assert_eq!(
+            list_commands_params(&repo),
+            serde_json::json!({
+                "harness": "mock",
+                "cwd": "/work/repo",
+                "targetDeviceId": "dev-a",
+            })
+        );
+        assert_eq!(
+            list_commands_params(&local_no_project),
+            serde_json::json!({ "harness": "mock" })
+        );
     }
 
     #[test]

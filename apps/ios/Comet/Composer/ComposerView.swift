@@ -26,6 +26,9 @@ struct ComposerShell<Chips: View>: View {
     /// transcript's bottom inset mid-presentation (t3 derives expansion from
     /// focus OR sheet-active for exactly this reason).
     var keepExpanded = false
+    /// Caret, for the `/` popup's token grammar (composer.rs reads the same
+    /// cursor). Composers without a slash popup pass nothing.
+    var selection: Binding<TextSelection?> = .constant(nil)
     var onSend: () -> Void
     var onStop: () -> Void = {}
     /// Staged image attachments (attachment-ui.tsx AttachmentStrip inside the
@@ -130,7 +133,7 @@ struct ComposerShell<Chips: View>: View {
     }
 
     private var input: some View {
-        TextField(placeholder, text: $draft, axis: .vertical)
+        TextField(placeholder, text: $draft, selection: selection, axis: .vertical)
             .font(Theme.sans(16))
             .foregroundStyle(Theme.text)
             .tint(Theme.text)
@@ -200,6 +203,151 @@ struct ComposerShell<Chips: View>: View {
     }
 }
 
+// MARK: - Slash commands (composer.rs render_slash_popup)
+
+/// The `/` completion popup above the pill: one row per advertised command,
+/// filtered by the typed token. Keyboard-less — a tap accepts, the ✕ hides it
+/// for this token (the desktop's Escape).
+struct SlashCommandPopup: View {
+    let state: SlashPopup
+    let accept: (SlashCommand) -> Void
+    let dismiss: () -> Void
+
+    var body: some View {
+        Group {
+            if case .hidden = state {
+                EmptyView()
+            } else {
+                card
+            }
+        }
+        .motionAnimation(Motion.menuIn, value: state)
+    }
+
+    private var card: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Spacer(minLength: 0)
+                Button(action: dismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.textFaint)
+                        .frame(width: 28, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            content
+        }
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+        .padding(.horizontal, 16)
+        .transition(.opacity)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch state {
+        case .hidden:
+            EmptyView()
+        case .loading:
+            HStack(spacing: 8) {
+                MiniSpinner(cellSize: 2.5)
+                notice("Loading commands…")
+            }
+            .padding(.leading, 14)
+        case .failed(let message):
+            notice(message, tone: Theme.danger)
+        case .noCommands:
+            notice("This agent has no slash commands")
+        case .noMatches:
+            notice("No matching commands")
+        case .commands(let commands):
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(commands) { row($0) }
+                }
+            }
+            .frame(maxHeight: 220)
+            .scrollBounceBehavior(.basedOnSize)
+        }
+    }
+
+    private func row(_ command: SlashCommand) -> some View {
+        Button {
+            accept(command)
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(command.title)
+                    .font(Theme.sans(13.5, weight: .medium))
+                    .foregroundStyle(Theme.text)
+                    .fixedSize()
+                Text(command.detail)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func notice(_ text: String, tone: Color = Theme.textMuted) -> some View {
+        Text(text)
+            .font(Theme.sans(12))
+            .foregroundStyle(tone)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Caret offset in characters. The selection binding is nil until the field
+/// reports one (and can lag a programmatic draft rewrite), so the draft's end
+/// stands in — that is where the caret sits while typing.
+func slashCaret(in text: String, selection: TextSelection?) -> Int {
+    guard case .selection(let range)? = selection?.indices,
+          let caret = String.Index(range.lowerBound, within: text) else { return text.count }
+    return text.distance(from: text.startIndex, to: caret)
+}
+
+/// Both composers drive the popup the same way: re-read the token on every
+/// edit / caret move / harness or folder switch, and probe `ListCommands` the
+/// first time a (device, harness, cwd) key is asked for.
+@MainActor
+func syncSlash(_ slash: Binding<SlashCommandsModel>, text: String, selection: TextSelection?,
+               key: SlashCatalogKey?, model: AppModel) {
+    guard let fetch = slash.wrappedValue.update(
+        text: text, cursor: slashCaret(in: text, selection: selection), key: key)
+    else { return }
+    Task { @MainActor in
+        switch await model.listCommands(deviceId: fetch.deviceId, harness: fetch.harness,
+                                        cwd: fetch.cwd) {
+        case .commands(let commands): slash.wrappedValue.received(commands, for: fetch)
+        case .failure(let message): slash.wrappedValue.failed(message, for: fetch)
+        }
+    }
+}
+
+/// Accept: the token becomes `/name `, the caret lands after it so arguments
+/// follow, and the prompt still sends as plain text.
+@MainActor
+func acceptSlash(_ slash: Binding<SlashCommandsModel>, _ command: SlashCommand,
+                 text: Binding<String>, selection: Binding<TextSelection?>) {
+    guard let accepted = slash.wrappedValue.accept(command, in: text.wrappedValue) else { return }
+    text.wrappedValue = accepted.text
+    if let caret = accepted.text.index(accepted.text.startIndex, offsetBy: accepted.cursor,
+                                       limitedBy: accepted.text.endIndex) {
+        selection.wrappedValue = TextSelection(insertionPoint: caret)
+    }
+}
+
 /// The live-chat composer: input, the photo attach button, the model + trait
 /// picker chips (harness stays locked mid-chat; picks merge into the chat's
 /// config row for the next dispatch), and the morphing action button.
@@ -210,6 +358,9 @@ struct ComposerView: View {
     let runLive: Bool
 
     @State private var text = ""
+    @State private var selection: TextSelection?
+    /// `/` completion, fed by ListCommands on the chat's device (§10.2).
+    @State private var slash = SlashCommandsModel()
     @State private var attachments: [StagedAttachment] = []
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPicker = false
@@ -271,12 +422,18 @@ struct ComposerView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .transition(.opacity)
             }
+            SlashCommandPopup(
+                state: slash.popup,
+                accept: { acceptSlash($slash, $0, text: $text, selection: $selection) },
+                dismiss: { slash.dismiss(in: text) }
+            )
             ComposerShell(
                 draft: $text,
                 sendEnabled: true,
                 showStop: runLive,
                 busy: uploading,
                 keepExpanded: showModelPicker || showTraitPicker,
+                selection: $selection,
                 onSend: send,
                 onStop: { store.sendInterrupt() },
                 attachments: attachments,
@@ -335,12 +492,23 @@ struct ComposerView: View {
             guard let space = model.space(for: chat) else { return }
             catalogs[harness] = await model.listModels(space: space, harness: harness)
         }
+        .onChange(of: text) { syncSlashCommands() }
+        .onChange(of: selection) { syncSlashCommands() }
+        .onChange(of: harness) { syncSlashCommands() }
         .onAppear {
             if model.launchSheet == "config" {
                 model.launchSheet = nil
                 showModelPicker = true
             }
         }
+    }
+
+    /// The catalog is the chat's own harness on the chat's own device, probed
+    /// in the chat's own folder (§10.4).
+    private func syncSlashCommands() {
+        syncSlash($slash, text: text, selection: selection,
+                  key: SlashCatalogKey(deviceId: chat.deviceId, harness: harness, cwd: chat.cwd),
+                  model: model)
     }
 
     /// Merge a model/effort change into the chat's config row (LWW; the host

@@ -372,6 +372,19 @@ final class AppModel {
         return HarnessCatalog.models(for: harness)
     }
 
+    /// The device's invocables for one harness in one directory (§10.2/§10.4)
+    /// — what the composer's `/` popup lists. Cached composer-side per
+    /// (device, harness, cwd); a failure is the popup's error row, never
+    /// another harness's list.
+    func listCommands(deviceId: String, harness: String, cwd: String?) async -> SlashCatalog {
+        if demo != nil {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            return .commands(DemoDataset.slashCommands)
+        }
+        guard let workspace else { return .failure("Not connected") }
+        return await workspace.listCommands(deviceId: deviceId, harness: harness, cwd: cwd)
+    }
+
     /// Refs of the space's repo (git spaces only).
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {

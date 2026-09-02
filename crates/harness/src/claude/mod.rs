@@ -119,9 +119,10 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Command discovery cache, per probe cwd: only a successful probe is
+    /// cached, so a broken CLI retries on the next picker open (ACP-harness
+    /// parity).
+    commands: crate::commands::CommandCache,
 }
 
 impl Default for ClaudeHarness {
@@ -130,7 +131,7 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
+            commands: crate::commands::CommandCache::default(),
         }
     }
 }
@@ -249,8 +250,13 @@ impl ClaudeHarness {
     /// the `initialize` control request, and read the commands out of its
     /// control_response. No user message is ever written, so no turn (and no
     /// API call) happens; the child is torn down as soon as the response
-    /// lands.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// lands. The child stands in `cwd`, so the CLI folds that project's
+    /// `.claude/skills` and `.claude/commands` into the listing; `None`
+    /// leaves it in the process directory.
+    async fn discover_commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         crate::compose_child_path(&mut cmd, &exe);
@@ -264,6 +270,9 @@ impl ClaudeHarness {
             // CLI exits immediately with a usage error.
             "--verbose",
         ]);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -326,7 +335,11 @@ impl ClaudeHarness {
 }
 
 /// `commands` out of an `initialize` control_response payload
-/// (`response.response.commands`: name / description / argumentHint).
+/// (`response.response.commands`: name / description / argumentHint /
+/// aliases). Verified live against 2.1.228: plugin skills arrive namespaced
+/// (`vercel:deploy`) with the bare name as an alias, and built-ins carry
+/// their own (`code-review` → `review`), which is what the CLI's own popup
+/// matches on.
 fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
     response
         .get("response")
@@ -353,6 +366,18 @@ fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
                     .map(str::trim)
                     .filter(|h| !h.is_empty())
                     .map(str::to_owned),
+                aliases: c
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::trim)
+                            .filter(|a| !a.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -401,12 +426,15 @@ impl Harness for ClaudeHarness {
     /// the same channel the Claude Agent SDK's `query()` opens. The response
     /// carries every command with description + argument hint and involves no
     /// model turn (verified live, 2.1.228: the control_response is the first
-    /// stdout line, well before any API traffic). Cached on success.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// stdout line, well before any API traffic). Cached per probe cwd on
+    /// success.
+    async fn commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands
-            .get_or_try_init(|| self.discover_commands())
+            .get_or_try_init(cwd, async || self.discover_commands(cwd).await)
             .await
-            .cloned()
     }
 
     async fn run(

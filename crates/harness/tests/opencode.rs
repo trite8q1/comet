@@ -9,16 +9,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::StreamExt;
-use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc, oneshot};
 use comet_harness::{
     CancellationToken, Harness, HarnessError, OpencodeHarness, RunControls, SteerMessage,
 };
 use comet_proto::{
     AgentEvent, DoneStatus, ReasoningLevel, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
 };
+use futures::StreamExt;
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 // ---------------------------------------------------------------------------
 // Fake server
@@ -38,6 +38,9 @@ struct FakeOpencode {
     /// (the no-replay bus makes prompting before the subscription a real
     /// event-loss race — observed live on fast-failing turns).
     first_prompt_had_subscriber: Arc<Mutex<Option<bool>>>,
+    /// The `directory` scope of every `GET /command` — the per-request
+    /// instance selector a cwd-scoped probe must set (§10.4).
+    command_directories: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl FakeOpencode {
@@ -52,6 +55,7 @@ impl FakeOpencode {
             posts: Arc::new(Mutex::new(Vec::new())),
             providers: Arc::new(Mutex::new(json!({ "all": [], "default": {} }))),
             first_prompt_had_subscriber: Arc::new(Mutex::new(None)),
+            command_directories: Arc::new(Mutex::new(Vec::new())),
         };
         let accept = fake.clone();
         tokio::spawn(async move {
@@ -134,6 +138,9 @@ impl FakeOpencode {
             let method = parts.next().unwrap_or_default().to_owned();
             let target = parts.next().unwrap_or_default().to_owned();
             let path = target.split('?').next().unwrap_or_default().to_owned();
+            let directory = target
+                .split_once("directory=")
+                .map(|(_, q)| percent_decode(q.split('&').next().unwrap_or_default()));
 
             if method == "GET" && path == "/global/event" {
                 // Subscribe FIRST, then snapshot the backlog: frames landing
@@ -178,7 +185,13 @@ impl FakeOpencode {
                 }
                 self.posts.lock().unwrap().push((path.clone(), body));
             }
-            let (status, payload) = self.route(&method, &path);
+            if method == "GET" && path == "/command" {
+                self.command_directories
+                    .lock()
+                    .unwrap()
+                    .push(directory.clone());
+            }
+            let (status, payload) = self.route(&method, &path, directory.as_deref());
             let body = payload.to_string();
             let resp = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
@@ -191,14 +204,29 @@ impl FakeOpencode {
         }
     }
 
-    fn route(&self, method: &str, path: &str) -> (&'static str, Value) {
+    fn route(&self, method: &str, path: &str, directory: Option<&str>) -> (&'static str, Value) {
         match (method, path) {
             ("GET", "/global/health") => ("200 OK", json!({ "healthy": true })),
             ("GET", "/provider") => ("200 OK", self.providers.lock().unwrap().clone()),
-            ("GET", "/command") => (
-                "200 OK",
-                json!([{ "name": "init", "description": "Create AGENTS.md" }]),
-            ),
+            // Skills ride the same list as commands, told apart by `source`
+            // (live 1.18.10); both are invocable through the same endpoint.
+            // The listing is scoped to the request's `directory`: a
+            // directory-scoped probe also sees that project's `.opencode`
+            // skills, exactly as the server would report them.
+            ("GET", "/command") => {
+                let mut commands = json!([
+                    { "name": "init", "description": "Create AGENTS.md", "source": "command" },
+                    { "name": "cometalpha", "description": "Alpha probe skill.", "source": "skill" },
+                ]);
+                if let Some(dir) = directory {
+                    commands.as_array_mut().unwrap().push(json!({
+                        "name": "project-skill",
+                        "description": dir,
+                        "source": "skill",
+                    }));
+                }
+                ("200 OK", commands)
+            }
             ("POST", "/session") => ("200 OK", json!({ "id": "ses_test" })),
             ("GET", "/session/ses_resume") => ("200 OK", json!({ "id": "ses_resume" })),
             ("GET", p) if p.starts_with("/session/") => ("404 Not Found", json!({})),
@@ -210,6 +238,37 @@ impl FakeOpencode {
             _ => ("404 Not Found", json!({ "missing": path })),
         }
     }
+}
+
+/// Percent-decode one query value (reqwest form-encodes the `directory`
+/// scope, so a path arrives with its separators escaped).
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 3 <= bytes.len() => match u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -336,11 +395,12 @@ async fn thinking_streams_and_the_turn_settles_only_on_idle() {
         &started,
         AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_test"
     ));
-    // AvailableCommands from /command.
+    // AvailableCommands from /command — commands and skills alike, scoped to
+    // the run's own directory (so the project entry rides along).
     let commands = next_event(&mut stream).await;
     assert!(matches!(
         &commands,
-        AgentEvent::AvailableCommands { commands } if commands.len() == 1
+        AgentEvent::AvailableCommands { commands } if commands.len() == 3
     ));
 
     assistant_message(&fake, "ses_test", "msg_1");
@@ -800,6 +860,55 @@ async fn slash_command_routes_through_the_command_endpoint() {
     drain_to_done(&mut stream).await;
 }
 
+/// A skill in the catalog is invoked exactly like a command — `GET /command`
+/// lists both and the endpoint resolves either by name — so `/name args`
+/// reaches opencode as its own native user action.
+#[tokio::test]
+async fn skill_invocation_routes_through_the_command_endpoint() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("/cometalpha  do it "), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+
+    let commands = wait_posts(&fake, "/session/ses_test/command", 1).await;
+    assert_eq!(commands[0]["command"], "cometalpha");
+    assert_eq!(commands[0]["arguments"], "do it", "args are trimmed");
+    assert!(fake.posts_to("/session/ses_test/prompt_async").is_empty());
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+/// §10.5: a `/name` this harness's catalog does not advertise is never
+/// translated — it stays prompt text so the CLI reacts as it would natively.
+#[tokio::test]
+async fn unknown_invocation_stays_prompt_text() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("/imagegen a cat"), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
+    let text = prompts[0]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("prompt part: {}", prompts[0]));
+    assert_eq!(text, "/imagegen a cat");
+    assert!(fake.posts_to("/session/ses_test/command").is_empty());
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
 #[tokio::test]
 async fn first_prompt_waits_for_the_live_event_subscription() {
     // The v1 bus has no replay: a fast-failing turn (bad model id) emits
@@ -869,6 +978,105 @@ async fn models_discover_from_the_provider_catalog() {
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "opencode/big-pickle");
     // Commands were primed off the same probe.
-    let commands = harness.commands().await.expect("commands");
+    let commands = harness.commands(None).await.expect("commands");
     assert_eq!(commands[0].name, "init");
+}
+
+/// §10.4: the catalog is cwd-scoped, so the probe asks `/command` about the
+/// directory the run would use — the server's own per-request instance
+/// selector — and caches per directory.
+#[tokio::test]
+async fn commands_probe_scopes_the_listing_to_the_requested_directory() {
+    let fake = FakeOpencode::start().await;
+    let harness = harness(&fake);
+    let names = |commands: &[comet_proto::SlashCommand]| {
+        commands.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    };
+
+    let project = harness
+        .commands(Some(std::path::Path::new("/w/project")))
+        .await
+        .expect("commands");
+    assert_eq!(names(&project), ["init", "cometalpha", "project-skill"]);
+    assert_eq!(
+        project[2].description, "/w/project",
+        "the probe scoped the request to the requested cwd: {project:?}"
+    );
+
+    // Another directory on the same instance is its own catalog, not the
+    // cached one; no cwd asks the server for its unscoped listing.
+    let other = harness
+        .commands(Some(std::path::Path::new("/w/other")))
+        .await
+        .expect("commands");
+    assert_eq!(other[2].description, "/w/other");
+    let none = harness.commands(None).await.expect("commands");
+    assert_eq!(names(&none), ["init", "cometalpha"]);
+
+    assert_eq!(
+        *fake.command_directories.lock().unwrap(),
+        [
+            Some("/w/project".to_owned()),
+            Some("/w/other".to_owned()),
+            None
+        ],
+        "one `/command` per directory, each carrying its own scope"
+    );
+}
+
+/// Live discovery against a real `opencode serve`: `cargo test -p
+/// comet-harness --test opencode -- --ignored live_commands`. Boots the
+/// server, reads `GET /command`, tears it down — no model turn, no cost.
+///
+/// §10.4 evidence that the catalog is the server's, not comet's: the list is
+/// whatever `/command` returns, skills (`source: "skill"`) included.
+#[tokio::test]
+#[ignore]
+async fn live_commands_discovery() {
+    let h = OpencodeHarness::new();
+    let commands = h.commands(None).await.expect("live discovery");
+    assert!(
+        !commands.is_empty(),
+        "opencode ships built-in commands (/init, /review)"
+    );
+    assert!(commands.iter().any(|c| c.name == "init"));
+    eprintln!(
+        "{} commands: {:?}",
+        commands.len(),
+        commands.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+
+    // §10.4 evidence that the catalog is cwd-scoped and the SERVER resolves
+    // it: a skill under the probe directory's `.opencode/skill` is offered
+    // only for the probe that scopes its request to that directory.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let skill = dir
+        .path()
+        .join(".opencode")
+        .join("skill")
+        .join("comet-live-probe");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: comet-live-probe\ndescription: comet live opencode discovery probe.\n---\n\nProbe body.\n",
+    )
+    .expect("SKILL.md");
+    let scoped = h
+        .commands(Some(dir.path()))
+        .await
+        .expect("cwd-scoped live discovery");
+    eprintln!(
+        "{} commands in {}: {:?}",
+        scoped.len(),
+        dir.path().display(),
+        scoped.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    assert!(
+        scoped.iter().any(|c| c.name == "comet-live-probe"),
+        "the project skill under the probe cwd is missing"
+    );
+    assert!(
+        commands.iter().all(|c| c.name != "comet-live-probe"),
+        "the cwd-less catalog must not carry a project skill"
+    );
 }

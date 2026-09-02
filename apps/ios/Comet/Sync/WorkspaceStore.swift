@@ -584,6 +584,23 @@ final class WorkspaceStore {
         }
     }
 
+    /// ListCommands — the target device's invocables for one harness (skills,
+    /// custom commands, built-ins; ARCHITECTURE.md §10.2). The harness is an
+    /// input, never derived here, and the reply is that harness's catalog only.
+    /// `cwd` scopes discovery to the directory the run would execute in (§10.4).
+    /// The failure text feeds the composer's error row.
+    func listCommands(deviceId: String, harness: String, cwd: String?) async -> SlashCatalog {
+        do {
+            let commands: [SlashCommand] = try await relay(for: deviceId)
+                .call(method: "ListCommands",
+                      params: slashListCommandsParams(harness: harness, cwd: cwd))
+            return .commands(commands)
+        } catch {
+            lastRelayError = error.localizedDescription
+            return .failure(error.localizedDescription)
+        }
+    }
+
     /// SwitchRef — `git checkout` in the given folder on the target device.
     /// Returns git's error message on failure (dirty tree, held ref, …).
     func switchRef(deviceId: String, repoPath: String, refName: String) async -> String? {

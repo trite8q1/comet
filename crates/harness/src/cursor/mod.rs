@@ -34,7 +34,7 @@
 //! - Steering: turn-boundary — steers queue and become the next turn on the
 //!   parked session (parity with the previous ACP behavior).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -48,10 +48,12 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SteeringMode, TodoItem, ToolCall,
+    RunRequest, SlashCommand, SteeringMode, TodoItem, ToolCall,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+
+pub mod skills;
 
 /// The pinned SDK (public beta 1.0.x line; inspected against 1.0.28's
 /// typings). Bump deliberately — see the module header.
@@ -75,6 +77,8 @@ fn cursor_cli_paths() -> Vec<PathBuf> {
 pub struct CursorHarness {
     /// Test seam: run this program AS the shim instead of node+managed SDK.
     executable: Option<PathBuf>,
+    /// Test seam: read the skill roots under this HOME instead of the user's.
+    home: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Discovery cache: only a successful, non-empty catalog is cached, so a
@@ -86,6 +90,7 @@ impl Default for CursorHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            home: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             models_cache: tokio::sync::OnceCell::new(),
@@ -101,6 +106,18 @@ impl CursorHarness {
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
         self
+    }
+
+    pub fn with_home(mut self, path: impl Into<PathBuf>) -> Self {
+        self.home = Some(path.into());
+        self
+    }
+
+    /// Where the user-scoped and built-in skill roots live.
+    fn skills_home(&self) -> Option<PathBuf> {
+        self.home
+            .clone()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
     }
 
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
@@ -222,10 +239,27 @@ impl Harness for CursorHarness {
         }
     }
 
-    // No `commands()` override: @cursor/sdk 1.0.28 exposes no slash-command
-    // listing (the cursor-agent TUI's slash commands are client-side only),
-    // so the trait's empty default is the honest answer, not a gap.
+    /// Cursor's Agent Skills, read from the roots the agent itself reads
+    /// ([`skills`]) — §10.4's filesystem exception, because the pinned SDK's
+    /// wire carries no listing (evidence in [`skills`]'s header). `cwd`
+    /// contributes its project root's skill roots, exactly as a run in that
+    /// directory does; without one only the built-in and user roots are read.
+    /// Uncached — and so cache-free per cwd too: a directory walk, no process
+    /// and no network, so a skill added mid-session shows up on the next `/`.
+    async fn commands(&self, cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
+        let Some(home) = self.skills_home() else {
+            return Ok(Vec::new());
+        };
+        let project = cwd.map(skills::project_root);
+        Ok(skills::scan(&home, project.as_deref()))
+    }
 
+    /// A leading `/name args` is left EXACTLY as typed (§10.5): that is the
+    /// native user action on Cursor's own surfaces — its palette submits
+    /// `/${skill}` plus the arguments as the user message
+    /// (`convertSkillToSlashCommand`), and its ACP server passes an
+    /// unmatched `/name` through untouched (`handleSlashCommand` substitutes
+    /// only *custom commands*). comet never expands a skill or a command.
     async fn run(
         &self,
         request: RunRequest,
@@ -284,6 +318,18 @@ impl Harness for CursorHarness {
         });
         let _ = stdin_tx.send(first.to_string());
 
+        // The run knows its cwd, so its catalog can carry the project's skill
+        // roots too — the same list the SDK's own workspace scan loads for
+        // this run (ACP/opencode advertise theirs the same way).
+        let commands = self
+            .skills_home()
+            .map(|home| {
+                let project = (!request.cwd.is_empty())
+                    .then(|| skills::project_root(Path::new(&request.cwd)));
+                skills::scan(&home, project.as_deref())
+            })
+            .unwrap_or_default();
+
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             child,
@@ -291,6 +337,7 @@ impl Harness for CursorHarness {
             stdin_tx,
             event_tx,
             controls,
+            commands,
             request_cwd: request.cwd,
             request_model: request.model.unwrap_or_default(),
             interrupt_grace: self.interrupt_grace,
@@ -431,6 +478,7 @@ struct Session {
     stdin_tx: mpsc::UnboundedSender<String>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
+    commands: Vec<SlashCommand>,
     request_cwd: String,
     request_model: String,
     interrupt_grace: Duration,
@@ -449,6 +497,7 @@ async fn run_session(session: Session) {
         stdin_tx,
         event_tx,
         controls,
+        commands,
         request_cwd,
         request_model,
         interrupt_grace,
@@ -477,6 +526,12 @@ async fn run_session(session: Session) {
         let tx = event_tx.clone();
         async move { tx.send(Ok(ev)).await.is_ok() }
     };
+
+    // Advertise this run's skills (project roots included) before anything
+    // else, so the composer's popup matches what the agent just loaded.
+    if !commands.is_empty() && !send(AgentEvent::AvailableCommands { commands }).await {
+        return;
+    }
 
     'main: loop {
         tokio::select! {
@@ -946,10 +1001,9 @@ mod tests {
 
     #[test]
     fn nested_frames_arrive_tagged() {
-        let frame: Value = serde_json::from_str(
-            r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#,
-        )
-        .unwrap();
+        let frame: Value =
+            serde_json::from_str(r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#)
+                .unwrap();
         assert_eq!(
             map_shim_frame(&frame, false),
             vec![AgentEvent::Subagent {
