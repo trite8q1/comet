@@ -721,6 +721,13 @@ impl Wizard {
         }
     }
 
+    /// This page's free-text answer, so the shared input can show it again
+    /// after a page turn (comet question-panel.tsx keeps one draft per
+    /// question; iOS does the same with a per-question `@State` binding).
+    pub fn current_typed(&self) -> &str {
+        self.typed.get(self.page).map_or("", String::as_str)
+    }
+
     /// Explicit submit / auto-advance landing.
     pub fn advance(&mut self) -> WizardStep {
         if self.page + 1 < self.questions.len() {
@@ -5029,11 +5036,8 @@ impl Composer {
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
         if self.wizard.is_some() {
-            // Enter inside the panel's free-text input submits the page.
-            let typed = self.input.read(cx).text().trim().to_string();
-            if let Some(w) = self.wizard.as_mut() {
-                w.set_typed(typed);
-            }
+            // Enter inside the panel's free-text input submits the page;
+            // `wizard_advance` banks the typed answer for every way forward.
             self.wizard_advance(cx);
             return;
         }
@@ -5791,31 +5795,53 @@ impl Composer {
     }
 
     fn wizard_advance(&mut self, cx: &mut Context<Self>) {
-        let typed_is_empty = self.input.read(cx).is_empty();
+        // The free-text answer lives in the SHARED composer input and only
+        // becomes this page's answer here — the Next/Submit press and a blurred
+        // Enter land here too, and both used to page past the typed text and
+        // then clear it, submitting the picked labels (or nothing) instead.
+        let typed = self.input.read(cx).text().trim().to_string();
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
+        wizard.set_typed(typed.clone());
         // The button dims when this page has no answer; it must also be
         // INERT, or the one path forward doubles as a way to skip a question
         // without answering it (Enter and the footer press both land here).
-        if !wizard.can_advance(typed_is_empty) {
+        // Trimmed, so whitespace alone is not an answer.
+        if !wizard.can_advance(typed.is_empty()) {
             return;
         }
         match wizard.advance() {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
-                // Moving on: clear the shared free-text input for the next page.
-                self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.show_page_draft(cx);
                 cx.notify();
             }
         }
     }
 
     fn wizard_back(&mut self, cx: &mut Context<Self>) {
-        if let Some(wizard) = self.wizard.as_mut() {
-            wizard.back();
-            cx.notify();
+        // Leaving the page banks its draft the same way advancing does, so
+        // paging back and forth never spends the user's own words.
+        let typed = self.input.read(cx).text().trim().to_string();
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        wizard.set_typed(typed);
+        if !wizard.back() {
+            return;
         }
+        self.show_page_draft(cx);
+        cx.notify();
+    }
+
+    /// Point the shared input at the current page's own free-text draft.
+    fn show_page_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = self
+            .wizard
+            .as_ref()
+            .map_or(String::new(), |w| w.current_typed().to_string());
+        self.input.update(cx, |input, cx| input.set_text(draft, cx));
     }
 
     /// Skip: resolve the request with no answers — the "declined" signal
@@ -5934,7 +5960,7 @@ impl Composer {
         };
         let page = wizard.page;
         let last = page + 1 >= wizard.questions.len();
-        let typed_empty = self.input.read(cx).is_empty();
+        let typed_empty = self.input.read(cx).text().trim().is_empty();
         let can_advance = wizard.can_advance(typed_empty);
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
@@ -7697,6 +7723,30 @@ mod tests {
             vec!["custom answer"],
             "typed overrides picked, trimmed"
         );
+    }
+
+    /// The shared input is the only place a typed answer lives, so paging
+    /// must hand each page its OWN draft back — otherwise Back then Next
+    /// spends the first page's words on an empty slot.
+    #[test]
+    fn wizard_keeps_a_free_text_draft_per_page() {
+        let mut w = Wizard::new(
+            "req".into(),
+            vec![question("q1", &["a"], false), question("q2", &["x"], false)],
+        );
+        w.set_typed("first".into());
+        assert_eq!(w.current_typed(), "first");
+        w.advance();
+        assert_eq!(w.current_typed(), "", "a fresh page starts empty");
+        w.set_typed("second".into());
+        assert!(w.back());
+        assert_eq!(w.current_typed(), "first", "page 1's draft came back");
+        w.advance();
+        let WizardStep::Done(answers) = w.advance() else {
+            panic!()
+        };
+        assert_eq!(answers[0].labels, vec!["first"]);
+        assert_eq!(answers[1].labels, vec!["second"]);
     }
 
     /// ARCHITECTURE.md §11.4 step 4: while the harness's exit gate is parked,
