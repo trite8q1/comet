@@ -26,7 +26,8 @@ func planOpensByDefault(_ status: PlanStatus) -> Bool {
 struct PlanCardView: View {
     /// The plan markdown, parsed like assistant prose (fenced code included).
     let blocks: [TopBlock]
-    /// The plan's first `# ` heading, else "Plan".
+    /// The plan's first `# ` heading, minus a repeated "Plan" genus — empty
+    /// when that heading added nothing over the label beside it.
     let title: String
     let status: PlanStatus
     /// The parked gate, present only while `awaitingApproval`.
@@ -80,11 +81,16 @@ struct PlanCardView: View {
                     .font(Theme.sans(12, weight: .medium))
                     .foregroundStyle(Theme.textMuted)
                     .fixedSize()
-                Text(title)
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.text.opacity(0.85))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                // Empty when the heading was nothing but the genus: the
+                // label carries the header alone rather than trailing an
+                // 8pt gap for a slot with no name in it.
+                if !title.isEmpty {
+                    Text(title)
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.text.opacity(0.85))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
                 Spacer(minLength: 8)
                 statusPill
                 Image(systemName: "chevron.right")
@@ -193,6 +199,24 @@ struct PlanCardView: View {
         .foregroundStyle(Theme.textMuted)
         .padding(.horizontal, 8)
         .padding(.bottom, 6)
+        // The whole row, padding included, is the press target — the glyph
+        // runs alone are an 11pt line and a poor one.
+        .contentShape(Rectangle())
+        // Long-press to copy: the app's one copy idiom (the code block and the
+        // user bubble say it the same way), and the row is outside the
+        // header's fold Button, so nothing competes for the press.
+        //
+        // The ABSOLUTE path is what lands on the pasteboard, never the
+        // `~`-collapsed line above it: this is copied to be USED — pasted
+        // into a terminal, a message, another device — and `~` only resolves
+        // against a home directory this path may not even belong to.
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = path
+            } label: {
+                Label("Copy path", systemImage: "doc.on.doc")
+            }
+        }
     }
 
     private func answer(_ answer: PlanAnswer) {

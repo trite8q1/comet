@@ -108,15 +108,30 @@ fi
 
 # ONE path treatment per surface (§11.6): the plan card's file row and the
 # diff file header are the same object, so they must not drift apart again.
-if grep -q 'file_path::path_line' crates/ui/src/changes.rs crates/ui/src/transcript.rs; then
+if grep -q 'file_path::copyable_path_line' crates/ui/src/changes.rs crates/ui/src/transcript.rs; then
   ok "desktop shares one file-path treatment"
 else
-  fail "the plan card / diff header no longer share ui::file_path::path_line"
+  fail "the plan card / diff header no longer share ui::file_path::copyable_path_line"
+fi
+# Both path sites copy through the one latch, so the flash cannot drift the
+# way the crate's four hand-rolled copy sites already have.
+if [[ "$(grep -c 'file_path::PathCopy for' crates/ui/src/transcript.rs crates/ui/src/changes.rs \
+         | awk -F: '{n+=$2} END{print n}')" == "2" ]]; then
+  ok "desktop paths copy through one latch"
+else
+  fail "a path-rendering entity stopped implementing file_path::PathCopy"
 fi
 if grep -rq 'planPathDisplay' apps/ios/Comet; then
   ok "phone shares one file-path treatment"
 else
   fail "apps/ios/Comet lacks the shared plan-path helper"
+fi
+# The path is copyable on BOTH surfaces, each in its own idiom (desktop
+# click, phone long-press menu) — the capability is what must not diverge.
+if grep -q 'Copy path' apps/ios/Comet/Transcript/PlanCard.swift; then
+  ok "phone plan path is copyable"
+else
+  fail "apps/ios PlanCard.swift lost the copy-path affordance"
 fi
 
 # The plan file is a STRING the harness handed us: the UI may render it, never
@@ -127,6 +142,33 @@ if grep -nE 'strip_prefix\(&?cwd|relative_to|components\(\)' crates/ui/src/file_
   fail "crates/ui/src/file_path.rs relativizes paths (must stay lexical)"
 else
   ok "file-path shortener stays lexical"
+fi
+
+# A pick NEVER pages the question panel by itself (§11.2). The rule is
+# duplicated per surface, so guard both — "fixed iOS, forgot desktop" is the
+# failure this catches. Any timer-driven advance is the shape to reject.
+if grep -nE 'AUTO_ADVANCE|AutoAdvance|schedule_auto_advance' crates/ui/src/composer.rs >/dev/null; then
+  fail "crates/ui/src/composer.rs still auto-advances the question panel"
+else
+  ok "desktop question panel never self-advances"
+fi
+if grep -nE 'autoAdvance|questionPanelAutoAdvances' apps/ios/Comet/Composer/ComposerView.swift >/dev/null; then
+  fail "apps/ios ComposerView.swift still auto-advances the question panel"
+else
+  ok "phone question panel never self-advances"
+fi
+
+# ONE genus-stripping rule per surface: a header's fixed label and the title
+# beside it must never say the same word twice (§11.6).
+if grep -q 'strip_genus_prefix' crates/ui/src/transcript.rs; then
+  ok "desktop strips a repeated genus"
+else
+  fail "crates/ui/src/transcript.rs lost strip_genus_prefix"
+fi
+if grep -rq 'stripGenusPrefix' apps/ios/Comet; then
+  ok "phone strips a repeated genus"
+else
+  fail "apps/ios/Comet lacks the genus stripper"
 fi
 
 # `/plan` is the one composer-owned slash command (§11.9): one resolver per
@@ -205,10 +247,13 @@ done
 # 4. UI.
 # ---------------------------------------------------------------------------
 step "desktop transcript/composer plan unit tests"
-if cargo test -q -p comet-ui --lib plan >/tmp/verify-plan-ui.log 2>&1; then
-  ok "comet-ui plan"
+# Two filters: the wizard tests are named `wizard_*`, so a bare `plan` filter
+# silently skipped every question-panel assertion in this loop.
+if cargo test -q -p comet-ui --lib plan >/tmp/verify-plan-ui.log 2>&1 \
+   && cargo test -q -p comet-ui --lib wizard >>/tmp/verify-plan-ui.log 2>&1; then
+  ok "comet-ui plan + wizard"
 else
-  fail "comet-ui plan (see /tmp/verify-plan-ui.log)"
+  fail "comet-ui plan/wizard (see /tmp/verify-plan-ui.log)"
 fi
 
 if [[ $LIVE -eq 1 ]]; then

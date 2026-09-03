@@ -186,7 +186,7 @@ feature spec `docs/research/feature-inventory.md` §1.
 - **Composer**: hand-rolled gpui text input (start from Zed's `examples/input.rs`: IME, selection,
   clipboard, key actions), compact↔expanded auto-flip by measured text width, auto-grow 76–260px,
   Enter/Shift+Enter, Send→Steer→Stop morph, drafts + attachments per chat, drag-drop/paste
-  images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance) replacing the composer while input
+  images, QuestionPanel (paged, 1-9 keys, never self-advancing) replacing the composer while input
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade.
 - **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
@@ -559,9 +559,13 @@ live-verified (`crates/harness/tests/fixtures/grok-plan-mode.json` lists it as u
 comet keeps sending `abandoned: false` and lets the interrupt do the work. Cursor and Codex
 have no gate to reject at all.
 
-**Question panels never submit on their own.** A pick on the last page stays put; the user
-presses Submit (or Skip, which resolves the request with no answers — the "declined" signal
-every adapter already carries). Auto-advance between pages remains.
+**Question panels never advance or submit on their own.** A pick lands and the page STAYS —
+between pages as well as on the last one; every step forward is Next, Submit or Skip (which
+resolves the request with no answers — the "declined" signal every adapter already carries).
+Comet used to page itself 220ms after a single-select pick, which spent the answer before the
+user could reconsider it and made Back the only way to look again. Next/Submit is now the one
+way forward, so it is also INERT until the page has an answer (a pick or typed text) — dimmed
+alone would let a press skip a question and send an empty answer for it.
 
 **Gate tools are the card, not chips.** The tool calls that ARE the gate (`ExitPlanMode` /
 `EnterPlanMode`, `exit_plan_mode` / `enter_plan_mode`, `plan_exit` / `plan_enter`,
@@ -671,7 +675,10 @@ Comet chip card (radius 9, `hairline(0.07)` border, `ink(0.03)` wash; iOS `white
 
 - Header: the active harness's brand icon tile (`ChatConfig.harness` → `icons::harness_brand_icon`
   / `BrandMark.forHarness`; never a language/file icon), "Plan" label, the plan's first `#`
-  heading (else "Plan"), a right-aligned status pill (Drafting… / Awaiting approval / Approved /
+  heading MINUS a "Plan" genus it repeats (`# Plan` and `# Plan: port the veil` are the two
+  commonest shapes agents write, and the label already says the word — an empty title slot
+  beats saying it twice; only punctuation separates a genus from a name, so `# Plan for the
+  veil port` keeps every word), a right-aligned status pill (Drafting… / Awaiting approval / Approved /
   Revising / Rejected — accent while waiting, danger when rejected, quiet otherwise), chevron.
 - Plan file: `MessagePart::Plan.path` on its own row under the header, ABOVE the fold, so a
   collapsed card still says where the plan lives. Rendered through the one shared path
@@ -679,6 +686,15 @@ Comet chip card (radius 9, `hairline(0.07)` border, `ink(0.03)` wash; iOS `white
   uses: monospace at the file-path tone, `$HOME` shortened to `~`, and the basename pinned so
   truncation eats the directory and never the filename (a live plan path runs to 239 chars).
   No row at all when the harness keeps no plan file (Cursor, Codex, generic ACP).
+  CLICK COPIES it (long-press on the phone, that surface's only copy idiom), and what lands on
+  the clipboard is the RAW path, never the `~`-shortened line — a path is copied to be used,
+  and `~` resolves against a home directory the path may not belong to. Desktop flashes a tick
+  after the basename for 1.2s (`file_path::PathCopy`, one latch for both path sites, so the
+  confirmation cannot drift the way this crate's four hand-rolled copy sites already have);
+  the phone shows none, matching its own two copy sites. Click-to-copy rather than text
+  selection: gpui has no selectable-text primitive, the crate's selection machinery is scoped
+  to the transcript's markdown registry, and a selectable path would have to give up the
+  two-part layout that keeps the filename on screen.
 - Body: the plan markdown through the shared markdown renderer (fenced code blocks styled as
   in the diff card); expanded while drafting or awaiting approval, collapsed once approved,
   toggled with the chip fold tween (`Motion.resize` on iOS); reduced motion honored.

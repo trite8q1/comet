@@ -184,7 +184,10 @@ enum TranscriptRowBuilder {
 
             case .input(let partId, _, let questions, let resolved):
                 flushTools(lastIx: ix - 1)
-                let header = questions.first?.header ?? "Question"
+                // The chip's own label already says "Question"; a header that
+                // says it again ("Question: which port?") adds nothing, and
+                // the bare genus adds less than nothing.
+                let header = stripGenusPrefix(questions.first?.header ?? "", genus: ["question"])
                 rows.append(TranscriptRow(id: "\(entry.id)#\(partId)",
                                           version: fnv1a(header) | (resolved ? 1 : 0),
                                           turnStart: first,
@@ -247,15 +250,37 @@ enum TranscriptRowBuilder {
         return blocks
     }
 
-    /// The card's detail line: the plan's first `# ` heading, else "Plan".
+    /// Max chars the plan card's title keeps: the header's title slot
+    /// truncates visually, but the derived title also rides the row version.
+    private static let planTitleMax = 80
+
+    /// The plan's own title: its first `# ` heading, minus a "Plan" genus the
+    /// heading repeats. Comet never writes a plan, so the card's name is
+    /// whatever the harness titled it — and harnesses title them `# Plan`,
+    /// `# Plan: port the veil` and `# Port the veil` in roughly equal measure.
+    /// The header already says "Plan" in its own slot, so the first two would
+    /// render the word twice.
+    ///
+    /// EMPTY when the heading adds nothing over the genus (`# Plan`, or no
+    /// heading at all): the header renders the label alone rather than "Plan
+    /// Plan".
     static func planTitle(_ plan: String) -> String {
         for line in plan.split(separator: "\n", omittingEmptySubsequences: false) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("# ") else { continue }
-            let title = trimmed.dropFirst(2).trimmingCharacters(in: .whitespaces)
-            if !title.isEmpty { return title }
+            let heading = line.drop(while: { $0.isWhitespace })
+            guard heading.hasPrefix("# ") else { continue }
+            // The FIRST `# ` line IS the title, even when it strips to
+            // nothing — the desktop commits to it rather than searching on,
+            // and a later heading is a section, not a second name.
+            return capped(stripGenusPrefix(String(heading.dropFirst(2)), genus: ["plan"]),
+                          max: planTitleMax)
         }
-        return "Plan"
+        return ""
+    }
+
+    /// `title_line`'s cap: the derived title rides the row version, so it is
+    /// bounded at the source rather than only by the view's truncation.
+    private static func capped(_ text: String, max: Int) -> String {
+        text.count > max ? String(text.prefix(max)) + "\u{2026}" : text
     }
 
     /// Diff key for a plan part. The part is refreshed IN PLACE by every
@@ -299,6 +324,43 @@ enum TranscriptRowBuilder {
         }
         return hash << 1
     }
+}
+
+// MARK: - Genus stripping (transcript.rs strip_genus_prefix)
+
+/// Separators an agent writes between a genus and the real title: `Plan: x`,
+/// `Agent - x`, `Plan — x`. NOT a bare space — "Plan for the veil port" is a
+/// title that happens to start with the word, and stripping there would leave
+/// "for the veil port".
+private let genusSeparators: Set<Character> = [":", "-", "\u{2013}", "\u{2014}"]
+
+/// Drop a leading genus word from a title that is about to be rendered NEXT
+/// to that same genus as a label — `Plan   Plan: port the veil` is one word
+/// doing nothing twice, and `Plan   Plan` is worse.
+///
+/// Returns `""` when the title IS the bare genus: there is no name here, only
+/// the category, and the label beside it already says that.
+///
+/// Only a real word boundary strips, so "Taskmaster" and "Planning: x" keep
+/// their names, and only punctuation counts as a separator (see
+/// `genusSeparators`). Case-insensitive, because the genus is ours and the
+/// title is the harness's.
+///
+/// TITLES only. A tool chip's detail is CONTENT — stripping `Search  search
+/// in crates/ui` down to `in crates/ui` would destroy the pattern.
+func stripGenusPrefix(_ text: String, genus: [String]) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    for prefix in genus {
+        guard trimmed.count >= prefix.count,
+              trimmed.prefix(prefix.count).lowercased() == prefix.lowercased() else { continue }
+        let rest = trimmed.dropFirst(prefix.count)
+        if rest.isEmpty { return "" }
+        // Exactly one separator, then whatever spacing followed it.
+        let afterSpace = rest.drop(while: { $0.isWhitespace })
+        guard let separator = afterSpace.first, genusSeparators.contains(separator) else { continue }
+        return afterSpace.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return trimmed
 }
 
 // MARK: - Path display (the phone half of crates/ui/src/file_path.rs)
@@ -354,7 +416,7 @@ extension RenderToolCall {
         case "webSearch": return "Web"
         case "todo": return "Todo"
         case "mcp": return "MCP"
-        default: return "Tool"
+        default: return unknownContent.label
         }
     }
 
@@ -374,8 +436,20 @@ extension RenderToolCall {
         case "mcp":
             let server = string("server").map { "\($0) · " } ?? ""
             return server + (string("tool") ?? "")
-        default: return string("name") ?? ""
+        default: return unknownContent.detail
         }
+    }
+
+    /// Subagent spawns decode as an unknown call named "Agent[: <description>]"
+    /// (every native driver's convention): label them "Agent" with the
+    /// description as the detail — "Tool  Agent: scan repo" read as two labels
+    /// fighting. Split here and not in `stripGenusPrefix` because the exact
+    /// name is the wire's, not a title a model wrote.
+    private var unknownContent: (label: String, detail: String) {
+        let name = string("name") ?? ""
+        if name.hasPrefix("Agent: ") { return ("Agent", String(name.dropFirst("Agent: ".count))) }
+        if name == "Agent" { return ("Agent", "") }
+        return ("Tool", name)
     }
 
     var chipSymbol: String {

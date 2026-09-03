@@ -74,7 +74,6 @@ pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
 pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = 14.0;
 /// Single-select questions auto-advance after this long.
-pub const AUTO_ADVANCE_MS: u64 = 220;
 /// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
 pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 
@@ -529,9 +528,20 @@ pub enum SendIntent {
 /// The send path's decision. Pure so the "a parked plan gate takes the send"
 /// rule is testable without a window. Every harness takes feedback this way;
 /// the host delivers it natively per harness (ARCHITECTURE.md §11.2).
-pub fn send_intent(pending_plan_gate: Option<&str>, answered: bool, steer: bool) -> SendIntent {
+///
+/// `has_text` is what makes the send FEEDBACK: the composer also counts
+/// attachments and staged diff comments as content, and those alone would
+/// otherwise answer the gate with an empty string — a silent bare denial that
+/// drops the very attachments that triggered it. The phone has always
+/// required text here (`composerSendAction`); this is the same rule.
+pub fn send_intent(
+    pending_plan_gate: Option<&str>,
+    answered: bool,
+    has_text: bool,
+    steer: bool,
+) -> SendIntent {
     match pending_plan_gate {
-        Some(request_id) if !answered => SendIntent::PlanFeedback {
+        Some(request_id) if !answered && has_text => SendIntent::PlanFeedback {
             request_id: request_id.to_string(),
         },
         _ if steer => SendIntent::Steer,
@@ -610,14 +620,13 @@ fn slash_rows_with_builtins(catalog: &[SlashCommand], plan_offered: bool) -> Vec
 #[derive(Debug, Clone, PartialEq)]
 pub enum WizardStep {
     Stay,
-    /// Single-select landed — advance after [`AUTO_ADVANCE_MS`].
-    AutoAdvance,
     /// All pages answered — submit these answers.
     Done(Vec<UserInputAnswer>),
 }
 
-/// Paged question state ("1/3"): single-select auto-advances, multi-select and
-/// typed answers advance explicitly, number keys 1-9 select, Back pages back.
+/// Paged question state ("1/3"): a pick NEVER pages by itself — Next and
+/// Submit are the user's own presses, on every page and for every question
+/// kind. Number keys 1-9 select, Back pages back.
 #[derive(Debug, Clone)]
 pub struct Wizard {
     pub request_id: String,
@@ -680,15 +689,22 @@ impl Wizard {
             WizardStep::Stay
         } else {
             *picked = vec![option_ix];
-            // Between pages a pick auto-advances; on the LAST page it never
-            // submits — the user presses Submit (or Skip) themselves, so the
-            // agent does not continue the moment a final option is tapped.
-            if self.page + 1 < self.questions.len() {
-                WizardStep::AutoAdvance
-            } else {
-                WizardStep::Stay
-            }
+            // A pick is a pick, never a page turn. Comet used to advance
+            // itself between pages, which spent the user's answer before they
+            // could reconsider it and made Back the only way to look again;
+            // the last page already worked this way and the rest now match.
+            WizardStep::Stay
         }
+    }
+
+    /// Whether Next/Submit may fire: this page needs an answer, either a
+    /// picked option or typed text. The typed half lives in the composer's
+    /// shared input, so the caller passes it in and this stays pure.
+    ///
+    /// Load-bearing now that nothing advances on its own — Next is the only
+    /// way forward, so an unanswered page must not be able to press past.
+    pub fn can_advance(&self, typed_is_empty: bool) -> bool {
+        self.page_has_pick() || !typed_is_empty
     }
 
     /// Number key 1-9.
@@ -3626,7 +3642,6 @@ pub struct Composer {
     /// The composer is currently inviting plan feedback (its placeholder is
     /// borrowed): latched so the restore happens exactly once.
     plan_prompting: bool,
-    advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     /// Interrupt/answer commands get their own slot: assigning `send_task`
     /// DROPPED an in-flight send future mid-upload — no banner, no cleanup,
@@ -3778,7 +3793,6 @@ impl Composer {
             plan_prompting: false,
             failure_key: None,
             action_task: None,
-            advance_task: None,
             send_task: None,
             expanded_mode: false,
             flip_epoch: 0,
@@ -4913,7 +4927,6 @@ impl Composer {
                 if !same {
                     self.reset_mention(None, cx);
                     self.wizard = Some(Wizard::new(request_id, questions));
-                    self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
                     self.input.update(cx, |input, cx| {
                         input.set_placeholder("Type your own answer, or pick an option above", cx)
@@ -4937,7 +4950,6 @@ impl Composer {
                             && !self.answered_requests.contains(&wizard.request_id));
                     if released {
                         self.wizard = None;
-                        self.advance_task = None;
                         self.input
                             .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
                     }
@@ -5038,7 +5050,12 @@ impl Composer {
                 let answered = pending
                     .as_deref()
                     .is_some_and(|id| self.state.read(cx).plan_gate_answered(id));
-                match send_intent(pending.as_deref(), answered, mode == SendButtonMode::Steer) {
+                match send_intent(
+                    pending.as_deref(),
+                    answered,
+                    !text.is_empty(),
+                    mode == SendButtonMode::Steer,
+                ) {
                     SendIntent::PlanFeedback { request_id } => {
                         self.send_plan_feedback(request_id, text, cx)
                     }
@@ -5767,27 +5784,23 @@ impl Composer {
             )
         });
         match step {
-            WizardStep::AutoAdvance => self.schedule_auto_advance(cx),
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             WizardStep::Stay => {}
         }
         cx.notify();
     }
 
-    fn schedule_auto_advance(&mut self, cx: &mut Context<Self>) {
-        self.advance_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(AUTO_ADVANCE_MS))
-                .await;
-            this.update(cx, |composer, cx| composer.wizard_advance(cx))
-                .ok();
-        }));
-    }
-
     fn wizard_advance(&mut self, cx: &mut Context<Self>) {
+        let typed_is_empty = self.input.read(cx).is_empty();
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
+        // The button dims when this page has no answer; it must also be
+        // INERT, or the one path forward doubles as a way to skip a question
+        // without answering it (Enter and the footer press both land here).
+        if !wizard.can_advance(typed_is_empty) {
+            return;
+        }
         match wizard.advance() {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
@@ -5816,7 +5829,6 @@ impl Composer {
         let Some(wizard) = self.wizard.take() else {
             return;
         };
-        self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
         self.input.update(cx, |input, cx| {
             input.set_text("", cx);
@@ -5923,7 +5935,7 @@ impl Composer {
         let page = wizard.page;
         let last = page + 1 >= wizard.questions.len();
         let typed_empty = self.input.read(cx).is_empty();
-        let can_advance = wizard.page_has_pick() || !typed_empty;
+        let can_advance = wizard.can_advance(typed_empty);
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
@@ -7578,8 +7590,10 @@ mod tests {
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
     }
 
+    /// A pick never pages by itself — not between pages, not on the last one.
+    /// Every step forward is the user's own press.
     #[test]
-    fn wizard_single_select_auto_advances_and_completes() {
+    fn wizard_picks_never_advance_by_themselves() {
         let mut w = Wizard::new(
             "req".into(),
             vec![
@@ -7588,11 +7602,14 @@ mod tests {
             ],
         );
         assert_eq!(w.counter(), "1/2");
-        assert_eq!(w.select(1), WizardStep::AutoAdvance);
+        // Between pages: the pick lands and the page STAYS, so the answer can
+        // still be reconsidered without paging Back to reach it.
+        assert_eq!(w.select(1), WizardStep::Stay);
         assert!(w.is_picked(1));
+        assert_eq!(w.counter(), "1/2", "the pick did not turn the page");
         assert_eq!(w.advance(), WizardStep::Stay);
         assert_eq!(w.counter(), "2/2");
-        // The last page never auto-submits: the pick stays, Submit finishes.
+        // The last page never auto-submits either: Submit finishes.
         assert_eq!(w.select(0), WizardStep::Stay);
         assert!(w.is_picked(0));
         let WizardStep::Done(answers) = w.advance() else {
@@ -7601,6 +7618,31 @@ mod tests {
         assert_eq!(answers.len(), 2);
         assert_eq!(answers[0].labels, vec!["b"]);
         assert_eq!(answers[1].labels, vec!["x"]);
+    }
+
+    /// Next/Submit is now the ONLY way forward, so it must refuse an
+    /// unanswered page — a dimmed-but-live button would let a press skip a
+    /// question and send an empty answer for it.
+    #[test]
+    fn wizard_cannot_advance_an_unanswered_page() {
+        let mut w = Wizard::new(
+            "req".into(),
+            vec![
+                question("q1", &["a", "b"], false),
+                question("q2", &["x"], false),
+            ],
+        );
+        assert!(!w.can_advance(true), "nothing picked, nothing typed");
+        assert!(w.can_advance(false), "typed text is an answer");
+        w.select(0);
+        assert!(w.can_advance(true), "a pick is an answer");
+        // Multi-select counts the same way: any picked option unlocks it.
+        let mut m = Wizard::new("req".into(), vec![question("q1", &["a", "b"], true)]);
+        assert!(!m.can_advance(true));
+        m.select(1);
+        assert!(m.can_advance(true));
+        m.select(1); // toggled back off
+        assert!(!m.can_advance(true));
     }
 
     #[test]
@@ -7663,25 +7705,46 @@ mod tests {
     /// answer.
     #[test]
     fn a_parked_plan_gate_takes_the_send_until_it_is_answered() {
+        let feedback = |id: &str| SendIntent::PlanFeedback {
+            request_id: id.into(),
+        };
         assert_eq!(
-            send_intent(Some("req-1"), false, false),
-            SendIntent::PlanFeedback {
-                request_id: "req-1".into()
-            }
+            send_intent(Some("req-1"), false, true, false),
+            feedback("req-1")
         );
         // Even mid-run, where the send would otherwise steer.
         assert_eq!(
-            send_intent(Some("req-1"), false, true),
-            SendIntent::PlanFeedback {
-                request_id: "req-1".into()
-            }
+            send_intent(Some("req-1"), false, true, true),
+            feedback("req-1")
         );
         // Answered here already (the card's buttons, or a previous send):
         // the ordinary send path is back.
-        assert_eq!(send_intent(Some("req-1"), true, true), SendIntent::Steer);
-        assert_eq!(send_intent(Some("req-1"), true, false), SendIntent::Run);
-        assert_eq!(send_intent(None, false, false), SendIntent::Run);
-        assert_eq!(send_intent(None, false, true), SendIntent::Steer);
+        assert_eq!(
+            send_intent(Some("req-1"), true, true, true),
+            SendIntent::Steer
+        );
+        assert_eq!(
+            send_intent(Some("req-1"), true, true, false),
+            SendIntent::Run
+        );
+        assert_eq!(send_intent(None, false, true, false), SendIntent::Run);
+        assert_eq!(send_intent(None, false, true, true), SendIntent::Steer);
+    }
+
+    /// Only TYPED text is feedback. An attachment or a staged diff comment
+    /// also counts as "the composer has content", and without this rule that
+    /// alone answered the gate with an empty string — a bare denial the user
+    /// never asked for, with the attachment silently dropped on the way.
+    #[test]
+    fn a_textless_send_never_answers_the_plan_gate() {
+        assert_eq!(
+            send_intent(Some("req-1"), false, false, false),
+            SendIntent::Run
+        );
+        assert_eq!(
+            send_intent(Some("req-1"), false, false, true),
+            SendIntent::Steer
+        );
     }
 
     #[test]

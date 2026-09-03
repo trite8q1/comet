@@ -83,9 +83,109 @@ final class PlanModeTests: XCTestCase {
         XCTAssertEqual(blocks.count, 2)
     }
 
-    func testAPlanWithoutAHeadingFallsBackToPlan() {
-        XCTAssertEqual(TranscriptRowBuilder.planTitle("Just prose.\n\n## Not h1"), "Plan")
+    func testAPlanWithoutAHeadingHasNoTitle() {
+        XCTAssertEqual(TranscriptRowBuilder.planTitle("Just prose.\n\n## Not h1"), "")
         XCTAssertEqual(TranscriptRowBuilder.planTitle("## Sub\n\n# Real title\n"), "Real title")
+    }
+
+    /// The header already says "Plan"; a heading that says it again adds
+    /// nothing. Harnesses write all three shapes, so the title slot carries
+    /// only what the genus label does not.
+    func testAPlanHeadingNeverRepeatsTheGenusLabel() {
+        let title = TranscriptRowBuilder.planTitle
+        // The shape every fixture in this repo produces.
+        XCTAssertEqual(title("# Plan\n\n1. one\n"), "")
+        // The shape a live harness produced (grok, 2026-09-03).
+        XCTAssertEqual(title("# Plan: Minimal placeholder README.md\n"),
+                       "Minimal placeholder README.md")
+        for dash in ["-", "\u{2013}", "\u{2014}"] {
+            XCTAssertEqual(title("# Plan \(dash) port the veil\n"), "port the veil")
+        }
+        XCTAssertEqual(title("# plan: lower case\n"), "lower case")
+        // A title that merely BEGINS with the word keeps every word of it.
+        XCTAssertEqual(title("# Plan for the veil port\n"), "Plan for the veil port")
+        XCTAssertEqual(title("# Planning: next steps\n"), "Planning: next steps")
+        XCTAssertEqual(title("# Plan B\n"), "Plan B")
+        // Nothing but the genus and a separator is still nothing.
+        XCTAssertEqual(title("# Plan:\n"), "")
+        // A heading in the user's own language cannot collide with our label.
+        XCTAssertEqual(title("# 计划: 迁移\n"), "计划: 迁移")
+    }
+
+    /// The one genus rule, shared: the plan card and the input chip strip the
+    /// same way, and only punctuation separates a genus from a name.
+    func testGenusPrefixesStripOnlyAtARealBoundary() {
+        let agent = { (text: String) in stripGenusPrefix(text, genus: ["agent", "task"]) }
+        XCTAssertEqual(agent("Agent: scan repo"), "scan repo")
+        XCTAssertEqual(agent("Task \u{2014} scan repo"), "scan repo")
+        XCTAssertEqual(agent("agent"), "", "the bare genus names nothing")
+        XCTAssertEqual(agent("Taskmaster"), "Taskmaster", "no word boundary")
+        XCTAssertEqual(agent("Agent scan repo"), "Agent scan repo",
+                       "a space is not a separator — it would eat a real first word")
+        XCTAssertEqual(agent("scan repo"), "scan repo")
+    }
+
+    /// The title rides the row version, so it is bounded at the source — and
+    /// the FIRST `# ` line is the title even when it strips to nothing, so a
+    /// later heading can never be promoted into the header.
+    func testThePlanTitleIsCappedAndCommitsToTheFirstHeading() {
+        let long = String(repeating: "a", count: 90)
+        let capped = TranscriptRowBuilder.planTitle("# Plan: \(long)\n")
+        XCTAssertEqual(capped, String(repeating: "a", count: 80) + "\u{2026}")
+        XCTAssertEqual(capped.count, 81)
+        // Exactly at the cap keeps its last character and gains no ellipsis.
+        let exact = String(repeating: "b", count: 80)
+        XCTAssertEqual(TranscriptRowBuilder.planTitle("# \(exact)\n"), exact)
+        // A blank first heading falls back rather than searching on.
+        XCTAssertEqual(TranscriptRowBuilder.planTitle("# \n\n# Real title\n"), "")
+    }
+
+    /// The input chip's own label says "Question" — a model header that says
+    /// it again would say it twice, and the bare genus adds less than nothing.
+    func testTheInputChipHeaderNeverRepeatsItsLabel() {
+        let header = { (text: String) -> String in
+            var parsers: [String: IncrementalMarkdownParser] = [:]
+            var completed: [String: CompletedParse] = [:]
+            let entries = [
+                MessageEntry(id: "m1", role: .assistant, parts: [
+                    .input(id: "ask", requestId: "req-1", questions: [
+                        UserInputQuestion(id: "q1", header: text, question: "which?",
+                                          options: ["a"], multiSelect: nil),
+                    ], resolved: true),
+                ], createdAt: 1, deviceId: "d", status: .complete, continuationOf: nil),
+            ]
+            let rows = TranscriptRowBuilder.rows(entries: entries, pendingSends: [],
+                                                 parsers: &parsers, completed: &completed)
+            guard case .inputChip(let value, _) = rows.first?.kind else { return "<no chip>" }
+            return value
+        }
+        XCTAssertEqual(header("Question: which port?"), "which port?")
+        XCTAssertEqual(header("Question"), "")
+        XCTAssertEqual(header("Which port?"), "Which port?")
+    }
+
+    /// Claude's subagent spawns arrive as an unknown call named
+    /// "Agent: <description>". Rendered raw that is "Tool  Agent: scan repo" —
+    /// two labels fighting — so the phone splits it exactly like the desktop.
+    func testASubagentSpawnRendersAsAnAgentChip() {
+        let spawn = RenderToolCall(tag: "unknown", fields: ["name": "Agent: scan repo"])
+        XCTAssertEqual(spawn.chipLabel, "Agent")
+        XCTAssertEqual(spawn.chipDetail, "scan repo")
+        // The bare name is still an Agent, just without a description.
+        let bare = RenderToolCall(tag: "unknown", fields: ["name": "Agent"])
+        XCTAssertEqual(bare.chipLabel, "Agent")
+        XCTAssertEqual(bare.chipDetail, "")
+        // Anything else keeps the generic label and its whole name.
+        let other = RenderToolCall(tag: "unknown", fields: ["name": "Agentic: scan"])
+        XCTAssertEqual(other.chipLabel, "Tool")
+        XCTAssertEqual(other.chipDetail, "Agentic: scan")
+    }
+
+    /// Content is not a title: the pattern a Search chip carries starts with
+    /// whatever the model searched for, and stripping there destroys it.
+    func testToolChipContentKeepsItsFirstWord() {
+        let search = RenderToolCall(tag: "search", fields: ["pattern": "plan: the veil"])
+        XCTAssertEqual(search.chipDetail, "plan: the veil")
     }
 
     /// The part is refreshed IN PLACE, so the row id never moves — the version
@@ -259,15 +359,19 @@ final class PlanModeTests: XCTestCase {
 
     // MARK: Question panel (pure)
 
-    func testTheLastPageNeverAutoSubmits() {
-        // Between pages a single-select pick advances itself…
-        XCTAssertTrue(questionPanelAutoAdvances(page: 0, count: 3, multiSelect: false))
-        XCTAssertTrue(questionPanelAutoAdvances(page: 1, count: 3, multiSelect: false))
-        // …but the last page's Submit is the user's own tap.
-        XCTAssertFalse(questionPanelAutoAdvances(page: 2, count: 3, multiSelect: false))
-        XCTAssertFalse(questionPanelAutoAdvances(page: 0, count: 1, multiSelect: false))
-        // Multi-select picks are toggles — never an advance.
-        XCTAssertFalse(questionPanelAutoAdvances(page: 0, count: 3, multiSelect: true))
+    /// Next/Submit is now the ONLY way forward — nothing advances on its own —
+    /// so it must refuse an unanswered page: a dimmed-but-live button would let
+    /// a tap skip a question and send an empty answer for it.
+    func testNextRefusesAnUnansweredPage() {
+        XCTAssertFalse(questionPanelCanAdvance(picked: [], typed: ""),
+                       "nothing picked, nothing typed")
+        XCTAssertTrue(questionPanelCanAdvance(picked: [], typed: "my own answer"),
+                      "typed text is an answer")
+        XCTAssertTrue(questionPanelCanAdvance(picked: ["a"], typed: ""), "a pick is an answer")
+        // Multi-select counts the same way: any picked option unlocks it, and
+        // toggling the last one back off locks it again.
+        XCTAssertTrue(questionPanelCanAdvance(picked: ["a", "b"], typed: ""))
+        XCTAssertFalse(questionPanelCanAdvance(picked: [], typed: ""))
     }
 
     func testAnAnsweredOrDraftingPlanLeavesTheSendAlone() {

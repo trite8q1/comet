@@ -1140,14 +1140,23 @@ fn assistant_copy_text(entry: &SessionMessageEntry) -> Option<SharedString> {
 /// visually, but the derived title also rides the row fingerprint.
 const PLAN_TITLE_MAX: usize = 80;
 
-/// The plan's own title: its first `# ` heading, else the bare genus. Comet
-/// never writes a plan, so the card's name is whatever the harness titled it.
+/// The plan's own title: its first `# ` heading, minus a "Plan" genus the
+/// heading repeats. Comet never writes a plan, so the card's name is whatever
+/// the harness titled it — and harnesses title them `# Plan`, `# Plan: port
+/// the veil` and `# Port the veil` in roughly equal measure. The header
+/// already says "Plan" in its own slot, so the first two would render the
+/// word twice.
+///
+/// EMPTY when the heading adds nothing over the genus (`# Plan`, or no
+/// heading at all): the header renders the label alone rather than "Plan
+/// Plan".
 fn plan_title(plan: &str) -> SharedString {
     plan.lines()
         .find_map(|line| line.trim_start().strip_prefix("# "))
+        .map(|heading| strip_genus_prefix(heading, &["plan"]))
         .and_then(|heading| title_line(heading, PLAN_TITLE_MAX))
         .map(SharedString::from)
-        .unwrap_or_else(|| "Plan".into())
+        .unwrap_or_default()
 }
 
 /// The status pill's word (ARCHITECTURE.md §11.6).
@@ -1191,6 +1200,14 @@ fn plan_version(
     acc.extend_from_slice(&fnv1a(path.unwrap_or_default().as_bytes()).to_le_bytes());
     acc.extend_from_slice(request_id.unwrap_or_default().as_bytes());
     fnv1a(&acc)
+}
+
+use crate::file_path::PathCopy as _;
+
+impl crate::file_path::PathCopy for Transcript {
+    fn copy_latch(&mut self) -> &mut crate::file_path::CopyLatch {
+        &mut self.copied_path
+    }
 }
 
 /// The card's three answers to the exit gate (ARCHITECTURE.md §11.4).
@@ -1480,8 +1497,8 @@ pub fn rows_for_entry(
                         let header: SharedString = single_line(
                             &questions
                                 .first()
-                                .map(|q| q.header.clone())
-                                .unwrap_or_else(|| "Question".to_string()),
+                                .map(|q| strip_genus_prefix(&q.header, &["question"]).to_string())
+                                .unwrap_or_default(),
                         )
                         .into();
                         rows.push(Row {
@@ -2352,6 +2369,8 @@ pub struct Transcript {
     plan_heights: Rc<RefCell<HashMap<SharedString, PlanBodyMeasure>>>,
     /// The in-flight `RespondPlanExit` QueueCommand.
     plan_task: Option<Task<()>>,
+    /// The plan path's "just copied" tick (`file_path::PathCopy`).
+    copied_path: crate::file_path::CopyLatch,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -2577,6 +2596,7 @@ impl Transcript {
             tool_details: HashMap::new(),
             plan_heights: Rc::default(),
             plan_task: None,
+            copied_path: Default::default(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -5374,6 +5394,7 @@ impl Transcript {
                 // A flex row with the line in the flexible slot — the same
                 // shape the diff file header gives it, so the directory has
                 // something to shrink against.
+                let raw = p.clone();
                 div()
                     .w_full()
                     .min_w_0()
@@ -5383,7 +5404,22 @@ impl Transcript {
                     .items_center()
                     .px(px(8.0))
                     .pb(px(6.0))
-                    .child(crate::file_path::path_line(p, theme).flex_1())
+                    .child(
+                        crate::file_path::copyable_path_line(
+                            p,
+                            SharedString::from(format!("{row_id}-plan-path")),
+                            self.copied_path.shows(p),
+                            theme,
+                            crate::file_path::PATH_TEXT_META,
+                        )
+                        // Nothing above this row clicks — the fold toggle
+                        // ends with the header — so the copy needs no
+                        // `stop_propagation` the way the diff header's does.
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.copy_path(raw.clone(), cx)),
+                        )
+                        .flex_1(),
+                    )
             }));
 
         if open || animating {
@@ -6222,12 +6258,26 @@ fn title_line(text: &str, max: usize) -> Option<String> {
     Some(out)
 }
 
-/// Drop a leading "Agent"/"Task" genus (with its `:` and spacing) from a
-/// spawn-title candidate. Only a real word boundary strips — "Taskmaster"
-/// keeps its name. A bare "Agent"/"Task" strips to "" (no context at all).
-fn strip_spawn_prefix(text: &str) -> &str {
+/// Separators an agent writes between a genus and the real title:
+/// `Plan: x`, `Agent - x`, `Plan — x`. NOT a bare space — "Plan for the veil
+/// port" is a title that happens to start with the word, and stripping there
+/// would leave "for the veil port".
+const GENUS_SEPARATORS: [char; 4] = [':', '-', '\u{2013}', '\u{2014}'];
+
+/// Drop a leading genus word from a title that is about to be rendered NEXT
+/// to that same genus as a label — `Plan   Plan: port the veil` is one word
+/// doing nothing twice, and `Plan   Plan` is worse.
+///
+/// Returns `""` when the title IS the bare genus: there is no name here, only
+/// the category, and the label beside it already says that.
+///
+/// Only a real word boundary strips, so "Taskmaster" and "Planning: x" keep
+/// their names, and only punctuation counts as a separator (see
+/// [`GENUS_SEPARATORS`]). Case-insensitive, because the genus is ours and the
+/// title is the harness's.
+fn strip_genus_prefix<'a>(text: &'a str, genus: &[&str]) -> &'a str {
     let t = text.trim();
-    for prefix in ["agent", "task"] {
+    for prefix in genus {
         if t.len() >= prefix.len()
             && t.is_char_boundary(prefix.len())
             && t[..prefix.len()].eq_ignore_ascii_case(prefix)
@@ -6236,8 +6286,10 @@ fn strip_spawn_prefix(text: &str) -> &str {
             if rest.is_empty() {
                 return "";
             }
-            if rest.starts_with(':') || rest.starts_with(char::is_whitespace) {
-                return rest.trim_start_matches(':').trim();
+            // Exactly one separator, then whatever spacing followed it.
+            let rest = rest.trim_start();
+            if let Some(stripped) = rest.strip_prefix(GENUS_SEPARATORS) {
+                return stripped.trim();
             }
         }
     }
@@ -6261,7 +6313,10 @@ fn subagent_tab_title(call: &ToolCall) -> SharedString {
         input.and_then(|i| i.get("prompt")?.as_str()),
     ];
     for text in candidates.into_iter().flatten() {
-        if let Some(title) = title_line(strip_spawn_prefix(text), SUBAGENT_TITLE_MAX) {
+        if let Some(title) = title_line(
+            strip_genus_prefix(text, &["agent", "task"]),
+            SUBAGENT_TITLE_MAX,
+        ) {
             return title.into();
         }
     }
@@ -7362,9 +7417,62 @@ mod tests {
         assert_eq!(request_id.as_deref(), Some("req-1"));
         assert!(plan.starts_with("# Veil port plan"), "body kept verbatim");
         assert_eq!(path.as_deref(), None, "this harness keeps no plan file");
-        // A plan the harness never titled still names itself.
-        assert_eq!(plan_title("1. do the thing\n"), "Plan");
+        // A plan the harness never titled adds no name: the header's own
+        // "Plan" label stands alone rather than being said twice.
+        assert_eq!(plan_title("1. do the thing\n"), "");
         assert_eq!(plan_title("## Sub\n# Real\n"), "Real");
+    }
+
+    /// The header already says "Plan"; a heading that says it again adds
+    /// nothing. Harnesses write all three shapes, so the title slot carries
+    /// only what the genus label does not.
+    #[test]
+    fn a_plan_heading_never_repeats_the_genus_label() {
+        // The shape every fixture in this repo produces.
+        assert_eq!(plan_title("# Plan\n\n1. one\n"), "");
+        // The shape a live harness produced (grok, 2026-09-03).
+        assert_eq!(
+            plan_title("# Plan: Minimal placeholder README.md\n"),
+            "Minimal placeholder README.md"
+        );
+        for dash in ["-", "\u{2013}", "\u{2014}"] {
+            assert_eq!(
+                plan_title(&format!("# Plan {dash} port the veil\n")),
+                "port the veil"
+            );
+        }
+        assert_eq!(plan_title("# plan: lower case\n"), "lower case");
+        // A title that merely BEGINS with the word keeps every word of it.
+        assert_eq!(
+            plan_title("# Plan for the veil port\n"),
+            "Plan for the veil port"
+        );
+        assert_eq!(
+            plan_title("# Planning: next steps\n"),
+            "Planning: next steps"
+        );
+        assert_eq!(plan_title("# Plan B\n"), "Plan B");
+        // Nothing but the genus and a separator is still nothing.
+        assert_eq!(plan_title("# Plan:\n"), "");
+        // A heading in the user's own language cannot collide with our label.
+        assert_eq!(plan_title("# 计划: 迁移\n"), "计划: 迁移");
+    }
+
+    /// The one genus rule, shared: the subagent tab title and the plan card
+    /// strip the same way, and only punctuation separates a genus from a name.
+    #[test]
+    fn genus_prefixes_strip_only_at_a_real_boundary() {
+        let agent = |t| strip_genus_prefix(t, &["agent", "task"]);
+        assert_eq!(agent("Agent: scan repo"), "scan repo");
+        assert_eq!(agent("Task — scan repo"), "scan repo");
+        assert_eq!(agent("agent"), "", "the bare genus names nothing");
+        assert_eq!(agent("Taskmaster"), "Taskmaster", "no word boundary");
+        assert_eq!(
+            agent("Agent scan repo"),
+            "Agent scan repo",
+            "a space is not a separator — it would eat a real first word",
+        );
+        assert_eq!(agent("scan repo"), "scan repo");
     }
 
     /// The harness refreshes the segment's single plan part in place, so the

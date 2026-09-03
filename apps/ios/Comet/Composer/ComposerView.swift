@@ -705,12 +705,13 @@ struct ComposerView: View {
 
 // MARK: - Question panel (composer.rs Wizard)
 
-/// Whether picking an option advances the panel by itself. Only BETWEEN
-/// pages: on the last page the pick would submit the whole request, so the
-/// user taps Submit themselves. Multi-select never auto-advances — the pick
-/// is a toggle.
-func questionPanelAutoAdvances(page: Int, count: Int, multiSelect: Bool) -> Bool {
-    !multiSelect && page < count - 1
+/// Whether Next/Submit may fire: this page needs an answer, either a picked
+/// option or typed text (composer.rs `Wizard::can_advance`).
+///
+/// Load-bearing now that nothing advances on its own — Next is the only way
+/// forward, so an unanswered page must not be able to press past.
+func questionPanelCanAdvance(picked: Set<String>, typed: String) -> Bool {
+    !picked.isEmpty || !typed.isEmpty
 }
 
 struct QuestionPanel: View {
@@ -721,7 +722,6 @@ struct QuestionPanel: View {
     @State private var page = 0
     @State private var picked: [String: Set<String>] = [:]  // questionId → labels
     @State private var typed: [String: String] = [:]
-    @State private var autoAdvanceTask: Task<Void, Never>?
 
     var body: some View {
         // `questions[min(page, count - 1)]` traps on an empty list (count - 1
@@ -789,7 +789,6 @@ struct QuestionPanel: View {
                     .foregroundStyle(Theme.textMuted)
                 }
                 Button("Skip") {
-                    autoAdvanceTask?.cancel()
                     respond(requestId, [])
                 }
                 .font(Theme.sans(13, weight: .medium))
@@ -853,22 +852,16 @@ struct QuestionPanel: View {
             if set.contains(option) { set.remove(option) } else { set.insert(option) }
             picked[question.id] = set
         } else {
+            // A pick is a pick, never a page turn. Comet used to advance
+            // itself 220ms later, which spent the user's answer before they
+            // could reconsider it and made Back the only way to look again.
             picked[question.id] = [option]
-            // Single-select auto-advances after 220ms (AUTO_ADVANCE_MS) —
-            // between pages only; the last page waits for Submit.
-            autoAdvanceTask?.cancel()
-            guard questionPanelAutoAdvances(page: page, count: questions.count,
-                                            multiSelect: false) else { return }
-            autoAdvanceTask = Task {
-                try? await Task.sleep(nanoseconds: 220_000_000)
-                guard !Task.isCancelled else { return }
-                advance()
-            }
         }
     }
 
     private func canAdvance(_ question: UserInputQuestion) -> Bool {
-        !(typed[question.id] ?? "").isEmpty || !picked[question.id, default: []].isEmpty
+        questionPanelCanAdvance(picked: picked[question.id, default: []],
+                                typed: typed[question.id] ?? "")
     }
 
     private func advance() {

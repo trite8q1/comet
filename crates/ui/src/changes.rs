@@ -1442,6 +1442,8 @@ pub struct Changes {
     scoped_task: Option<Task<()>>,
     scope_menu: Popup<()>,
     ref_menu: Popup<RefMenu>,
+    /// The file header path's "just copied" tick (`file_path::PathCopy`).
+    copied_path: crate::file_path::CopyLatch,
     /// Only ever one: a second `+` moves the card rather than stacking two
     /// half-written notes.
     draft: Option<CommentDraft>,
@@ -1464,6 +1466,14 @@ pub enum ChangesEvent {
 }
 
 impl gpui::EventEmitter<ChangesEvent> for Changes {}
+
+use crate::file_path::PathCopy as _;
+
+impl crate::file_path::PathCopy for Changes {
+    fn copy_latch(&mut self) -> &mut crate::file_path::CopyLatch {
+        &mut self.copied_path
+    }
+}
 
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -1505,6 +1515,7 @@ impl Changes {
             scoped_task: None,
             scope_menu: Popup::default(),
             ref_menu: Popup::default(),
+            copied_path: Default::default(),
             draft: None,
             hover: None,
             comment_key: 0,
@@ -3062,10 +3073,28 @@ impl Changes {
                 cx.notify();
             }))
             .child(chevron)
-            // The shared path treatment (`file_path::path_line`) — this header
-            // is where it was designed, so it renders through it rather than
-            // keeping a private copy the plan card would drift from.
-            .child(crate::file_path::path_line(&file.path, theme).flex_1())
+            // The shared path treatment (`file_path::copyable_path_line`) —
+            // this header is where it was designed, so it renders through it
+            // rather than keeping a private copy the plan card would drift
+            // from, and it copies the same way the plan card's does.
+            .child({
+                let raw = file.path.clone();
+                crate::file_path::copyable_path_line(
+                    &file.path,
+                    SharedString::from(format!("changes-path-{ix}")),
+                    self.copied_path.shows(&file.path),
+                    theme,
+                    crate::file_path::PATH_TEXT,
+                )
+                // The path sits INSIDE the header's fold click, so copying
+                // must stop the event or every copy would also fold the file
+                // (the `history.rs` sha chip does exactly this).
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.copy_path(SharedString::from(raw.clone()), cx);
+                }))
+                .flex_1()
+            })
             .when(file.binary, |el| {
                 el.child(
                     div()
