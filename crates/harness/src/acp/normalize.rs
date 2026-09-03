@@ -462,6 +462,152 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
         .collect()
 }
 
+/// Byte cap for plan text crossing the event stream (ARCHITECTURE.md §11.3
+/// caps the doc part at the same size).
+pub(crate) const PLAN_TEXT_CAP: usize = 128 * 1024;
+
+/// Whether a tool call is the agent's plan-exit gate. `names` is the spec's
+/// tool-name set; the call is matched on the grok-native tool name, the
+/// `rawInput.variant` discriminant grok stamps on the update, and the title
+/// (verified live against grok 1.0.13: `_meta["x.ai/tool"].name` is
+/// `exit_plan_mode`, the update's `rawInput` is `{"variant":"ExitPlanMode"}`).
+pub(crate) fn is_plan_exit_call(update: &Value, names: &[&str]) -> bool {
+    [
+        xai_tool_name(update),
+        update
+            .get("toolName")
+            .or_else(|| update.get("rawInput").and_then(|r| r.get("variant")))
+            .and_then(Value::as_str),
+        update.get("title").and_then(Value::as_str),
+    ]
+    .iter()
+    .flatten()
+    .any(|n| names.contains(n))
+}
+
+/// The plan-ENTER tool, the exit gate's twin. It has no gate of its own, so
+/// it is named only here: its chip, like the exit call's, is replaced by the
+/// plan card (§11.6). Grok spells it `enter_plan_mode` on
+/// `_meta["x.ai/tool"].name` and titles the update "Plan: Enter" (verified
+/// live, 1.0.13).
+pub(crate) const PLAN_ENTER_TOOLS: &[&str] = &["enter_plan_mode", "EnterPlanMode", "Plan: Enter"];
+
+/// Whether a tool call is either half of the plan-mode gate (enter or exit).
+/// The plan card already represents both, so the parent feed drops their tool
+/// chips — a rejected exit otherwise reads as a stray failed tool.
+pub(crate) fn is_plan_gate_call(update: &Value, exit_names: &[&str]) -> bool {
+    is_plan_exit_call(update, exit_names) || is_plan_exit_call(update, PLAN_ENTER_TOOLS)
+}
+
+/// A plan file a harness keeps on disk: `<anything>/plans/*.md` (Claude,
+/// opencode) or the bare `plan.md` grok writes into its session directory
+/// (`~/.grok/sessions/<encoded-cwd>/<session-id>/plan.md`, verified live
+/// against 1.0.13).
+fn is_plan_file(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    if !path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+    {
+        return false;
+    }
+    path.file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("plan.md"))
+        || path
+            .parent()
+            .and_then(|d| d.file_name())
+            .is_some_and(|d| d.eq_ignore_ascii_case("plans"))
+}
+
+/// The file an edit-kind tool call touched (diff path, location, or the
+/// `file_path`/`path` argument agents spell three ways).
+fn edited_path(update: &Value) -> Option<String> {
+    tool_diff(update)
+        .map(|d| d.path)
+        .or_else(|| first_location(update))
+        .or_else(|| {
+            let raw = update.get("rawInput")?;
+            ["file_path", "filePath", "path"]
+                .iter()
+                .find_map(|k| raw.get(*k))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|p| !p.is_empty())
+}
+
+/// Depth-limited hunt for a string field under either spelling; agents wrap
+/// the tool output differently (`ExitPlanModeOutput::PlanReady` serializes
+/// externally OR internally tagged depending on the adapter).
+fn nested_str<'a>(value: &'a Value, keys: &[&str], depth: u8) -> Option<&'a str> {
+    let obj = value.as_object()?;
+    for key in keys {
+        if let Some(found) = obj.get(*key).and_then(Value::as_str) {
+            return Some(found);
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    obj.values().find_map(|v| nested_str(v, keys, depth - 1))
+}
+
+/// The plan text an `exit_plan_mode` tool call carries in its output/input
+/// (`ExitPlanModeOutput::PlanReady { plan_content, plan_file_path }`), plus
+/// the plan file path when the variant names one.
+pub(crate) fn plan_from_exit_call(update: &Value) -> Option<(String, Option<String>)> {
+    let text = ["rawOutput", "rawInput", "content"]
+        .iter()
+        .filter_map(|k| update.get(*k))
+        .find_map(|v| nested_str(v, &["plan_content", "planContent"], 3))
+        .filter(|t| !t.is_empty())?;
+    let path = ["rawOutput", "rawInput"]
+        .iter()
+        .filter_map(|k| update.get(*k))
+        .find_map(|v| nested_str(v, &["plan_file_path", "planFilePath"], 3))
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned);
+    Some((cap_text(text, PLAN_TEXT_CAP), path))
+}
+
+/// Native plan mode (ARCHITECTURE.md §11.2), kept BESIDE [`map_update`]
+/// rather than inside it: the plan mode id is per-session context (the
+/// spec's static id for grok, or the id the agent advertised at
+/// `session/new`), which a pure update map cannot know. Everything here is
+/// additive — the ACP `plan` update stays [`map_update`]'s live todo chip.
+///
+/// - `current_mode_update` → the REPORTED mode (§11.1).
+/// - an `exit_plan_mode` call carrying plan content → the plan text.
+/// - an edit-kind call on a plan file → the plan text, re-read from disk
+///   (the file, not the hunk, is the plan).
+pub(crate) fn plan_events(update: &Value, plan_mode_id: &str) -> Vec<AgentEvent> {
+    let kind = update
+        .get("sessionUpdate")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match kind {
+        "current_mode_update" => vec![AgentEvent::PlanModeChanged {
+            active: update.get("currentModeId").and_then(Value::as_str) == Some(plan_mode_id),
+        }],
+        "tool_call" | "tool_call_update" => {
+            if let Some((text, path)) = plan_from_exit_call(update) {
+                return vec![AgentEvent::PlanUpdated { text, path }];
+            }
+            let read = edited_path(update)
+                .filter(|p| is_plan_file(p))
+                .and_then(|p| std::fs::read_to_string(&p).ok().map(|text| (p, text)));
+            match read {
+                Some((path, text)) => vec![AgentEvent::PlanUpdated {
+                    text: cap_text(&text, PLAN_TEXT_CAP),
+                    path: Some(path),
+                }],
+                None => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
 /// preferred auto-approve choice: `allow_always` > `allow_once` > first.
 pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {
@@ -477,10 +623,186 @@ pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+/// The "keep planning" answer to a plan-exit permission request:
+/// `reject_once` > `reject_always`. `None` (no reject option offered) makes
+/// the caller cancel the request rather than approve it.
+pub(crate) fn preferred_reject_option(options: &[Value]) -> Option<String> {
+    let by_kind = |kind: &str| {
+        options
+            .iter()
+            .find(|o| o.get("kind").and_then(Value::as_str) == Some(kind))
+    };
+    by_kind("reject_once")
+        .or_else(|| by_kind("reject_always"))
+        .map(|o| str_field(o, "optionId"))
+        .filter(|id| !id.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Native plan mode (ARCHITECTURE.md §11.2). Wire shapes verbatim from
+    /// the live grok 1.0.13 capture in tests/fixtures/grok-plan-mode.json.
+    #[test]
+    fn current_mode_update_reports_the_plan_mode_against_the_session_id() {
+        let plan = json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" });
+        assert_eq!(
+            plan_events(&plan, "plan"),
+            vec![AgentEvent::PlanModeChanged { active: true }]
+        );
+        let default = json!({ "sessionUpdate": "current_mode_update", "currentModeId": "default" });
+        assert_eq!(
+            plan_events(&default, "plan"),
+            vec![AgentEvent::PlanModeChanged { active: false }]
+        );
+        // It is still boilerplate to the normal mapping: no chip, no delta.
+        assert_eq!(map_update(&plan), Vec::new());
+    }
+
+    #[test]
+    fn exit_plan_mode_output_publishes_the_plan() {
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "x1",
+            "title": "exit_plan_mode",
+            "status": "completed",
+            "rawOutput": {
+                "type": "PlanReady",
+                "plan_content": "# Plan\n\n1. Ship it.\n",
+                "plan_file_path": "/w/plans/ship.md",
+            },
+        });
+        assert_eq!(
+            plan_events(&update, "plan"),
+            vec![AgentEvent::PlanUpdated {
+                text: "# Plan\n\n1. Ship it.\n".into(),
+                path: Some("/w/plans/ship.md".into()),
+            }]
+        );
+        // Externally tagged variants nest one level deeper.
+        let nested = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "x1",
+            "rawOutput": { "PlanReady": { "planContent": "# Nested\n" } },
+        });
+        assert_eq!(
+            plan_events(&nested, "plan"),
+            vec![AgentEvent::PlanUpdated {
+                text: "# Nested\n".into(),
+                path: None,
+            }]
+        );
+    }
+
+    /// grok's real exit call carries no plan text — the gate request does.
+    /// An empty call must publish nothing rather than an empty plan.
+    #[test]
+    fn a_plan_exit_call_without_content_publishes_nothing() {
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-1",
+            "title": "exit_plan_mode",
+            "rawInput": {},
+            "_meta": { "x.ai/tool": { "name": "exit_plan_mode", "kind": "exit_plan" } },
+        });
+        assert_eq!(plan_events(&update, "plan"), Vec::new());
+        assert!(is_plan_exit_call(
+            &update,
+            &["exit_plan_mode", "ExitPlanMode"]
+        ));
+        // The follow-up update identifies the same tool by its rawInput
+        // variant discriminant (grok stamps `{"variant":"ExitPlanMode"}`).
+        let follow_up = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "kind": "other",
+            "title": "Plan: Exit",
+            "rawInput": { "variant": "ExitPlanMode" },
+        });
+        assert!(is_plan_exit_call(
+            &follow_up,
+            &["exit_plan_mode", "ExitPlanMode"]
+        ));
+        let ordinary = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "ls -la",
+            "kind": "execute",
+        });
+        assert!(!is_plan_exit_call(
+            &ordinary,
+            &["exit_plan_mode", "ExitPlanMode"]
+        ));
+    }
+
+    /// §11.6: both halves of the gate are chip-suppressed — the exit call by
+    /// the spec's tool names, the ENTER call by its own (it has no gate).
+    #[test]
+    fn both_halves_of_the_plan_gate_are_recognized() {
+        let exit = &["exit_plan_mode", "ExitPlanMode"];
+        let enter = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "p0",
+            "title": "enter_plan_mode",
+            "_meta": { "x.ai/tool": { "name": "enter_plan_mode", "kind": "enter_plan" } },
+        });
+        assert!(is_plan_gate_call(&enter, exit));
+        assert!(!is_plan_exit_call(&enter, exit));
+        let enter_update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "p0",
+            "title": "Plan: Enter",
+            "rawInput": { "variant": "EnterPlanMode" },
+        });
+        assert!(is_plan_gate_call(&enter_update, exit));
+        let exit_update = json!({
+            "sessionUpdate": "tool_call_update",
+            "title": "Plan: Exit",
+            "rawInput": { "variant": "ExitPlanMode" },
+        });
+        assert!(is_plan_gate_call(&exit_update, exit));
+        let ordinary = json!({ "sessionUpdate": "tool_call", "title": "read file" });
+        assert!(!is_plan_gate_call(&ordinary, exit));
+    }
+
+    #[test]
+    fn plan_file_edits_are_recognized_and_others_ignored() {
+        assert!(is_plan_file("/w/plans/ship.md"));
+        assert!(is_plan_file("/h/.grok/sessions/%2Ftmp%2Fp/01a0-63/plan.md"));
+        assert!(!is_plan_file("/w/plans/ship.txt"));
+        assert!(!is_plan_file("/w/src/main.rs"));
+        assert!(!is_plan_file("/w/README.md"));
+        // No file behind the path: nothing is published (never a guess).
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "e1",
+            "kind": "edit",
+            "status": "completed",
+            "content": [{
+                "type": "diff",
+                "path": "/nonexistent/plans/gone.md",
+                "oldText": "",
+                "newText": "hunk",
+            }],
+        });
+        assert_eq!(plan_events(&update, "plan"), Vec::new());
+    }
+
+    #[test]
+    fn reject_option_prefers_reject_once_and_never_falls_back_to_allow() {
+        let options = vec![
+            json!({ "optionId": "yes", "name": "Approve", "kind": "allow_once" }),
+            json!({ "optionId": "always", "name": "Always", "kind": "reject_always" }),
+            json!({ "optionId": "keep", "name": "Keep planning", "kind": "reject_once" }),
+        ];
+        assert_eq!(preferred_reject_option(&options), Some("keep".to_owned()));
+        // No reject option at all: the caller cancels, never approves.
+        let allow_only = vec![json!({ "optionId": "yes", "kind": "allow_once" })];
+        assert_eq!(preferred_reject_option(&allow_only), None);
+        assert_eq!(preferred_allow_option(&allow_only), Some("yes".to_owned()));
+    }
 
     #[test]
     fn message_and_thought_chunks_map_to_deltas() {

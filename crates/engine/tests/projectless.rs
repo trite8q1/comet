@@ -166,6 +166,7 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
                     cwd: "~".into(),
                     sandbox: SandboxLevel::WorkspaceWrite,
                     auto_approve: true,
+                    plan_mode: false,
                     attachments: Vec::new(),
                     worktree: None,
                     resume: None,

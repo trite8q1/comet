@@ -250,6 +250,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
             cwd: "~".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
+            plan_mode: false,
             attachments: Vec::new(),
             worktree: None,
             resume: None,

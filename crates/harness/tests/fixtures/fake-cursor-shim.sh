@@ -48,6 +48,23 @@ case "$first" in
   exit 0
   ;;
 
+*scenario:plan*)
+  # Plan mode (ARCHITECTURE.md §11.2, Cursor row): the client owns the mode,
+  # so it must ride the run frame and every send. Append the raw stdin frames
+  # to a log in the run's cwd; the test reads back the `mode` of each. The
+  # `createPlan` call carries the plan the adapter turns into a plan part.
+  printf '%s\n' "$first" >>plan-mode.jsonl
+  emit '{"ev":"ready","agentId":"agent-plan","model":"auto"}'
+  emit '{"ev":"tool","phase":"start","id":"p1","name":"createPlan","args":{"plan":"# Port the veil\n\n1. Move the fade into the row painter.\n"}}'
+  emit '{"ev":"tool","phase":"end","id":"p1","name":"createPlan","args":{"plan":"# Port the veil\n\n1. Move the fade into the row painter.\n"},"error":false}'
+  emit '{"ev":"turn","status":"finished"}'
+  read -r steer || exit 0
+  printf '%s\n' "$steer" >>plan-mode.jsonl
+  emit '{"ev":"text","text":"building it"}'
+  emit '{"ev":"turn","status":"finished"}'
+  exit 0
+  ;;
+
 *scenario:interrupt*)
   emit '{"ev":"ready","agentId":"agent-int","model":"auto"}'
   emit '{"ev":"text","text":"working"}'

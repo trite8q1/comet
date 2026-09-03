@@ -3144,6 +3144,7 @@ impl DocHost {
                     && ws.chat_config(chat_id).is_none()
                 {
                     let config = comet_proto::ChatConfig {
+                        plan_mode: request.plan_mode,
                         harness,
                         model: request.model.clone(),
                         reasoning: request.reasoning,
@@ -3231,6 +3232,78 @@ impl DocHost {
             SessionCommandPayload::Interrupt {} => {
                 sessions.interrupt(chat_id).await?;
                 Ok((SessionCommandStatus::Applied, None))
+            }
+            SessionCommandPayload::SetPlanMode { active } => {
+                // Live run: the adapter applies the CLI's own switch. Idle:
+                // nothing to switch — the next Run carries the config value
+                // the same toggle wrote. Applied either way.
+                let live = sessions.set_plan_mode(chat_id, *active);
+                Ok((
+                    SessionCommandStatus::Applied,
+                    (!live).then(|| "no live run; applies on the next run".to_string()),
+                ))
+            }
+            SessionCommandPayload::RespondPlanExit {
+                request_id,
+                approved,
+                feedback,
+            } => {
+                let decision = comet_proto::PlanDecision {
+                    approved: *approved,
+                    feedback: feedback.clone(),
+                };
+                if sessions.respond_plan_exit(chat_id, request_id, decision)? {
+                    // "Keep planning" feedback is the user's next message,
+                    // on every harness (ARCHITECTURE.md §11.2 "Feedback
+                    // delivery"): the adapter only rejects its gate, and the
+                    // text rides the ordinary steer path — a visible user
+                    // entry, a segment split. A step-boundary steerer
+                    // (Claude) takes it inside the turn, right after the
+                    // rejected gate — its own TUI does exactly this
+                    // (`feedbackIsFromUser`). A turn-boundary agent would
+                    // queue it behind a turn that, after a rejection, goes on
+                    // to ask its own question or raise the gate again — the
+                    // feedback would wait behind the user forever. So that
+                    // turn is cancelled first (the same abort the CLI does)
+                    // and the feedback opens the next one on the resumed
+                    // session; the steer fallback below is that dispatch.
+                    let feedback = feedback
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|f| !f.is_empty() && !*approved);
+                    if let Some(text) = feedback {
+                        let replacing = sessions.steering_mode(chat_id)
+                            != Some(comet_proto::SteeringMode::StepBoundary);
+                        if replacing {
+                            // Replacement, not a Stop: the cancelled turn's
+                            // Idle is suppressed so no "done" chime rings
+                            // over a turn the user did not end.
+                            sessions.interrupt_for_replacement(chat_id).await?;
+                        }
+                        let steer = SessionCommandEntry {
+                            payload: SessionCommandPayload::Steer {
+                                prompt: text.to_owned(),
+                                message_id: Some(crate::new_id()),
+                            },
+                            ..entry.clone()
+                        };
+                        let outcome = Box::pin(self.execute(sessions, handle, &steer)).await;
+                        if replacing && !matches!(outcome, Ok((SessionCommandStatus::Applied, _))) {
+                            sessions.abandon_replacement(chat_id);
+                        }
+                        return outcome;
+                    }
+                    return Ok((SessionCommandStatus::Applied, None));
+                }
+                // No live resolver: the gate's turn is over (run settled,
+                // engine restarted). Unlike an orphan question there is no
+                // turn to re-dispatch the answer into — the harness's own
+                // gate is gone with the process, and re-asking it would be
+                // comet inventing an approval. Reject so the card settles.
+                Ok((
+                    SessionCommandStatus::Rejected,
+                    Some("no pending plan-exit request".into()),
+                ))
             }
             SessionCommandPayload::RespondInput {
                 request_id,
@@ -3413,6 +3486,7 @@ impl DocHost {
                 .map(|c| c.sandbox)
                 .unwrap_or(comet_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
+            plan_mode: config.as_ref().is_some_and(|c| c.plan_mode),
             attachments: Vec::new(),
             resume: None,
             worktree: None,

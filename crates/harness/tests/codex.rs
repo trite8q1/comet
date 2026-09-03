@@ -43,6 +43,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: String::new(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -56,6 +57,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        plan: comet_harness::PlanControls::off(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -374,6 +376,7 @@ async fn approvals_round_trip_as_input_requests() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
+        plan: comet_harness::PlanControls::off(),
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -599,6 +602,104 @@ async fn models_returns_curated_catalog() {
     // lazy descriptor must stay in lockstep).
     assert_eq!(missing.display_name(), "Codex");
     assert_eq!(missing.reasoning_levels().len(), 7);
+}
+
+/// ARCHITECTURE.md §11.2: codex has no client-settable collaboration mode, so
+/// the composer's toggle stays hidden — the descriptor, not the harness id,
+/// decides.
+#[tokio::test]
+async fn plan_mode_is_unsupported_on_the_codex_wire() {
+    assert!(!harness().plan_mode());
+}
+
+/// The READ-ONLY half: a thread codex itself put in plan mode still reports
+/// the mode and renders its plan.
+#[tokio::test]
+async fn plan_item_and_reported_mode_map_to_plan_events() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:plan"), controls).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::PlanModeChanged { active: true })),
+        "thread/settings/updated must report the plan collaboration mode: {events:?}"
+    );
+
+    let plans: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PlanUpdated { text, path } => {
+                assert_eq!(*path, None, "codex keeps no plan file on this wire");
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        plans,
+        vec![
+            // The started item reports nothing; each delta reports the
+            // accumulation so far…
+            "# Plan\n\n",
+            "# Plan\n\n1. Look",
+            // …and the completed item's text is authoritative (the schema
+            // warns the deltas may not concatenate to it).
+            "# Plan\n\n1. Look around\n2. Report back",
+        ],
+        "{events:?}"
+    );
+    // The child thread's plan delta is consumed, never folded into the
+    // parent's plan.
+    assert!(
+        plans.iter().all(|p| !p.contains("child plan")),
+        "{events:?}"
+    );
+}
+
+/// Tripwire (ARCHITECTURE.md §11.2): the day `thread/start`/`turn/start` grow a
+/// collaboration mode, codex gets native plan mode and this test says so.
+/// `cargo test -p comet-harness --test codex -- --ignored live_plan_schema`.
+#[test]
+#[ignore = "runs the real codex CLI to regenerate the app-server JSON schema"]
+fn live_plan_schema_tripwire() {
+    let exe = std::env::var("CODEX_EXECUTABLE").unwrap_or_else(|_| "codex".into());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = match std::process::Command::new(&exe)
+        .args(["app-server", "generate-json-schema", "--out"])
+        .arg(dir.path())
+        .output()
+    {
+        Ok(out) => out,
+        // Not installed on this machine: nothing to check.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("codex not installed — skipping the plan-schema tripwire");
+            return;
+        }
+        Err(e) => panic!("codex app-server generate-json-schema: {e}"),
+    };
+    assert!(
+        out.status.success(),
+        "generate-json-schema failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for params in ["TurnStartParams.json", "ThreadStartParams.json"] {
+        let path = dir.path().join("v2").join(params);
+        let schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {params}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("parse {params}: {e}"));
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{params} has no properties"));
+        assert!(
+            !properties
+                .keys()
+                .any(|k| k == "collaborationMode" || k == "collaboration_mode"),
+            "Codex app-server now accepts a collaboration mode on thread/turn start \
+             — implement native plan mode (ARCHITECTURE.md §11.2)"
+        );
+    }
 }
 
 #[tokio::test]

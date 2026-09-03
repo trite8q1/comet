@@ -81,6 +81,11 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
+    /// The plan mode the user asked for (ARCHITECTURE.md §11.1 "requested
+    /// mode"). The host writes it back to the harness's reported mode, so an
+    /// agent that leaves plan mode itself flips the toggle everywhere.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_mode: bool,
 }
 
 /// Immutable-at-run-start repository context owned by one conversation.

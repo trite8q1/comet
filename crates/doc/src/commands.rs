@@ -21,6 +21,10 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    /// Answer the harness's plan-exit request (ARCHITECTURE.md §11.4).
+    RespondPlanExit,
+    /// Toggle the requested plan mode on a live run.
+    SetPlanMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +58,21 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    /// The card's Approve / Keep planning answer to `PlanExitRequested`;
+    /// host-executed, idempotent by request id like `RespondInput`.
+    #[serde(rename_all = "camelCase")]
+    RespondPlanExit {
+        request_id: String,
+        approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+    },
+    /// The composer toggle while a run is live: the host pushes the mode
+    /// into the run and the adapter applies the CLI's own live switch. An
+    /// idle chat applies nothing (the next Run carries `ChatConfig.plan_mode`).
+    SetPlanMode {
+        active: bool,
+    },
 }
 
 impl SessionCommandPayload {
@@ -63,6 +82,8 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::RespondPlanExit { .. } => SessionCommandKind::RespondPlanExit,
+            SessionCommandPayload::SetPlanMode { .. } => SessionCommandKind::SetPlanMode,
         }
     }
 }
@@ -149,7 +170,7 @@ pub fn evaluate_command(
     let kind = entry.kind();
     if matches!(
         kind,
-        SessionCommandKind::Steer | SessionCommandKind::Interrupt
+        SessionCommandKind::Steer | SessionCommandKind::Interrupt | SessionCommandKind::SetPlanMode
     ) {
         let has_newer_same_kind = cx.entries.iter().any(|other| {
             other.id != entry.id
@@ -219,6 +240,53 @@ mod tests {
     }
 
     const NEVER: fn(&str) -> bool = |_| false;
+
+    /// ARCHITECTURE.md §11.3 ledger payloads: kinds, wire shape, and the
+    /// supersede rule (a newer toggle wins; an answer never supersedes).
+    #[test]
+    fn plan_commands_have_kinds_and_toggle_supersedes() {
+        let answer = SessionCommandPayload::RespondPlanExit {
+            request_id: "r1".into(),
+            approved: false,
+            feedback: Some("shorter".into()),
+        };
+        assert_eq!(answer.kind(), SessionCommandKind::RespondPlanExit);
+        let json = serde_json::to_value(&answer).unwrap();
+        assert_eq!(json["kind"], "respondPlanExit");
+        assert_eq!(json["requestId"], "r1");
+        assert_eq!(json["feedback"], "shorter");
+        let round: SessionCommandPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(round, answer);
+        let toggle = SessionCommandPayload::SetPlanMode { active: true };
+        assert_eq!(toggle.kind(), SessionCommandKind::SetPlanMode);
+        assert_eq!(
+            serde_json::to_value(&toggle).unwrap(),
+            serde_json::json!({ "kind": "setPlanMode", "active": true })
+        );
+
+        let older = entry(
+            "c1",
+            SessionCommandPayload::SetPlanMode { active: true },
+            1_000,
+        );
+        let newer = entry(
+            "c2",
+            SessionCommandPayload::SetPlanMode { active: false },
+            2_000,
+        );
+        let entries = vec![older.clone(), newer.clone()];
+        let ctx = cx(&entries, &NEVER, &NEVER, 3_000, None);
+        assert_eq!(
+            evaluate_command(&older, &ctx),
+            CommandDisposition::Superseded
+        );
+        assert_eq!(evaluate_command(&newer, &ctx), CommandDisposition::Execute);
+        let a1 = entry("a1", answer.clone(), 1_000);
+        let a2 = entry("a2", answer, 2_000);
+        let entries = vec![a1.clone(), a2];
+        let ctx = cx(&entries, &NEVER, &NEVER, 3_000, None);
+        assert_eq!(evaluate_command(&a1, &ctx), CommandDisposition::Execute);
+    }
 
     #[test]
     fn processed_commands_are_skipped() {
@@ -311,6 +379,7 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
             auto_approve: false,
+            plan_mode: false,
             attachments: Vec::new(),
             worktree: None,
             resume: None,

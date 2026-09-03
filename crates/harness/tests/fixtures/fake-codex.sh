@@ -128,6 +128,22 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 
+*scenario:plan*)
+  # Plan mode's READ-ONLY half (ARCHITECTURE.md §11.2): codex reports the
+  # collaboration mode and streams a plan item; nothing sets the mode.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  emit '{"method":"thread/settings/updated","params":{"threadId":"th-1","threadSettings":{"model":"gpt-5.6-sol","collaborationMode":{"mode":"plan","settings":{"model":"gpt-5.6-sol"}}}}}'
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"id":"p1","type":"plan","text":""}}}'
+  emit '{"method":"item/plan/delta","params":{"threadId":"th-1","turnId":"t-1","itemId":"p1","delta":"# Plan\n\n"}}'
+  emit '{"method":"item/plan/delta","params":{"threadId":"th-1","turnId":"t-1","itemId":"p1","delta":"1. Look"}}'
+  # A CHILD thread's plan traffic must never reach the parent's plan.
+  emit '{"method":"item/plan/delta","params":{"threadId":"child-1","turnId":"ct-1","itemId":"cp1","delta":"child plan"}}'
+  # The completed item is authoritative — deltas need not concatenate to it.
+  emit '{"method":"item/completed","params":{"threadId":"th-1","item":{"id":"p1","type":"plan","text":"# Plan\n\n1. Look around\n2. Report back"}}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  ;;
+
 *scenario:subagent*)
   # Multi-agent v2 child-thread routing: registration via subAgentActivity,
   # tagged child items, consumed child turn bookkeeping (must never settle

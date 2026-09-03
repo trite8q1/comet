@@ -1,8 +1,8 @@
 //! Frame → [`AgentEvent`] normalization (init dedupe, subagent tagging, tool
 //! decoding, error-code mapping).
 
-use serde_json::Value;
 use comet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use serde_json::Value;
 
 use super::wire::{ContentBlock, Frame};
 
@@ -249,9 +249,7 @@ impl Normalizer {
                         return Vec::new();
                     }
                     let status = match f.status.as_deref().unwrap_or("") {
-                        "completed" | "complete" | "succeeded" | "success" => {
-                            DoneStatus::Completed
-                        }
+                        "completed" | "complete" | "succeeded" | "success" => DoneStatus::Completed,
                         "failed" | "errored" | "error" => DoneStatus::Errored,
                         "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
                             DoneStatus::Interrupted
@@ -288,14 +286,24 @@ impl Normalizer {
                 }
                 self.saw_init = true;
                 self.session_id = Some(f.session_id.clone());
-                vec![AgentEvent::SessionStarted {
-                    harness: HarnessId::ClaudeCode,
-                    model: f.model,
-                    tools: f.tools,
-                    cwd: f.cwd,
-                    session_id: f.session_id,
-                    assistant_message_id: self.assistant_message_id.clone(),
-                }]
+                // `permissionMode` is the CLI's own report of the mode it
+                // started in (ARCHITECTURE.md §11.1 "reported mode"), so the
+                // toggle follows the harness from the first frame. It rides
+                // AFTER SessionStarted — that event is the fold's run
+                // boundary.
+                vec![
+                    AgentEvent::SessionStarted {
+                        harness: HarnessId::ClaudeCode,
+                        model: f.model,
+                        tools: f.tools,
+                        cwd: f.cwd,
+                        session_id: f.session_id,
+                        assistant_message_id: self.assistant_message_id.clone(),
+                    },
+                    AgentEvent::PlanModeChanged {
+                        active: f.permission_mode == "plan",
+                    },
+                ]
             }
 
             // Frames with `parent_tool_use_id` set belong to a SUBAGENT's
@@ -411,12 +419,14 @@ impl Normalizer {
                             .flatten()
                             .and_then(Value::as_str)
                             .filter(|p| !p.trim().is_empty())
-                            .map(|prompt| tag(
-                                &b.id,
-                                AgentEvent::UserMessage {
-                                    text: prompt.to_owned(),
-                                },
-                            ));
+                            .map(|prompt| {
+                                tag(
+                                    &b.id,
+                                    AgentEvent::UserMessage {
+                                        text: prompt.to_owned(),
+                                    },
+                                )
+                            });
                         // A SendMessage steer never echoes on the child feed
                         // (live-verified) — surface it from the parent's own
                         // call, re-keyed onto the spawn it addresses.
@@ -597,7 +607,7 @@ impl Normalizer {
             }
 
             // Control frames are handled by the run loop, not normalized.
-            Frame::ControlRequest(_) | Frame::Other => Vec::new(),
+            Frame::ControlRequest(_) | Frame::ControlResponse(_) | Frame::Other => Vec::new(),
         }
     }
 }
@@ -790,8 +800,7 @@ mod tests {
         ] {
             let ev = normalize_one(frame);
             assert!(
-                !ev.iter()
-                    .any(|e| matches!(e, AgentEvent::Subagent { .. })),
+                !ev.iter().any(|e| matches!(e, AgentEvent::Subagent { .. })),
                 "{frame}: {ev:?}"
             );
         }
@@ -967,10 +976,12 @@ mod tests {
             r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_agent","status":"running"}"#,
         )
         .is_empty());
-        assert!(normalize_one(
-            r#"{"type":"system","subtype":"task_notification","status":"completed"}"#,
-        )
-        .is_empty());
+        assert!(
+            normalize_one(
+                r#"{"type":"system","subtype":"task_notification","status":"completed"}"#,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1025,7 +1036,11 @@ mod tests {
         let mut norm = Normalizer::new();
         let init = r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s1"}"#;
         let frame = crate::claude::wire::parse_frame(init).unwrap();
-        assert_eq!(norm.normalize(frame, false).len(), 1, "first init");
+        assert_eq!(
+            norm.normalize(frame, false).len(),
+            2,
+            "first init: SessionStarted + the reported permission mode"
+        );
         let frame = crate::claude::wire::parse_frame(init).unwrap();
         assert!(
             norm.normalize(frame, false).is_empty(),

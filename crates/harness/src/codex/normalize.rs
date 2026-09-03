@@ -211,6 +211,19 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 .collect();
             tool_lifecycle(phase, id, ToolCall::Todo { items }, false)
         }
+        // EXPERIMENTAL plan item (ARCHITECTURE.md §11.2). The COMPLETED item is
+        // authoritative and, per the schema's own warning, may not equal the
+        // concatenation of the `item/plan/delta` stream — so only this phase
+        // reports, and it overwrites whatever the deltas accumulated. The
+        // started item carries no text worth reporting (it would blank the
+        // card the deltas are filling).
+        "plan" => match phase {
+            Phase::Started => Vec::new(),
+            Phase::Completed => vec![AgentEvent::PlanUpdated {
+                text: str_field(item, &["text"]),
+                path: None,
+            }],
+        },
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
         }],
@@ -241,6 +254,20 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
         // (mod.rs child branch), not here.
         _ => Vec::new(),
     }
+}
+
+/// `thread/settings/updated` → the harness's REPORTED plan mode
+/// (ARCHITECTURE.md §11.1). Codex 0.151+ carries `collaborationMode` read-only
+/// inside `ThreadSettings`; nothing on the wire SETS it, which is why the
+/// harness reports `plan_mode() == false`.
+pub(crate) fn plan_mode_event(params: &Value) -> Option<AgentEvent> {
+    let settings = field(params, &["threadSettings", "thread_settings"])?;
+    let mode = field(settings, &["collaborationMode", "collaboration_mode"])?
+        .get("mode")?
+        .as_str()?;
+    Some(AgentEvent::PlanModeChanged {
+        active: mode == "plan",
+    })
 }
 
 /// The text of a `userMessage` thread item. Codex builds have carried both
@@ -506,6 +533,66 @@ mod tests {
     }
 
     #[test]
+    fn plan_item_reports_only_the_authoritative_completed_text() {
+        // The started item would blank the card the deltas are filling.
+        assert_eq!(
+            map_item(
+                Phase::Started,
+                &json!({"type": "plan", "id": "p1", "text": ""})
+            ),
+            Vec::new()
+        );
+        assert_eq!(
+            map_item(
+                Phase::Completed,
+                &json!({"type": "plan", "id": "p1", "text": "# Plan\n\n1. Ship it"})
+            ),
+            vec![AgentEvent::PlanUpdated {
+                text: "# Plan\n\n1. Ship it".into(),
+                path: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn thread_settings_report_the_collaboration_mode() {
+        let settings = |mode: &str| {
+            json!({"threadId": "th-1", "threadSettings": {"collaborationMode": {
+                "mode": mode,
+                "settings": {"model": "gpt-5.6-sol"},
+            }}})
+        };
+        assert_eq!(
+            plan_mode_event(&settings("plan")),
+            Some(AgentEvent::PlanModeChanged { active: true })
+        );
+        assert_eq!(
+            plan_mode_event(&settings("default")),
+            Some(AgentEvent::PlanModeChanged { active: false })
+        );
+        // A settings update without the block says nothing about the mode.
+        assert_eq!(
+            plan_mode_event(&json!({"threadId": "th-1", "threadSettings": {"model": "x"}})),
+            None
+        );
+        assert_eq!(plan_mode_event(&json!({"threadId": "th-1"})), None);
+    }
+
+    #[test]
+    fn child_plan_deltas_are_consumed() {
+        // A subagent's plan has no consumer on this wire; the parent thread's
+        // plan is the one that renders (ARCHITECTURE.md §11.2).
+        assert_eq!(
+            route_child_notification("item/plan/delta"),
+            ChildRoute::Consumed
+        );
+        assert_eq!(
+            route_child_notification("thread/settings/updated"),
+            ChildRoute::Consumed
+        );
+    }
+
+    #[test]
     fn child_routing_table_fails_open_to_parent() {
         // Child content/lifecycle → the subagent path, deltas included
         // (live-verified: child threads stream them on this wire).
@@ -551,10 +638,16 @@ mod tests {
             Some("th-c".into())
         );
         assert_eq!(
-            notification_thread_id("turn/completed", &json!({"threadId": "th-1", "turn": {"id": "t"}})),
+            notification_thread_id(
+                "turn/completed",
+                &json!({"threadId": "th-1", "turn": {"id": "t"}})
+            ),
             Some("th-1".into())
         );
-        assert_eq!(notification_thread_id("error", &json!({"message": "x"})), None);
+        assert_eq!(
+            notification_thread_id("error", &json!({"message": "x"})),
+            None
+        );
     }
 
     #[test]

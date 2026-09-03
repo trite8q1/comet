@@ -105,10 +105,18 @@ elif has "$line" '"method":"session/new"'; then
   # forcing a set) and thought_level (current high). The model config option
   # feeds discovery first; the first-class `models` state (SessionModelState)
   # is the legacy fallback — codex-acp enumerates model × effort there.
+  # Generic-ACP plan discovery: `comet-acp-modes` in the cwd holds the ACP
+  # SessionModeState the agent advertises ({currentModeId, availableModes}).
+  # Grok advertises none — verified live, 1.0.13 — so the file is absent for
+  # every grok scenario.
+  MODES=""
+  if [ -f ./comet-acp-modes ]; then
+    MODES=",\"modes\":$(tr -d '\n' < ./comet-acp-modes)"
+  fi
   if [ "$MODEL_API" -eq 1 ]; then
-    emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"currentModelId\":\"grok-4-fast\",\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]}}}"
+    emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\"$MODES,\"models\":{\"currentModelId\":\"grok-4-fast\",\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]}}}"
   else
-    emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}],\"currentModelId\":\"grok-4.5\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
+    emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\"$MODES,\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}],\"currentModelId\":\"grok-4.5\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
   fi
   if [ -f ./comet-skill-probe ]; then
     # Record the cwd the client asked for: grok's catalog is cwd-scoped, so
@@ -120,15 +128,22 @@ else
   exit 1
 fi
 
-# ---- model/config sets (0..n), then the first turn ---------------------------
+# ---- mode/model/config sets (0..n), then the first turn ---------------------
+# Native plan mode: `session/set_mode` lands here, right after session/new and
+# ahead of the model/config sets (ARCHITECTURE §11.4 step 1). Grok answers it
+# with `{}` — verified live, 1.0.13.
 CONFIG_SETS=""
 MODEL_SETS=""
+MODE_SETS=""
 read -r promptline || exit 1
 while has "$promptline" '"method":"session/set_config_option"' \
-  || has "$promptline" '"method":"session/set_model"'; do
+  || has "$promptline" '"method":"session/set_model"' \
+  || has "$promptline" '"method":"session/set_mode"'; do
   emit "{\"id\":$(rid "$promptline"),\"result\":{}}"
   if has "$promptline" '"method":"session/set_model"'; then
     MODEL_SETS="$MODEL_SETS $promptline"
+  elif has "$promptline" '"method":"session/set_mode"'; then
+    MODE_SETS="$MODE_SETS $promptline"
   else
     CONFIG_SETS="$CONFIG_SETS $promptline"
   fi
@@ -455,6 +470,150 @@ case "$promptline" in
   update '{"sessionUpdate":"tool_call_update","toolCallId":"th-1","status":"completed","content":[]}'
   sleep 4
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"finished"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+# ---- native plan mode (ARCHITECTURE.md §11) --------------------------------
+# Wire shapes captured live against grok 1.0.13 (see
+# tests/fixtures/grok-plan-mode.json): `session/set_mode {"modeId":"plan"}`
+# is answered `{}` although `session/new` advertises no `modes`; the reported
+# mode rides `current_mode_update`; the exit gate is grok's own
+# `_x.ai/exit_plan_mode` reverse request, NOT `session/request_permission`.
+
+*scenario:plan-modes*)
+  # Generic-ACP discovery: report whether a `set_mode` was sent at all, so a
+  # `modes` advertisement WITHOUT a plan id can be proven inert.
+  if [ -n "$MODE_SETS" ]; then
+    mode=$(printf '%s' "$MODE_SETS" | sed 's/.*"modeId":"\([^"]*\)".*/\1/')
+    update "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"setmode:$mode\"}}"
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"nosetmode"}}'
+  fi
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:plan-mode*)
+  # The run asked for plan mode: `set_mode plan` must have landed already.
+  if has "$MODE_SETS" '"modeId":"plan"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"planning"}}'
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  else
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
+  fi
+  ;;
+
+*scenario:plan-toggle*)
+  # The composer toggled plan mode OFF mid-run: the live switch is
+  # `session/set_mode` with the agent's non-plan id, and the agent's own
+  # `current_mode_update` reports the result.
+  update '{"sessionUpdate":"current_mode_update","currentModeId":"plan"}'
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"planning"}}'
+  read -r toggle || exit 1
+  if has "$toggle" '"method":"session/set_mode"'; then
+    emit "{\"id\":$(rid "$toggle"),\"result\":{}}"
+    mode=$(printf '%s' "$toggle" | sed 's/.*"modeId":"\([^"]*\)".*/\1/')
+    update "{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"$mode\"}"
+    update "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"switched:$mode\"}}"
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  else
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
+  fi
+  ;;
+
+*scenario:plan-exit*)
+  update '{"sessionUpdate":"current_mode_update","currentModeId":"plan"}'
+  update '{"sessionUpdate":"tool_call","toolCallId":"x1","title":"exit_plan_mode","rawInput":{},"_meta":{"x.ai/tool":{"version":1,"name":"exit_plan_mode","kind":"exit_plan","namespace":"grok_build","label":"Exit Plan Mode","read_only":true}}}'
+  emit "{\"id\":0,\"method\":\"_x.ai/exit_plan_mode\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"x1\",\"planContent\":\"# Plan\\n\\n1. Rename README.md to README2.md.\\n\"}}"
+  read -r ans || exit 1
+  # grok's ExitPlanModeExtResponse. `approved:false` is "keep planning": the
+  # tool result says so and plan mode stays active (verified live).
+  { has "$ans" '"id":0' && has "$ans" '"approved":false' && has "$ans" '"abandoned":false'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"x1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"The user wants to revise the plan. Ask the user what changes they would like to make."}}]}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  # The decision's feedback is the ENGINE's to deliver, as the user's next
+  # message through the ordinary steer path (§11.2 "Feedback delivery"): the
+  # adapter must send NO prompt of its own. Anything that arrives here would
+  # be one, so say so loudly instead of ending the turn quietly.
+  read -r next || exit 0
+  if has "$next" '"method":"session/prompt"'; then
+    npid=$(rid "$next")
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"unexpected-prompt"}}'
+    emit "{\"id\":$npid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  fi
+  ;;
+
+*scenario:plan-chips*)
+  # The enter/exit gate tools (§11.6): the plan card represents them, so
+  # neither may fold into a tool chip — while an ordinary tool in the same
+  # turn still does. Shapes verbatim from grok 1.0.13.
+  update '{"sessionUpdate":"tool_call","toolCallId":"p0","title":"enter_plan_mode","rawInput":{},"_meta":{"x.ai/tool":{"version":1,"name":"enter_plan_mode","kind":"enter_plan","namespace":"grok_build","label":"Enter Plan Mode","read_only":true}}}'
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"p0","kind":"other","status":"completed","title":"Plan: Enter","rawInput":{"variant":"EnterPlanMode"},"_meta":{"x.ai/tool":{"version":1,"name":"enter_plan_mode","kind":"enter_plan"}}}'
+  update '{"sessionUpdate":"current_mode_update","currentModeId":"plan"}'
+  update '{"sessionUpdate":"tool_call","toolCallId":"r1","title":"read file","kind":"read","status":"completed","rawInput":{"path":"/w/a.rs"}}'
+  update '{"sessionUpdate":"tool_call","toolCallId":"x1","title":"exit_plan_mode","rawInput":{},"_meta":{"x.ai/tool":{"version":1,"name":"exit_plan_mode","kind":"exit_plan","namespace":"grok_build","label":"Exit Plan Mode","read_only":true}}}'
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"x1","kind":"other","status":"completed","title":"Plan: Exit","rawInput":{"variant":"ExitPlanMode"},"_meta":{"x.ai/tool":{"version":1,"name":"exit_plan_mode","kind":"exit_plan"}}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+# ---- grok's ask-the-user extension (_x.ai/ask_user_question) ---------------
+# Live-captured against grok 1.0.13: a reverse request carrying `questions`
+# with `{label, description}` options, answered with the internally tagged
+# `AskUserQuestionExtResponse` (`{"outcome":"accepted","answers":{…}}`, keyed
+# by the question TEXT). The reply lands verbatim in ./ask-reply.txt so the
+# test can pin the wire shape byte for byte.
+
+*scenario:ask-user*)
+  emit "{\"id\":0,\"method\":\"_x.ai/ask_user_question\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"call-1-0\",\"questions\":[{\"question\":\"Which color do you prefer, red or blue?\",\"options\":[{\"label\":\"Red\",\"description\":\"Prefer red\"},{\"label\":\"Blue\",\"description\":\"Prefer blue\"}],\"multiSelect\":null}],\"mode\":\"default\"}}"
+  read -r ans || exit 1
+  printf '%s' "$ans" > ./ask-reply.txt
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:ask-multi*)
+  emit "{\"id\":0,\"method\":\"_x.ai/ask_user_question\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"call-2-0\",\"questions\":[{\"question\":\"Which colors do you like?\",\"options\":[{\"label\":\"Red\",\"description\":\"Prefer red\"},{\"label\":\"Blue\",\"description\":\"Prefer blue\"}],\"multiSelect\":true}],\"mode\":\"default\",\"_meta\":{\"x.ai/tool\":{\"name\":\"ask_user_question\",\"kind\":\"ask_user\",\"label\":\"Ask User\"}}}}"
+  read -r ans || exit 1
+  printf '%s' "$ans" > ./ask-reply.txt
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:plan-approve*)
+  update '{"sessionUpdate":"current_mode_update","currentModeId":"plan"}'
+  emit "{\"id\":0,\"method\":\"_x.ai/exit_plan_mode\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"x1\",\"planContent\":\"# Plan\\n\\n1. Ship it.\\n\"}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":0' && has "$ans" '"approved":true'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  # An approved exit leaves plan mode on the agent's own signal.
+  update '{"sessionUpdate":"current_mode_update","currentModeId":"default"}'
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"building"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:plan-permission*)
+  # The generic ACP shape: the exit gate as a `session/request_permission`.
+  update '{"sessionUpdate":"current_mode_update","currentModeId":"plan"}'
+  # An ORDINARY permission still auto-accepts, plan mode or not (§11.2
+  # "Permissions elsewhere unchanged").
+  emit "{\"id\":70,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t0\",\"title\":\"ls -la\",\"kind\":\"execute\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
+  read -r ord || exit 1
+  { has "$ord" '"id":70' && has "$ord" '"optionId":"always"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  # The plan text rides the exit tool's own output.
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"x1","title":"exit_plan_mode","status":"completed","rawOutput":{"type":"PlanReady","plan_content":"# Plan\n\n1. Ship it.\n","plan_file_path":"/w/plans/ship.md"}}'
+  emit "{\"id\":71,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"x1\",\"title\":\"exit_plan_mode\",\"kind\":\"other\"},\"options\":[{\"optionId\":\"yes\",\"name\":\"Approve\",\"kind\":\"allow_once\"},{\"optionId\":\"keep\",\"name\":\"Keep planning\",\"kind\":\"reject_once\"}]}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":71' && has "$ans" '"optionId":"keep"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"still planning"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:plan-file*)
+  # grok writes the plan to a file and edits it with a normal edit tool; the
+  # FILE (not the hunk) is the plan, so the adapter re-reads it from disk.
+  update "{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"e1\",\"kind\":\"edit\",\"status\":\"completed\",\"content\":[{\"type\":\"diff\",\"path\":\"$PWD/plans/build.md\",\"oldText\":\"\",\"newText\":\"a stale hunk, not the plan\"}]}"
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 

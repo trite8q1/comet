@@ -32,6 +32,9 @@ use comet_rpc::methods;
 const MAX_REF_ROWS: usize = 300;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+/// The harness brand marks live with the icon set (every surface resolves
+/// them there); the pickers re-export the one they and their callers use.
+pub(crate) use crate::icons::harness_brand_icon;
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
@@ -88,6 +91,8 @@ pub struct DraftConfig {
     pub branch: Option<String>,
     /// Where the new session runs (the t3code env-mode).
     pub checkout: CheckoutKind,
+    /// Start the session in the harness's own plan mode (ARCHITECTURE.md §11).
+    pub plan_mode: bool,
 }
 
 /// Where a new session runs (t3code's env-mode: `local | worktree`). "Current
@@ -127,12 +132,15 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// The requested plan mode this send carries (`RunRequest.plan_mode`).
+    pub plan_mode: bool,
 }
 
 impl ResolvedRunConfig {
     /// The `ChatConfig` recorded on `Mutate createChat` (needs a known harness).
     pub fn chat_config(&self) -> Option<ChatConfig> {
         Some(ChatConfig {
+            plan_mode: self.plan_mode,
             harness: self.harness?,
             model: self.model.clone(),
             reasoning: self.reasoning,
@@ -489,6 +497,9 @@ pub struct Pickers {
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
     mutate_task: Option<Task<()>>,
+    /// The in-flight `SetPlanMode` QueueCommand (its own slot: toggling plan
+    /// mode writes the config AND pushes the live run in one gesture).
+    plan_task: Option<Task<()>>,
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
@@ -634,6 +645,7 @@ impl Pickers {
             switch_task: None,
             switch_error: None,
             mutate_task: None,
+            plan_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
@@ -754,6 +766,36 @@ impl Pickers {
         }
     }
 
+    /// Effective plan mode: the chat's own requested bit — which the host
+    /// also reconciles to whatever the harness REPORTS, so an agent leaving
+    /// plan mode by itself flips the chip here — or the draft on the
+    /// new-chat canvas.
+    fn effective_plan_mode(&self, cx: &App) -> bool {
+        match self.state.read(cx).selected_chat_row() {
+            Some(chat) => chat.config.as_ref().is_some_and(|c| c.plan_mode),
+            None => self.config.plan_mode,
+        }
+    }
+
+    /// Whether plan mode is offered at all right now — the resolved
+    /// harness's own descriptor advertises one. The chip's gate, shared with
+    /// the composer's `/plan` builtin (§11.9).
+    pub fn offers_plan_mode(&self, cx: &App) -> bool {
+        plan_mode_offered(
+            self.effective_harness(cx),
+            self.harnesses.ready().map(Vec::as_slice),
+        )
+    }
+
+    /// Enter plan mode through the chip's own path, so `/plan` writes
+    /// `SetChatConfig` and pushes `SetPlanMode` into a live run exactly as a
+    /// click does (§11.9: the command IS the toggle). Already on: no-op.
+    pub fn enter_plan_mode(&mut self, cx: &mut Context<Self>) {
+        if !self.effective_plan_mode(cx) {
+            self.toggle_plan_mode(cx);
+        }
+    }
+
     /// The explicit (non-default) option picks: the chat's persisted
     /// selections for existing chats, the draft's for the new-chat canvas.
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
@@ -802,6 +844,7 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            plan_mode: self.effective_plan_mode(cx),
         }
     }
 
@@ -1397,6 +1440,43 @@ impl Pickers {
                 .insert(option_id, serde_json::Value::String(choice_id));
         }
         cx.notify();
+    }
+
+    /// Flip the harness's own plan mode for this chat. An existing chat writes
+    /// the requested bit (`SetChatConfig`, LWW across devices) AND pushes it
+    /// into whatever is running (`SetPlanMode`); the new-chat canvas only
+    /// moves the draft the first send carries.
+    fn toggle_plan_mode(&mut self, cx: &mut Context<Self>) {
+        let active = !self.effective_plan_mode(cx);
+        if self.state.read(cx).selected_chat.is_some() {
+            self.update_chat_config(cx, move |config| config.plan_mode = active);
+            self.queue_plan_mode(active, cx);
+        } else {
+            self.config.plan_mode = active;
+        }
+        cx.notify();
+    }
+
+    /// Push the mode into a live run through the ledger — the same
+    /// `QueueCommand` the composer sends a Run with. Harmless when the
+    /// session is idle: the host applies it as a no-op and the next Run
+    /// carries the config value instead.
+    fn queue_plan_mode(&mut self, active: bool, cx: &mut Context<Self>) {
+        let (Some(chat_id), Some(engine)) =
+            (self.state.read(cx).selected_chat.clone(), self.engine(cx))
+        else {
+            return;
+        };
+        let command = comet_doc::SessionCommandPayload::SetPlanMode { active };
+        let Ok(command) = serde_json::to_value(&command) else {
+            return;
+        };
+        let params = serde_json::json!({ "chatId": chat_id, "command": command });
+        self.plan_task = Some(cx.spawn(async move |_, _| {
+            if let Err(err) = engine.client().call(methods::QUEUE_COMMAND, params).await {
+                tracing::warn!(error = %err, "SetPlanMode queue failed");
+            }
+        }));
     }
 
     /// Apply `change` to the selected chat's effective config and persist it:
@@ -2214,6 +2294,52 @@ impl Pickers {
                         .child(suffix),
                 )
             })
+    }
+
+    /// The plan-mode toggle: the pickers' own ghost pill, but a switch rather
+    /// than a menu — the accent plate is the "this session is planning" state.
+    fn plan_chip(
+        &self,
+        active: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        const ID: &str = "picker-plan";
+        div()
+            .id(ID)
+            .h(px(32.0))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0))
+            .rounded(px(8.0))
+            .text_size(crate::typography::ui_rems(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(if active {
+                theme.accent
+            } else {
+                motion::hover_blend(ID, theme.text_muted, theme.text)
+            })
+            .bg(if active {
+                theme.accent.opacity(0.14)
+            } else {
+                motion::hover_blend(ID, gpui::transparent_black(), theme.element_hover)
+            })
+            .on_hover(motion::hover_listener(ID))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_plan_mode(cx)))
+            .child(
+                crate::icons::icon(crate::icons::CHECKLIST)
+                    .size(px(16.0))
+                    .text_color(if active {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    }),
+            )
+            .child(SharedString::from("Plan"))
     }
 
     /// A footer-row trigger (t3code ghost `Button size="xs"`): leading icon,
@@ -3806,24 +3932,6 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
         .collect()
 }
 
-pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
-    match harness {
-        HarnessId::ClaudeCode | HarnessId::Mock => (
-            crate::icons::CLAUDE_MARK,
-            Some(crate::icons::claude_brand()),
-        ),
-        HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
-        HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
-        // Monochrome mark, tinted by the surface like OpenAI's.
-        HarnessId::Grok => (crate::icons::GROK_MARK, None),
-        // Nous Research's mark (the Hermes product icon), monochrome.
-        HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
-        HarnessId::Pi => (crate::icons::PI_MARK, None),
-        // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
-        HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
-    }
-}
-
 /// `COMET_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
 /// production launches never set it, so the mock never surfaces there.
 fn mock_harness_enabled() -> bool {
@@ -3880,6 +3988,17 @@ fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
 }
 
 /// Attach the (single) open popover overlay to its trigger chip.
+/// Whether the composer offers the plan toggle: the RESOLVED harness's own
+/// descriptor says it has a plan mode. Descriptor-gated, never by harness
+/// identity — a CLI whose wire has no plan-mode entry point reports `false`
+/// and the toggle simply isn't there (ARCHITECTURE.md §11.6).
+pub fn plan_mode_offered(harness: Option<HarnessId>, list: Option<&[HarnessDescriptor]>) -> bool {
+    let (Some(harness), Some(list)) = (harness, list) else {
+        return false;
+    };
+    list.iter().any(|d| d.id == harness && d.plan_mode)
+}
+
 fn attach_overlay(
     chip: gpui::Stateful<gpui::Div>,
     overlay: &mut Option<(PickerKind, AnyElement)>,
@@ -4078,12 +4197,18 @@ impl Render for Pickers {
             &theme,
             cx,
         );
+        // Plan toggle: only for a harness whose own descriptor advertises a
+        // plan mode, and always beside the run-identity chip it qualifies.
+        let plan_chip = self
+            .offers_plan_mode(cx)
+            .then(|| self.plan_chip(self.effective_plan_mode(cx), &theme, cx));
         let right = div()
             .flex()
             .flex_row()
             .items_center()
             .flex_none()
             .gap(px(4.0))
+            .children(plan_chip)
             // End-anchored: the menu's right edge sits flush with the chip's
             // right edge (user request), same as the footer's ref popover.
             .child(attach_overlay_end(
@@ -4126,6 +4251,7 @@ mod tests {
 
     fn descriptor(id: HarnessId, name: &str) -> HarnessDescriptor {
         HarnessDescriptor {
+            plan_mode: false,
             id,
             name: name.into(),
             installed: true,
@@ -4545,6 +4671,35 @@ mod tests {
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
     }
 
+    /// ARCHITECTURE.md §11.6: the toggle is DESCRIPTOR-gated. A harness whose
+    /// wire has no plan-mode entry point reports `plan_mode: false` and the
+    /// chip simply isn't offered — nothing here knows a harness by name.
+    #[test]
+    fn plan_toggle_follows_the_harness_descriptor() {
+        let mut planner = descriptor(HarnessId::ClaudeCode, "Claude Code");
+        planner.plan_mode = true;
+        let plain = descriptor(HarnessId::Codex, "Codex");
+        let list = vec![planner, plain];
+        assert!(plan_mode_offered(Some(HarnessId::ClaudeCode), Some(&list)));
+        assert!(!plan_mode_offered(Some(HarnessId::Codex), Some(&list)));
+        // Harness not in the catalog, catalog still loading, or no harness
+        // resolved yet: nothing to conclude, so no chip.
+        assert!(!plan_mode_offered(Some(HarnessId::Cursor), Some(&list)));
+        assert!(!plan_mode_offered(Some(HarnessId::ClaudeCode), None));
+        assert!(!plan_mode_offered(None, Some(&list)));
+    }
+
+    #[test]
+    fn resolved_chat_config_carries_the_plan_bit() {
+        let mut resolved = ResolvedRunConfig {
+            harness: Some(HarnessId::ClaudeCode),
+            ..Default::default()
+        };
+        assert!(!resolved.chat_config().expect("harness set").plan_mode);
+        resolved.plan_mode = true;
+        assert!(resolved.chat_config().expect("harness set").plan_mode);
+    }
+
     #[test]
     fn default_model_is_first_catalog_row() {
         let models = vec![
@@ -4600,6 +4755,7 @@ mod tests {
     #[test]
     fn mock_harness_hidden_unless_alone() {
         let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
+            plan_mode: false,
             id,
             name: name.into(),
             supports_steering: true,
@@ -4626,6 +4782,7 @@ mod tests {
     #[test]
     fn offered_harnesses_follow_the_catalog_enabled_flags() {
         let descriptor = |id: HarnessId, name: &str, enabled: Option<bool>| HarnessDescriptor {
+            plan_mode: false,
             id,
             name: name.into(),
             supports_steering: true,
@@ -4678,6 +4835,7 @@ mod tests {
     fn offered_harnesses_require_an_installed_cli() {
         let descriptor =
             |id: HarnessId, name: &str, enabled: Option<bool>, installed: bool| HarnessDescriptor {
+                plan_mode: false,
                 id,
                 name: name.into(),
                 supports_steering: true,

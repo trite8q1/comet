@@ -3,18 +3,19 @@
 //! A live smoke test against the real CLI lives at the bottom, `#[ignore]`d.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use comet_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, PlanDecision, RunRequest, SandboxLevel, ToolCall,
+    UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -44,6 +45,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -57,6 +59,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        plan: comet_harness::PlanControls::off(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -287,6 +290,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
+        plan: comet_harness::PlanControls::off(),
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -739,6 +743,366 @@ async fn slash_invocation_is_passed_through_unchanged_parity() {
             "the invocation reaches the CLI verbatim — no expansion, no skill frame"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Native plan mode (ARCHITECTURE.md §11.2)
+// ---------------------------------------------------------------------------
+
+/// The plan-mode test rig: [`RunControls`] plus the handles a test drives them
+/// with — the composer's toggle, the interrupt, and a count of how many times
+/// the exit gate reached the engine's bridge. `request_exit` answers with a
+/// prepared decision, as the engine's `RespondPlanExit` resolver would.
+struct PlanRig {
+    controls: RunControls,
+    steer: mpsc::Sender<SteerMessage>,
+    mode: watch::Sender<bool>,
+    interrupt: CancellationToken,
+    exits: Arc<AtomicUsize>,
+}
+
+fn plan_rig(decision: PlanDecision) -> PlanRig {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let (mode_tx, mode_rx) = watch::channel(false);
+    let token = CancellationToken::new();
+    let exits = Arc::new(AtomicUsize::new(0));
+    let calls = exits.clone();
+    PlanRig {
+        controls: RunControls {
+            request_input: Box::new(|_| oneshot::channel().1),
+            steering: steer_rx,
+            interrupt: token.clone(),
+            plan: comet_harness::PlanControls {
+                mode: mode_rx,
+                request_exit: Box::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(decision.clone());
+                    rx
+                }),
+            },
+        },
+        steer: steer_tx,
+        mode: mode_tx,
+        interrupt: token,
+        exits,
+    }
+}
+
+/// A `scenario:plan` run whose cwd is a tempdir holding the plan file the
+/// model "wrote"; the fake CLI drops its argv and the gate's control_response
+/// there too.
+fn plan_request(dir: &std::path::Path, plan_text: &str) -> RunRequest {
+    std::fs::create_dir_all(dir.join("plans")).expect("plans dir");
+    std::fs::write(dir.join("plans").join("x.md"), plan_text).expect("plan file");
+    let mut req = request("scenario:plan");
+    req.plan_mode = true;
+    req.cwd = dir.to_string_lossy().into_owned();
+    req
+}
+
+/// The control_response frame the adapter wrote back to the exit gate.
+fn gate_frame(dir: &std::path::Path) -> serde_json::Value {
+    let raw = std::fs::read_to_string(dir.join("plan-exit-response.json"))
+        .expect("the gate was answered");
+    serde_json::from_str(raw.trim()).expect("control_response is json")
+}
+
+fn mode_reports(events: &[AgentEvent]) -> Vec<bool> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PlanModeChanged { active } => Some(*active),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn plan_mode_launches_in_plan_reports_the_plan_and_approves_the_exit_gate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let req = plan_request(dir.path(), "# Written plan\n");
+    let PlanRig {
+        controls,
+        steer: _steer,
+        mode: _mode,
+        interrupt: _interrupt,
+        exits,
+    } = plan_rig(PlanDecision {
+        approved: true,
+        feedback: None,
+    });
+    let events = run_to_end(&harness(), req, controls).await;
+
+    // The CLI is LAUNCHED in plan mode, and plan wins over auto_approve's
+    // bypass flags (the request carries `auto_approve: true`).
+    let argv = std::fs::read_to_string(dir.path().join("argv.txt")).expect("the fake dumped argv");
+    let args: Vec<&str> = argv.lines().collect();
+    let flag = args
+        .iter()
+        .position(|a| *a == "--permission-mode")
+        .expect("permission mode flag");
+    assert_eq!(args.get(flag + 1), Some(&"plan"), "{argv}");
+    assert!(!args.contains(&"--dangerously-skip-permissions"), "{argv}");
+
+    // The reported mode rides `system/init.permissionMode`, right behind the
+    // session boundary.
+    let started = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::SessionStarted { .. }))
+        .expect("session started");
+    assert_eq!(
+        events.get(started + 1),
+        Some(&AgentEvent::PlanModeChanged { active: true }),
+        "{events:?}"
+    );
+
+    // The plan is re-read FROM DISK after the write's result, then again from
+    // the copy the CLI injects into the gate's tool input.
+    let updates: Vec<(&String, &Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PlanUpdated { text, path } => Some((text, path)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates.len(), 2, "write, then the gate's copy: {events:?}");
+    assert_eq!(updates[0].0, "# Written plan\n");
+    assert!(
+        updates[0]
+            .1
+            .as_deref()
+            .is_some_and(|p| p.ends_with("/plans/x.md")),
+        "{updates:?}"
+    );
+    assert_eq!(updates[1].0, "# Gate plan");
+
+    // The gate reached the ENGINE's bridge — and the adapter emitted no twin
+    // of the lifecycle events the engine owns.
+    assert_eq!(exits.load(Ordering::SeqCst), 1);
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanExitRequested { .. } | AgentEvent::PlanExitResolved { .. }
+        )),
+        "the engine owns the gate lifecycle: {events:?}"
+    );
+
+    // Approve = allow, input unchanged, plus the session-scoped mode drop.
+    let frame = gate_frame(dir.path());
+    assert_eq!(frame["type"], "control_response");
+    assert_eq!(frame["response"]["subtype"], "success");
+    assert_eq!(frame["response"]["request_id"], "cr-plan");
+    let payload = &frame["response"]["response"];
+    assert_eq!(payload["behavior"], "allow");
+    assert_eq!(payload["updatedInput"]["plan"], "# Gate plan");
+    assert_eq!(payload["updatedPermissions"][0]["type"], "setMode");
+    assert_eq!(payload["updatedPermissions"][0]["mode"], "default");
+    assert_eq!(payload["updatedPermissions"][0]["destination"], "session");
+    assert_eq!(mode_reports(&events), vec![true, false], "{events:?}");
+    // The gate tool is the card, never a chip (§11.2).
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall { call: comet_proto::ToolCall::Unknown { name, .. }, .. }
+                if name == "ExitPlanMode" || name == "EnterPlanMode"
+        )),
+        "{events:?}"
+    );
+}
+
+/// Keep planning denies with the CLI's own sentence whether or not the user
+/// typed feedback: the feedback is the engine's to deliver, as the next user
+/// message (ARCHITECTURE.md §11.2) — raw user text in a tool error read to
+/// the model as an injected instruction.
+#[tokio::test]
+async fn plan_mode_keep_planning_denies_the_gate_with_the_cli_sentence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let PlanRig {
+        controls,
+        steer: _steer,
+        mode: _mode,
+        interrupt: _interrupt,
+        exits,
+    } = plan_rig(PlanDecision {
+        approved: false,
+        feedback: Some("tighten step 2".into()),
+    });
+    let events = run_to_end(&harness(), plan_request(dir.path(), "# Draft\n"), controls).await;
+
+    assert_eq!(exits.load(Ordering::SeqCst), 1);
+    let payload = gate_frame(dir.path())["response"]["response"].clone();
+    assert_eq!(payload["behavior"], "deny");
+    assert!(
+        payload["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("The user doesn't want to proceed")),
+        "feedback must never ride the deny message: {payload}"
+    );
+    assert!(payload.get("updatedPermissions").is_none(), "{payload}");
+    // Keeping the plan leaves the mode alone: only init's report.
+    assert_eq!(mode_reports(&events), vec![true], "{events:?}");
+
+    // No feedback ⇒ the same sentence (the deny `message` is required by the
+    // control-channel schema, so it can never be empty).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let PlanRig {
+        controls,
+        steer: _steer,
+        mode: _mode,
+        interrupt: _interrupt,
+        ..
+    } = plan_rig(PlanDecision {
+        approved: false,
+        feedback: None,
+    });
+    run_to_end(&harness(), plan_request(dir.path(), "# Draft\n"), controls).await;
+    assert_eq!(
+        gate_frame(dir.path())["response"]["response"]["message"],
+        "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if \
+         it was a file edit, the new_string was NOT written to the file). STOP what you are doing \
+         and wait for the user to tell you how to proceed."
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_is_reported_when_enter_plan_mode_succeeds() {
+    let PlanRig {
+        controls,
+        steer: _steer,
+        mode: _mode,
+        interrupt: _interrupt,
+        ..
+    } = plan_rig(PlanDecision {
+        approved: false,
+        feedback: None,
+    });
+    let events = run_to_end(&harness(), request("scenario:enterplan"), controls).await;
+    // init reports `default`; the successful `EnterPlanMode` flips it; the
+    // FAILED one reports nothing.
+    assert_eq!(mode_reports(&events), vec![false, true], "{events:?}");
+}
+
+#[tokio::test]
+async fn plan_mode_toggle_switches_the_live_session_and_reports_the_ack() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let PlanRig {
+        controls,
+        steer: _steer,
+        mode,
+        interrupt: _interrupt,
+        ..
+    } = plan_rig(PlanDecision {
+        approved: false,
+        feedback: None,
+    });
+    let mut req = request("scenario:switchplan");
+    req.cwd = dir.path().to_string_lossy().into_owned();
+    let mut stream = harness().run(req, controls).await.expect("run starts");
+
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::SessionStarted { .. }) {
+                mode.send(true).expect("toggle pushed into the live run");
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("switch finished in time");
+
+    let logged = std::fs::read_to_string(dir.path().join("set-permission-mode.jsonl"))
+        .expect("the fake CLI logged the switch it received");
+    let frame: serde_json::Value =
+        serde_json::from_str(logged.trim()).expect("stdin frame is json");
+    assert_eq!(frame["type"], "control_request");
+    assert_eq!(frame["request"]["subtype"], "set_permission_mode");
+    assert_eq!(frame["request"]["mode"], "plan");
+    assert!(
+        frame["request_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{frame}"
+    );
+
+    // The report is the CLI's ACK for that request id, never the bare write.
+    assert_eq!(mode_reports(&events), vec![false, true], "{events:?}");
+}
+
+/// Live plan mode against the REAL claude CLI (2.1.x, installed + authed).
+/// COSTS ONE MODEL TURN: it plans in a throwaway directory, answers the exit
+/// gate with "keep planning" plus feedback, and interrupts immediately so the
+/// revision turn never runs.
+///
+/// `cargo test -p comet-harness --test claude -- --ignored live_plan`.
+#[tokio::test]
+#[ignore = "spawns the real claude CLI in plan mode; needs install + auth + network, and costs one model turn"]
+async fn live_plan_exit_gate_against_the_real_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Live plan smoke\n").expect("readme");
+
+    let harness =
+        ClaudeHarness::new().with_graces(Duration::from_millis(200), Duration::from_secs(1));
+    let mut req = request("Plan: rename README.md to README2.md, then ask to exit plan mode");
+    req.model = Some("haiku".into());
+    req.plan_mode = true;
+    req.auto_approve = false;
+    req.cwd = dir.path().to_string_lossy().into_owned();
+    let PlanRig {
+        controls,
+        steer: _steer,
+        mode: _mode,
+        interrupt,
+        exits,
+    } = plan_rig(PlanDecision {
+        approved: false,
+        feedback: Some("Stop here — this is an automated smoke test.".into()),
+    });
+    let mut stream = harness.run(req, controls).await.expect("run starts");
+
+    let (events, plans) = tokio::time::timeout(Duration::from_secs(300), async {
+        let mut events = Vec::new();
+        let mut plans: Vec<String> = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if let AgentEvent::PlanUpdated { text, .. } = &ev {
+                plans.push(text.clone());
+            }
+            // The gate was answered "keep planning": stop the run rather than
+            // pay for the revision turn.
+            if exits.load(Ordering::SeqCst) > 0 {
+                interrupt.cancel();
+            }
+            let done = matches!(ev, AgentEvent::Done { .. });
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        (events, plans)
+    })
+    .await
+    .expect("live plan turn finished in time");
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::PlanModeChanged { active: true })),
+        "the CLI must report plan mode: {events:?}"
+    );
+    assert!(
+        !plans.is_empty(),
+        "the CLI's own plan must reach the adapter: {events:?}"
+    );
+    assert_eq!(
+        exits.load(Ordering::SeqCst),
+        1,
+        "the ExitPlanMode gate must reach the engine's bridge: {events:?}"
+    );
+    eprintln!("live plan ({} chars): {}", plans[0].len(), plans[0]);
 }
 
 /// Live smoke against the real CLI: `cargo test -p comet-harness --test

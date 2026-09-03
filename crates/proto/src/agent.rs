@@ -121,6 +121,12 @@ pub struct RunRequest {
     /// host ignores it and runs in `cwd` (the repo's main checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSpec>,
+    /// Start (or continue) the run in the harness's OWN plan mode
+    /// (ARCHITECTURE.md §11): the requested mode, carried like `model` and
+    /// `reasoning`. Additive + serde-defaulted for wire compat — an old host
+    /// ignores it and runs in the CLI's default mode.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_mode: bool,
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
@@ -327,6 +333,18 @@ pub struct UserInputAnswer {
     pub labels: Vec<String>,
 }
 
+/// The user's answer to a harness's plan-exit request (ARCHITECTURE.md
+/// §11.1): approve, or keep planning with optional feedback. How the
+/// feedback reaches the agent is the adapter's business (Claude's deny
+/// message; a follow-up prompt where the wire has no message channel).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanDecision {
+    pub approved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DoneStatus {
@@ -431,6 +449,36 @@ pub enum AgentEvent {
     #[serde(rename_all = "camelCase")]
     UserMessage {
         text: String,
+    },
+    /// The harness REPORTED its plan mode (ARCHITECTURE.md §11.1 "reported
+    /// mode"): Claude's init `permissionMode`, an ACP `current_mode_update`,
+    /// OpenCode's `plan_enter`/`plan_exit` parts, Cursor's echoed send mode.
+    /// The host reconciles the chat's requested mode to it.
+    PlanModeChanged {
+        active: bool,
+    },
+    /// The harness's current plan text changed — the FULL text as the
+    /// harness produced it (a plan file the adapter re-read, a streamed
+    /// plan item, a `createPlan` argument). Folds in place into the
+    /// segment's single plan part; comet never edits the text.
+    PlanUpdated {
+        text: String,
+        /// Where the harness keeps the plan, when it is a file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// The harness asked whether to leave plan mode with the current plan
+    /// (Claude `ExitPlanMode`, OpenCode `plan_exit`, Grok `exit_plan_mode`).
+    /// Like `InputRequested`, ONLY the engine's bridge emits this: it mints
+    /// the id and parks the resolver `RespondPlanExit` answers.
+    #[serde(rename_all = "camelCase")]
+    PlanExitRequested {
+        request_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    PlanExitResolved {
+        request_id: String,
+        approved: bool,
     },
     /// An event belonging to a SUBAGENT's nested transcript, attributed to
     /// the spawning tool call (`parent_tool_use_id` = the parent-feed
@@ -557,6 +605,67 @@ mod tests {
         assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
         let round: RunRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round.worktree, req.worktree);
+    }
+
+    /// ARCHITECTURE.md §11.3: `plan_mode` is additive — an old sender's
+    /// request parses (mode off), `false` serializes away so old readers
+    /// never see the key, and `true` round-trips camelCased.
+    #[test]
+    fn run_request_plan_mode_default_and_round_trip() {
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(!req.plan_mode);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("planMode").is_none());
+        let req = RunRequest {
+            plan_mode: true,
+            ..req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["planMode"], true);
+        let round: RunRequest = serde_json::from_value(json).unwrap();
+        assert!(round.plan_mode);
+    }
+
+    #[test]
+    fn plan_events_and_decision_round_trip() {
+        for ev in [
+            AgentEvent::PlanModeChanged { active: true },
+            AgentEvent::PlanUpdated {
+                text: "# Plan".into(),
+                path: Some("/tmp/plans/x.md".into()),
+            },
+            AgentEvent::PlanExitRequested {
+                request_id: "r1".into(),
+            },
+            AgentEvent::PlanExitResolved {
+                request_id: "r1".into(),
+                approved: false,
+            },
+        ] {
+            let json = serde_json::to_string(&ev).unwrap();
+            assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+        }
+        let json = serde_json::to_value(&AgentEvent::PlanExitRequested {
+            request_id: "r1".into(),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "planExitRequested");
+        assert_eq!(json["requestId"], "r1");
+        let decision = PlanDecision {
+            approved: false,
+            feedback: Some("tighter".into()),
+        };
+        let round: PlanDecision =
+            serde_json::from_value(serde_json::to_value(&decision).unwrap()).unwrap();
+        assert_eq!(round, decision);
+        // A bare approval carries no feedback key.
+        let json = serde_json::to_value(&PlanDecision {
+            approved: true,
+            feedback: None,
+        })
+        .unwrap();
+        assert!(json.get("feedback").is_none());
     }
 
     #[test]

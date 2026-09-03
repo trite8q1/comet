@@ -39,7 +39,10 @@ use gpui::{
     div, img, list, prelude::*, px, quad,
 };
 
-use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
+use comet_doc::{
+    MessagePart, MessageRole, MessageStatus, PlanStatus, SessionCommandPayload,
+    SessionMessageEntry, SubagentStatus,
+};
 use comet_proto::ToolCall;
 
 use crate::markdown::parser::{
@@ -954,6 +957,18 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+    /// The harness's own plan, as the card that carries its whole lifecycle
+    /// (ARCHITECTURE.md §11.6): one row per `MessagePart::Plan`, refreshed in
+    /// place while the harness redrafts.
+    PlanCard {
+        /// The plan markdown exactly as the harness produced it.
+        plan: SharedString,
+        /// The plan's first `# ` heading, else "Plan".
+        title: SharedString,
+        status: PlanStatus,
+        /// The parked exit request the Approve / Keep planning buttons answer.
+        request_id: Option<SharedString>,
+    },
 }
 
 /// A transcript row: stable id + content version (diff key) + block payload.
@@ -1116,6 +1131,56 @@ fn assistant_copy_text(entry: &SessionMessageEntry) -> Option<SharedString> {
         .collect::<Vec<_>>()
         .join("\n\n");
     (!text.is_empty()).then(|| text.into())
+}
+
+/// Max chars the plan card's title keeps: the header's title slot truncates
+/// visually, but the derived title also rides the row fingerprint.
+const PLAN_TITLE_MAX: usize = 80;
+
+/// The plan's own title: its first `# ` heading, else the bare genus. Comet
+/// never writes a plan, so the card's name is whatever the harness titled it.
+fn plan_title(plan: &str) -> SharedString {
+    plan.lines()
+        .find_map(|line| line.trim_start().strip_prefix("# "))
+        .and_then(|heading| title_line(heading, PLAN_TITLE_MAX))
+        .map(SharedString::from)
+        .unwrap_or_else(|| "Plan".into())
+}
+
+/// The status pill's word (ARCHITECTURE.md §11.6).
+fn plan_status_label(status: PlanStatus) -> &'static str {
+    match status {
+        PlanStatus::Drafting => "Drafting…",
+        PlanStatus::AwaitingApproval => "Awaiting approval",
+        PlanStatus::Approved => "Approved",
+        PlanStatus::Revising => "Revising",
+    }
+}
+
+/// The lifecycle as one hash byte (row version + entry fingerprint).
+fn plan_status_bits(status: PlanStatus) -> u8 {
+    match status {
+        PlanStatus::Drafting => 0,
+        PlanStatus::AwaitingApproval => 1,
+        PlanStatus::Approved => 2,
+        PlanStatus::Revising => 3,
+    }
+}
+
+/// The plan row's diff key: length + lifecycle + the parked request. The
+/// harness refreshes the part in place, so every draft has to move this.
+fn plan_version(plan: &str, status: PlanStatus, request_id: Option<&str>) -> u64 {
+    let mut acc = Vec::with_capacity(request_id.map_or(0, str::len) + 9);
+    acc.extend_from_slice(&(plan.len() as u64).to_le_bytes());
+    acc.push(plan_status_bits(status));
+    acc.extend_from_slice(request_id.unwrap_or_default().as_bytes());
+    fnv1a(&acc)
+}
+
+/// Whether the card opens by default: a plan still being written (or waiting
+/// on the user) is the point of the turn; an approved one is history.
+fn plan_opens_by_default(status: PlanStatus) -> bool {
+    !matches!(status, PlanStatus::Approved)
 }
 
 /// Build the block rows of one (already continuation-joined) entry.
@@ -1289,6 +1354,34 @@ pub fn rows_for_entry(
                     group_last_part_ix,
                 );
                 match other {
+                    MessagePart::Plan {
+                        id: part_id,
+                        plan,
+                        status,
+                        request_id,
+                        ..
+                    } => {
+                        // One row per plan part, refreshed IN PLACE: the
+                        // harness rewrites the segment's single plan part on
+                        // every draft, so the row keeps its id and only its
+                        // version moves (length + lifecycle + the parked
+                        // request) — the drafts re-render without ever
+                        // re-splicing the rows around them.
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: plan_version(plan, *status, request_id.as_deref()),
+                            turn_start: false,
+                            kind: RowKind::PlanCard {
+                                plan: plan.clone().into(),
+                                title: plan_title(plan),
+                                status: *status,
+                                request_id: request_id.clone().map(SharedString::from),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                        });
+                    }
                     MessagePart::Text { id: part_id, text } => {
                         if text.trim().is_empty() {
                             continue;
@@ -1535,9 +1628,15 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
     });
     if same_part_markdown {
         render::MD_BLOCK_GAP
-    } else if matches!(row.kind, RowKind::ToolGroup { .. })
-        || prev.is_some_and(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
-    {
+    } else if matches!(
+        row.kind,
+        RowKind::ToolGroup { .. } | RowKind::PlanCard { .. }
+    ) || prev.is_some_and(|row| {
+        matches!(
+            row.kind,
+            RowKind::ToolGroup { .. } | RowKind::PlanCard { .. }
+        )
+    }) {
         Theme::SPACE_MD
     } else {
         Theme::SPACE_SM
@@ -2201,6 +2300,15 @@ pub struct Transcript {
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
     tool_details: HashMap<SharedString, FoldState>,
+    /// Measured plan-card bodies, keyed by row id (see [`PlanBodyMeasure`]).
+    /// Shared with the measuring canvas, so it must outlive the borrow the
+    /// element tree takes — the [`RenderCache`] arrangement.
+    plan_heights: Rc<RefCell<HashMap<SharedString, PlanBodyMeasure>>>,
+    /// Plan-exit requests answered from THIS card, held until the doc frame
+    /// flips the part's status (the composer's `answered_requests` latch).
+    answered_plan_gates: std::collections::HashSet<String>,
+    /// The in-flight `RespondPlanExit` QueueCommand.
+    plan_task: Option<Task<()>>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -2301,6 +2409,18 @@ pub struct Transcript {
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
     _observe: Subscription,
+}
+
+/// A plan card body's last measured geometry. The body is markdown, so its
+/// height is only knowable by layout — and the fold tween needs a number
+/// before it can start. The measuring canvas writes this on every paint; a
+/// changed plan length or column width invalidates it (the memo is keyed by
+/// row id, and carries the two inputs its height is a function of).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PlanBodyMeasure {
+    plan_len: usize,
+    width: f32,
+    height: f32,
 }
 
 /// One sidecar blob fetch's lifecycle.
@@ -2412,6 +2532,9 @@ impl Transcript {
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
             tool_details: HashMap::new(),
+            plan_heights: Rc::default(),
+            answered_plan_gates: std::collections::HashSet::new(),
+            plan_task: None,
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -4334,6 +4457,21 @@ impl Transcript {
                 input_chip(header.clone(), *resolved, &theme)
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::PlanCard {
+                plan,
+                title,
+                status,
+                request_id,
+            } => self.render_plan_card(
+                &row.id,
+                plan,
+                title,
+                *status,
+                request_id.as_ref(),
+                &theme,
+                window,
+                cx,
+            ),
         };
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
@@ -5033,6 +5171,385 @@ impl Transcript {
             .child(body)
             .into_any_element()
     }
+
+    /// The active harness's brand mark for the plan card's tile — the chat's
+    /// own `ChatConfig.harness` (the doc's plan part carries no harness, and
+    /// the card must never wear a language or file glyph). The neutral
+    /// checklist glyph stands in until the chat row has synced.
+    fn plan_brand_icon(&self, cx: &gpui::App) -> (&'static str, Option<gpui::Hsla>) {
+        self.chat_id
+            .as_deref()
+            .and_then(|id| self.state.read(cx).chats.iter().find(|c| c.id == id))
+            .and_then(|chat| chat.config.as_ref())
+            .map(|config| crate::icons::harness_brand_icon(config.harness))
+            .unwrap_or((crate::icons::CHECKLIST, None))
+    }
+
+    /// Open/close the plan card, arming the fold tween only when the body's
+    /// height is known — a card whose body has never been laid out has no
+    /// start height to grow from, so it opens with a snap instead of a tween
+    /// that would flash through the wrong geometry.
+    fn toggle_plan_fold(&mut self, row_id: SharedString, plan_len: usize, default_open: bool) {
+        let measured = self
+            .plan_heights
+            .borrow()
+            .get(&row_id)
+            .filter(|m| m.plan_len == plan_len)
+            .map(|m| m.height);
+        let entry = self.folds.entry(row_id).or_default();
+        let currently_open = entry.open.unwrap_or(default_open);
+        entry.open = Some(!currently_open);
+        entry.epoch += 1;
+        entry.from = if currently_open {
+            measured.unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        entry.toggled_at = measured.map(|_| Instant::now());
+    }
+
+    /// The card's answer to the harness's own exit gate: the ledger command
+    /// the host executes, queued through the very RPC the composer sends a
+    /// Run or a `RespondInput` with. The request is marked answered locally
+    /// so the buttons go quiet until the doc frame flips the part's status
+    /// (the composer's `answered_requests` latch), and un-marked when the
+    /// queue call itself fails — the gate must stay answerable.
+    fn answer_plan_gate(&mut self, request_id: String, approved: bool, cx: &mut Context<Self>) {
+        let (Some(chat_id), Some(engine)) =
+            (self.chat_id.clone(), self.state.read(cx).engine().cloned())
+        else {
+            return;
+        };
+        let command = SessionCommandPayload::RespondPlanExit {
+            request_id: request_id.clone(),
+            approved,
+            feedback: None,
+        };
+        let Ok(command) = serde_json::to_value(&command) else {
+            return;
+        };
+        self.answered_plan_gates.insert(request_id.clone());
+        let params = serde_json::json!({ "chatId": chat_id, "command": command });
+        self.plan_task = Some(cx.spawn(async move |this, cx| {
+            let result = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                comet_rpc::methods::QUEUE_COMMAND,
+                params,
+                Duration::from_secs(30),
+            )
+            .await;
+            if let Err(err) = result {
+                tracing::warn!(error = %err, "RespondPlanExit queue failed");
+                this.update(cx, |this, cx| {
+                    this.answered_plan_gates.remove(&request_id);
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+        cx.notify();
+    }
+
+    /// The plan card (ARCHITECTURE.md §11.6). Header: the active harness's
+    /// brand tile, the "Plan" genus, the plan's own title, the lifecycle pill,
+    /// the fold chevron. Body: the plan markdown through the transcript's own
+    /// block renderer, so a fenced block in a plan reads exactly like one in a
+    /// reply — plus, at the exit gate, the two buttons that answer it.
+    #[allow(clippy::too_many_arguments)]
+    fn render_plan_card(
+        &mut self,
+        row_id: &SharedString,
+        plan: &SharedString,
+        title: &SharedString,
+        status: PlanStatus,
+        request_id: Option<&SharedString>,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let plan_len = plan.len();
+        let brand = self.plan_brand_icon(cx);
+        let fold = self.folds.get(row_id).copied().unwrap_or_default();
+        let default_open = plan_opens_by_default(status);
+        let open = fold.open.unwrap_or(default_open);
+        let measured = self
+            .plan_heights
+            .borrow()
+            .get(row_id)
+            .filter(|m| m.plan_len == plan_len)
+            .map(|m| m.height);
+        // Armed by a user toggle only, and only inside the RESIZE window:
+        // gpui replays an element's animation on remount, and a virtualized
+        // row scrolling back into view is a remount. Reduced motion needs no
+        // branch here — gpui snaps every `with_animation` element when set.
+        let animating = fold.epoch > 0
+            && fold
+                .toggled_at
+                .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
+
+        let toggle_row = row_id.clone();
+        let header = div()
+            .id(SharedString::from(format!("{row_id}-plan-hdr")))
+            .h(px(CHIP_HEADER_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .font_family(theme.font_sans_fixed.clone())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_plan_fold(toggle_row.clone(), plan_len, default_open);
+                cx.notify();
+            }))
+            .child(plan_header_row(brand, title.clone(), status, open, theme));
+
+        let mut card = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.07))
+            .bg(crate::theme::ink(0.03))
+            .child(header);
+
+        if open || animating {
+            // The plan is markdown the harness wrote: same parse cache and
+            // same block renderer as an assistant reply.
+            let (tree, _) = parse_for_row(
+                false,
+                row_id,
+                plan,
+                &mut self.live_parsers,
+                &mut self.tree_cache,
+            );
+            let highlight = self.code_highlight_for(row_id, &tree, None, cx);
+            let opts = RenderOptions {
+                row_key: row_id.clone(),
+                veil: None,
+                cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                now: Instant::now(),
+                copy: Some(self.copy_ui_for(row_id, cx)),
+            };
+            let markdown = render::render_tree(&tree, &opts, theme, window, &|ix| {
+                highlight.get(&ix).cloned().flatten()
+            });
+            let answered =
+                request_id.is_some_and(|id| self.answered_plan_gates.contains(id.as_ref()));
+            let actions = request_id
+                .filter(|_| status == PlanStatus::AwaitingApproval)
+                .map(|request_id| plan_actions(row_id, request_id.clone(), answered, theme, cx));
+            // The body's height is only knowable by layout, and the fold
+            // tween needs it as a number: a paint-time canvas memoizes it
+            // (see [`PlanBodyMeasure`]) and asks for one repaint whenever the
+            // measurement moves.
+            let heights = self.plan_heights.clone();
+            let measure_key = row_id.clone();
+            let entity = cx.entity_id();
+            let body = div()
+                .relative()
+                .w_full()
+                .min_w_0()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .child(
+                    canvas(
+                        move |bounds, window, _| {
+                            let next = PlanBodyMeasure {
+                                plan_len,
+                                width: f32::from(bounds.size.width),
+                                height: f32::from(bounds.size.height),
+                            };
+                            if heights.borrow().get(&measure_key) != Some(&next) {
+                                heights.borrow_mut().insert(measure_key.clone(), next);
+                                window.on_next_frame(move |_, cx| cx.notify(entity));
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+                .child(
+                    div()
+                        .h(px(DETAIL_SEPARATOR))
+                        .flex_none()
+                        .bg(crate::theme::hairline(0.06)),
+                )
+                .child(div().min_w_0().px(px(12.0)).py(px(10.0)).child(markdown))
+                .children(actions);
+            let target = if open { measured.unwrap_or(0.0) } else { 0.0 };
+            card = card.child(if animating {
+                let from = fold.from;
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(body)
+                    .with_animation(
+                        SharedString::from(format!("{row_id}-planfold{}", fold.epoch)),
+                        RESIZE.animation(),
+                        move |el, t| el.h(px(motion::lerp(from, target, t))),
+                    )
+                    .into_any_element()
+            } else {
+                body.into_any_element()
+            });
+        }
+
+        div().py(px(4.0)).w_full().child(card).into_any_element()
+    }
+}
+
+/// The plan card's header row: the same 18px tiles, 8px rhythm and 12px text
+/// as [`chip_header_row`], with the harness brand in the icon slot and the
+/// lifecycle pill between the title and the chevron.
+fn plan_header_row(
+    brand: (&'static str, Option<gpui::Hsla>),
+    title: SharedString,
+    status: PlanStatus,
+    open: bool,
+    theme: &Theme,
+) -> gpui::Div {
+    let (icon_path, tint) = brand;
+    div()
+        .h(px(CHIP_HEADER_HEIGHT))
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(8.0))
+        .text_size(px(12.0))
+        .line_height(px(18.0))
+        .child(
+            div()
+                .size(px(18.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .bg(crate::theme::ink(0.08))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(icon_path)
+                        .size(px(12.0))
+                        .text_color(tint.unwrap_or(theme.text_muted)),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child(SharedString::from("Plan")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .truncate()
+                .text_color(theme.text.opacity(0.85))
+                .child(title),
+        )
+        .child(plan_status_pill(status, theme))
+        .child(
+            div()
+                .size(px(18.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .bg(crate::theme::ink(0.06))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.0))
+                .text_color(theme.text_muted.opacity(0.8))
+                .child(SharedString::from(if open {
+                    "\u{25be}"
+                } else {
+                    "\u{25b8}"
+                })),
+        )
+}
+
+/// The lifecycle pill: quiet for every state the user cannot act on, accent
+/// only while the harness is actually waiting on them.
+fn plan_status_pill(status: PlanStatus, theme: &Theme) -> gpui::Div {
+    let waiting = status == PlanStatus::AwaitingApproval;
+    div()
+        .flex_none()
+        .h(px(18.0))
+        .px(px(6.0))
+        .rounded(px(5.0))
+        .flex()
+        .items_center()
+        .bg(if waiting {
+            theme.accent.opacity(0.14)
+        } else {
+            crate::theme::ink(0.06)
+        })
+        .text_size(px(11.0))
+        .text_color(if waiting {
+            theme.accent
+        } else {
+            theme.text_muted.opacity(0.85)
+        })
+        .child(SharedString::from(plan_status_label(status)))
+}
+
+/// The exit gate's two answers, inside the card: approve the plan (accent), or
+/// keep planning. Both go quiet the moment one is pressed and stay quiet until
+/// the doc frame moves the part's status.
+fn plan_actions(
+    row_id: &SharedString,
+    request_id: SharedString,
+    answered: bool,
+    theme: &Theme,
+    cx: &mut Context<Transcript>,
+) -> gpui::Div {
+    let keep = request_id.to_string();
+    let approve = request_id.to_string();
+    div()
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .gap(px(8.0))
+        .px(px(12.0))
+        .pb(px(10.0))
+        .child(
+            crate::popover::btn_ghost(theme, "Keep planning", format!("{row_id}-plan-keep"))
+                .id(SharedString::from(format!("{row_id}-plan-keep")))
+                .when(answered, |el| el.opacity(0.5))
+                .when(!answered, |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.answer_plan_gate(keep.clone(), false, cx)
+                    }))
+                }),
+        )
+        .child(
+            crate::popover::btn_primary(theme, "Approve")
+                .bg(theme.accent_strong)
+                .text_color(theme.on_accent)
+                .id(SharedString::from(format!("{row_id}-plan-approve")))
+                .when(answered, |el| el.opacity(0.5))
+                .when(!answered, |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.answer_plan_gate(approve.clone(), true, cx)
+                    }))
+                }),
+        )
 }
 
 /// A sent message's text with its file-mention chips. The same recipe as the
@@ -5812,6 +6329,17 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         }
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
+        }
+        // A plan part mutates in place: the exit gate flips its status (and
+        // parks a request id) without touching a byte of the plan, so the
+        // `byte_len` above alone would leave the cached card showing
+        // "Drafting…" forever.
+        if let MessagePart::Plan {
+            status, request_id, ..
+        } = part
+        {
+            acc.push(0x20 | plan_status_bits(*status));
+            acc.extend_from_slice(request_id.as_deref().unwrap_or_default().as_bytes());
         }
     }
     fnv1a(&acc)
@@ -6687,6 +7215,126 @@ mod tests {
     }
 
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
+
+    fn plan_part(plan: &str, status: PlanStatus, request_id: Option<&str>) -> MessagePart {
+        MessagePart::Plan {
+            id: comet_doc::PLAN_PART_ID.into(),
+            plan: plan.into(),
+            status,
+            request_id: request_id.map(str::to_string),
+            path: None,
+        }
+    }
+
+    /// ARCHITECTURE.md §11.6: one card row per plan part, titled by the
+    /// plan's own first heading and carrying the lifecycle the doc reports.
+    #[test]
+    fn plan_part_builds_a_titled_card_row() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![
+                text_part("t0", "Looking around first."),
+                plan_part(
+                    "# Veil port plan\n\n1. Port the fade veil.\n",
+                    PlanStatus::AwaitingApproval,
+                    Some("req-1"),
+                ),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2, "one markdown block + the plan card");
+        assert_eq!(rows[1].id.as_ref(), "m1#plan");
+        let RowKind::PlanCard {
+            title,
+            status,
+            request_id,
+            plan,
+        } = &rows[1].kind
+        else {
+            panic!("expected a plan card, got a {:?}", rows[1].id);
+        };
+        assert_eq!(title.as_ref(), "Veil port plan");
+        assert_eq!(*status, PlanStatus::AwaitingApproval);
+        assert_eq!(request_id.as_deref(), Some("req-1"));
+        assert!(plan.starts_with("# Veil port plan"), "body kept verbatim");
+        // A plan the harness never titled still names itself.
+        assert_eq!(plan_title("1. do the thing\n"), "Plan");
+        assert_eq!(plan_title("## Sub\n# Real\n"), "Real");
+    }
+
+    /// The harness refreshes the segment's single plan part in place, so the
+    /// drafts must move the row VERSION while keeping the row id — the diff
+    /// re-renders the card and never re-splices the rows around it.
+    #[test]
+    fn plan_drafts_re_render_the_same_row() {
+        let of = |plan: &str, status, request_id| {
+            rows_for_entry(
+                &assistant(
+                    "m1",
+                    MessageStatus::Streaming,
+                    vec![plan_part(plan, status, request_id)],
+                ),
+                false,
+                &mut parse,
+            )
+            .remove(0)
+        };
+        let d1 = of("# Plan\n\n1. one\n", PlanStatus::Drafting, None);
+        let d2 = of("# Plan\n\n1. one\n2. two\n", PlanStatus::Drafting, None);
+        let gate = of(
+            "# Plan\n\n1. one\n2. two\n",
+            PlanStatus::AwaitingApproval,
+            Some("req-1"),
+        );
+        let approved = of(
+            "# Plan\n\n1. one\n2. two\n",
+            PlanStatus::Approved,
+            Some("req-1"),
+        );
+        assert_eq!(d1.id, d2.id);
+        assert_eq!(d2.id, gate.id);
+        assert_ne!(d1.version, d2.version, "a new draft re-renders");
+        assert_ne!(gate.version, d2.version, "the gate re-renders");
+        assert_ne!(approved.version, gate.version, "the answer re-renders");
+        // The cached-rows gate sits one level up: an in-place status flip
+        // touches no plan byte, so the entry fingerprint has to move too.
+        let fingerprint = |status, request_id| {
+            entry_fingerprint(
+                &assistant(
+                    "m1",
+                    MessageStatus::Streaming,
+                    vec![plan_part("# Plan\n", status, request_id)],
+                ),
+                false,
+            )
+        };
+        assert_ne!(
+            fingerprint(PlanStatus::Drafting, None),
+            fingerprint(PlanStatus::AwaitingApproval, Some("req-1")),
+        );
+        assert_ne!(
+            fingerprint(PlanStatus::AwaitingApproval, Some("req-1")),
+            fingerprint(PlanStatus::Approved, Some("req-1")),
+        );
+    }
+
+    /// A plan being written (or waiting on the user) is the point of the
+    /// turn; an approved one is history and folds away.
+    #[test]
+    fn plan_cards_open_while_live_and_close_once_approved() {
+        assert!(plan_opens_by_default(PlanStatus::Drafting));
+        assert!(plan_opens_by_default(PlanStatus::AwaitingApproval));
+        assert!(plan_opens_by_default(PlanStatus::Revising));
+        assert!(!plan_opens_by_default(PlanStatus::Approved));
+        assert_eq!(plan_status_label(PlanStatus::Drafting), "Drafting…");
+        assert_eq!(
+            plan_status_label(PlanStatus::AwaitingApproval),
+            "Awaiting approval"
+        );
+        assert_eq!(plan_status_label(PlanStatus::Approved), "Approved");
+        assert_eq!(plan_status_label(PlanStatus::Revising), "Revising");
+    }
 
     #[test]
     fn live_entry_splits_per_block_with_id_continuity() {

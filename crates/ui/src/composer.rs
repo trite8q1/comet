@@ -491,6 +491,117 @@ pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &s
     })
 }
 
+/// The harness's own plan-exit gate awaiting an answer, if any: an
+/// `awaitingApproval` plan part with a parked request on the LAST assistant
+/// entry. Same shape (and the same reasoning) as [`pending_input_request`] —
+/// the gate stays answerable until it is actually answered, and a newer
+/// assistant entry supersedes an unanswered one.
+pub fn pending_plan_gate(transcript: &[SessionMessageEntry]) -> Option<String> {
+    transcript
+        .iter()
+        .rev()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .and_then(|entry| {
+            entry.parts.iter().find_map(|part| match part {
+                MessagePart::Plan {
+                    status: comet_doc::PlanStatus::AwaitingApproval,
+                    request_id: Some(request_id),
+                    ..
+                } => Some(request_id.clone()),
+                _ => None,
+            })
+        })
+}
+
+/// What a send does with the composer's text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SendIntent {
+    /// An unanswered plan-exit gate owns the send: the text is feedback, and
+    /// resolving the gate with "keep planning" is what delivers it
+    /// (ARCHITECTURE.md §11.4) — not a Run, and not a Steer.
+    PlanFeedback {
+        request_id: String,
+    },
+    Run,
+    Steer,
+}
+
+/// The send path's decision. Pure so the "a parked plan gate takes the send"
+/// rule is testable without a window. Every harness takes feedback this way;
+/// the host delivers it natively per harness (ARCHITECTURE.md §11.2).
+pub fn send_intent(pending_plan_gate: Option<&str>, answered: bool, steer: bool) -> SendIntent {
+    match pending_plan_gate {
+        Some(request_id) if !answered => SendIntent::PlanFeedback {
+            request_id: request_id.to_string(),
+        },
+        _ if steer => SendIntent::Steer,
+        _ => SendIntent::Run,
+    }
+}
+
+/// The composer's invitation while the harness waits on its plan.
+const PLAN_FEEDBACK_PLACEHOLDER: &str = "Describe what to change in the plan…";
+
+// ---------------------------------------------------------------------------
+// `/plan` — the one composer-owned slash command (ARCHITECTURE.md §11.9)
+// ---------------------------------------------------------------------------
+
+/// The name every plan-mode CLI spells its command with.
+const PLAN_BUILTIN_NAME: &str = "plan";
+
+/// A slash command the COMPOSER owns: its text never reaches the agent, so
+/// the send path resolves it before choosing Run or Steer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComposerBuiltin {
+    /// `/plan` enters plan mode (exactly the chip); `/plan <description>`
+    /// enters it and sends the description as the prompt.
+    Plan { description: Option<String> },
+}
+
+/// Resolve the prompt's leading invocation to a composer builtin, on the one
+/// shared grammar (`split_invocation`) and matching the name exactly like a
+/// catalog does. Offered only where the resolved harness's descriptor has a
+/// plan mode (`plan_offered`); elsewhere `/plan …` is ordinary prompt text,
+/// exactly as §10.5 says for an unknown `/name`. Names no harness.
+pub fn composer_builtin(text: &str, plan_offered: bool) -> Option<ComposerBuiltin> {
+    let invocation = comet_harness::commands::split_invocation(text)?;
+    if !plan_offered || invocation.name != PLAN_BUILTIN_NAME {
+        return None;
+    }
+    Some(ComposerBuiltin::Plan {
+        description: (!invocation.args.is_empty()).then(|| invocation.args.to_string()),
+    })
+}
+
+/// Comet's own `/plan` row, with comet's description and hint (§11.9).
+fn plan_builtin_command() -> SlashCommand {
+    SlashCommand {
+        name: PLAN_BUILTIN_NAME.to_string(),
+        description: "Enter plan mode".to_string(),
+        input_hint: Some("[description]".to_string()),
+        aliases: Vec::new(),
+    }
+}
+
+/// The popup's rows: comet's builtins first, and each one SHADOWS a catalog
+/// entry it would collide with (Claude and Grok both list `plan`) so there is
+/// one behavior and one report path on every harness. Nothing is added or
+/// removed where the builtin is not offered.
+fn slash_rows_with_builtins(catalog: &[SlashCommand], plan_offered: bool) -> Vec<SlashCommand> {
+    if !plan_offered {
+        return catalog.to_vec();
+    }
+    let mut rows = Vec::with_capacity(catalog.len() + 1);
+    rows.push(plan_builtin_command());
+    rows.extend(
+        catalog
+            .iter()
+            .filter(|command| !command.matches(PLAN_BUILTIN_NAME))
+            .cloned(),
+    );
+    rows
+}
+
 // ---------------------------------------------------------------------------
 // Question wizard (pure reducer)
 // ---------------------------------------------------------------------------
@@ -569,7 +680,14 @@ impl Wizard {
             WizardStep::Stay
         } else {
             *picked = vec![option_ix];
-            WizardStep::AutoAdvance
+            // Between pages a pick auto-advances; on the LAST page it never
+            // submits — the user presses Submit (or Skip) themselves, so the
+            // agent does not continue the moment a final option is tapped.
+            if self.page + 1 < self.questions.len() {
+                WizardStep::AutoAdvance
+            } else {
+                WizardStep::Stay
+            }
         }
     }
 
@@ -3505,6 +3623,9 @@ pub struct Composer {
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
+    /// The composer is currently inviting plan feedback (its placeholder is
+    /// borrowed): latched so the restore happens exactly once.
+    plan_prompting: bool,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     /// Interrupt/answer commands get their own slot: assigning `send_task`
@@ -3654,6 +3775,7 @@ impl Composer {
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
+            plan_prompting: false,
             failure_key: None,
             action_task: None,
             advance_task: None,
@@ -4413,6 +4535,19 @@ impl Composer {
         cx.notify();
     }
 
+    /// The popup's rows for the active key: the key's harness catalog with
+    /// comet's own builtins merged in (§11.9).
+    fn slash_rows(&self, cx: &App) -> Vec<SlashCommand> {
+        let catalog = self
+            .slash
+            .key
+            .as_ref()
+            .and_then(|key| self.slash_cache.get(key))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        slash_rows_with_builtins(catalog, self.pickers.read(cx).offers_plan_mode(cx))
+    }
+
     /// Re-rank the cached list for the current query (pure local filter).
     fn refilter_slash(&mut self, cx: &mut Context<Self>) {
         let query = self
@@ -4421,14 +4556,8 @@ impl Composer {
             .as_ref()
             .map(|t| t.query.clone())
             .unwrap_or_default();
-        let commands = self
-            .slash
-            .key
-            .as_ref()
-            .and_then(|key| self.slash_cache.get(key))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        self.slash.filtered = filter_commands(&query, commands);
+        let rows = self.slash_rows(cx);
+        self.slash.filtered = filter_commands(&query, &rows);
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
         // A fresh query/reopen restarts the row stack at the top.
         reset_scroll_offset(&self.slash_scroll);
@@ -4467,14 +4596,7 @@ impl Composer {
             .slash
             .active
             .and_then(|active| self.slash.filtered.get(active))
-            .and_then(|&ix| {
-                self.slash
-                    .key
-                    .as_ref()
-                    .and_then(|key| self.slash_cache.get(key))
-                    .and_then(|c| c.get(ix))
-            })
-            .cloned()
+            .and_then(|&ix| self.slash_rows(cx).get(ix).cloned())
         else {
             return;
         };
@@ -4505,13 +4627,7 @@ impl Composer {
     ) -> Option<gpui::AnyElement> {
         // Only while a slash token is active.
         self.slash.token.as_ref()?;
-        let commands = self
-            .slash
-            .key
-            .as_ref()
-            .and_then(|key| self.slash_cache.get(key))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+        let commands = self.slash_rows(cx);
         // Full pill width at the mention card's height budget — both composer
         // completions share the same surface shape.
         let mut card = crate::popover::popover_card(theme)
@@ -4833,7 +4949,33 @@ impl Composer {
         // list so the new folder's rows replace the previous ones at once
         // (§10.6). The agent-chip twin rides the pickers observer.
         self.revalidate_slash_on_key_change(cx);
+
+        // Plan-exit gate: while one is parked the composer's send resolves it
+        // with feedback (see `on_submit`), so its placeholder says so. The
+        // question panel owns the input first when both are up.
+        let prompting = self.wizard.is_none() && self.pending_plan_gate(cx).is_some();
+        if prompting != self.plan_prompting {
+            self.plan_prompting = prompting;
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder(
+                    if prompting {
+                        PLAN_FEEDBACK_PLACEHOLDER
+                    } else {
+                        "Do anything…"
+                    },
+                    cx,
+                )
+            });
+        }
         cx.notify();
+    }
+
+    /// The parked plan-exit gate this composer serves: the transcript's, minus
+    /// the ones already answered from this device (the card's buttons and this
+    /// composer share the latch through the doc, not through each other).
+    fn pending_plan_gate(&self, cx: &App) -> Option<String> {
+        pending_plan_gate(&self.state.read(cx).transcript)
+            .filter(|request_id| !self.answered_requests.contains(request_id))
     }
 
     fn run_live(&self, cx: &App) -> bool {
@@ -4885,13 +5027,102 @@ impl Composer {
         let text = self.input.read(cx).text().trim().to_string();
         let no_content =
             !composer_has_content(&text, self.staged().len(), self.staged_comments(cx).len());
-        match self.button_mode(cx) {
+        let mode = self.button_mode(cx);
+        match mode {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
-            SendButtonMode::Send => self.send(text, false, cx),
-            SendButtonMode::Steer => self.send(text, true, cx),
+            _ => {
+                let pending = pending_plan_gate(&self.state.read(cx).transcript);
+                let answered = pending
+                    .as_deref()
+                    .is_some_and(|id| self.answered_requests.contains(id));
+                match send_intent(pending.as_deref(), answered, mode == SendButtonMode::Steer) {
+                    SendIntent::PlanFeedback { request_id } => {
+                        self.send_plan_feedback(request_id, text, cx)
+                    }
+                    // A parked gate owns the send first (above); what would
+                    // otherwise be a Run or a Steer may be comet's own
+                    // `/plan` instead (§11.9).
+                    intent => {
+                        let steer = intent == SendIntent::Steer;
+                        let offered = self.pickers.read(cx).offers_plan_mode(cx);
+                        match composer_builtin(&text, offered) {
+                            Some(ComposerBuiltin::Plan { description }) => {
+                                self.enter_plan_mode(description, steer, cx)
+                            }
+                            None => self.send(text, steer, cx),
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// `/plan` (§11.9): enter plan mode for this chat — the chip's own path,
+    /// so an existing chat writes `SetChatConfig` and pushes `SetPlanMode`
+    /// into a live run — and send the description, if the user typed one, as
+    /// an ordinary prompt. The flip lands BEFORE the send resolves the run
+    /// config, so the request this send carries already has
+    /// `plan_mode: true` (the draft is the source on the new-chat canvas).
+    fn enter_plan_mode(
+        &mut self,
+        description: Option<String>,
+        steer: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.pickers
+            .update(cx, |pickers, cx| pickers.enter_plan_mode(cx));
+        match description {
+            Some(description) => self.send(description, steer, cx),
+            // Nothing goes to the agent: the command was the toggle.
+            None => {
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.drafts.remove(&self.current_key);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Answer the harness's plan-exit gate with "keep planning" and the user's
+    /// words — the ledger command the card's buttons queue, with the feedback
+    /// the card has no field for. Latched and un-latched exactly like
+    /// [`Self::wizard_finish`]'s answer.
+    fn send_plan_feedback(&mut self, request_id: String, text: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let command = SessionCommandPayload::RespondPlanExit {
+            request_id: request_id.clone(),
+            approved: false,
+            feedback: Some(text),
+        };
+        let Ok(command) = serde_json::to_value(&command) else {
+            return;
+        };
+        self.answered_requests.insert(request_id.clone());
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&self.current_key);
+        self.failure = None;
+        let failure_chat = chat_id.clone();
+        let params = serde_json::json!({ "chatId": chat_id, "command": command });
+        // `action_task`, NOT `send_task` — see `interrupt`.
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            if let Err(err) = engine.client().call(methods::QUEUE_COMMAND, params).await {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(format!("Plan feedback failed: {err}").into());
+                    composer.failure_key = Some(failure_chat);
+                    // It never left this device — hand the gate back.
+                    composer.answered_requests.remove(&request_id);
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+        cx.notify();
     }
 
     /// Queue a Run (or Steer) doc command with an optimistic echo. New chats
@@ -5369,6 +5600,7 @@ impl Composer {
                             cwd,
                             sandbox: SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
+                            plan_mode: resolved.plan_mode,
                             resume: None,
                             attachments: attachment_paths,
                             worktree: run_worktree,
@@ -5563,6 +5795,12 @@ impl Composer {
             wizard.back();
             cx.notify();
         }
+    }
+
+    /// Skip: resolve the request with no answers — the "declined" signal
+    /// every adapter already carries — and retire the panel.
+    fn wizard_skip(&mut self, cx: &mut Context<Self>) {
+        self.wizard_finish(Vec::new(), cx);
     }
 
     /// Submit RespondInput and retire the panel.
@@ -5849,14 +6087,26 @@ impl Composer {
                     .px(px(16.0))
                     .pb(px(16.0))
                     .pt(px(4.0))
-                    .child(if page > 0 {
-                        crate::popover::btn_ghost(&theme, "Back", "wizard-back")
-                            .id("wizard-back")
-                            .on_click(cx.listener(|this, _, _, cx| this.wizard_back(cx)))
-                            .into_any_element()
-                    } else {
-                        gpui::Empty.into_any_element()
-                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .child(
+                                crate::popover::btn_ghost(&theme, "Skip", "wizard-skip")
+                                    .id("wizard-skip")
+                                    .on_click(cx.listener(|this, _, _, cx| this.wizard_skip(cx))),
+                            )
+                            .when(page > 0, |el| {
+                                el.child(
+                                    crate::popover::btn_ghost(&theme, "Back", "wizard-back")
+                                        .id("wizard-back")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.wizard_back(cx)),
+                                        ),
+                                )
+                            }),
+                    )
                     .child(
                         crate::popover::btn_primary(&theme, if last { "Submit" } else { "Next" })
                             .id("wizard-submit")
@@ -6672,6 +6922,69 @@ mod tests {
         assert!(filter_commands("zzz", &commands).is_empty());
     }
 
+    /// §11.9: comet owns exactly one slash command, resolved on the shared
+    /// invocation grammar and only where plan mode is offered at all.
+    #[test]
+    fn plan_builtin_resolves_from_the_shared_grammar() {
+        assert_eq!(
+            composer_builtin("/plan", true),
+            Some(ComposerBuiltin::Plan { description: None })
+        );
+        // The grammar trims the argument, so the spacing is not the prompt.
+        assert_eq!(
+            composer_builtin("/plan  add a readme", true),
+            Some(ComposerBuiltin::Plan {
+                description: Some("add a readme".to_string()),
+            })
+        );
+        // Exact, case-sensitive name — the catalog's own matching rule.
+        assert_eq!(composer_builtin("/plans", true), None);
+        assert_eq!(composer_builtin("/Plan", true), None);
+        assert_eq!(composer_builtin("plan", true), None);
+        // Leading whitespace is no invocation (`split_invocation`), and a
+        // command mid-prompt never was one.
+        assert_eq!(composer_builtin(" /plan", true), None);
+        assert_eq!(composer_builtin("run /plan", true), None);
+        // Not offered: ordinary prompt text, exactly like an unknown `/name`.
+        assert_eq!(composer_builtin("/plan", false), None);
+        assert_eq!(composer_builtin("/plan add a readme", false), None);
+    }
+
+    /// §11.9: the builtin is listed first with comet's own copy and shadows
+    /// the catalog's entry of the same name — one behavior on every harness.
+    #[test]
+    fn plan_builtin_row_leads_and_shadows_the_catalog() {
+        let command = |name: &str, aliases: &[&str]| SlashCommand {
+            name: name.to_string(),
+            description: "the harness's own copy".to_string(),
+            input_hint: None,
+            aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+        };
+        let catalog = [command("compact", &[]), command("plan", &[])];
+
+        let rows = slash_rows_with_builtins(&catalog, true);
+        assert_eq!(
+            rows.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["plan", "compact"]
+        );
+        assert_eq!(rows[0].description, "Enter plan mode");
+        assert_eq!(rows[0].input_hint.as_deref(), Some("[description]"));
+        // An ALIAS collision is shadowed too (`SlashCommand::matches`).
+        let aliased = [command("plan-mode", &["plan"])];
+        assert_eq!(
+            slash_rows_with_builtins(&aliased, true)
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plan"]
+        );
+        // Not offered: the harness catalog rides through untouched.
+        assert_eq!(slash_rows_with_builtins(&catalog, false), catalog.to_vec());
+        // The typed prefix filters the builtin row like any other row.
+        assert_eq!(filter_commands("pl", &rows), vec![0]);
+        assert_eq!(filter_commands("com", &rows), vec![1]);
+    }
+
     /// Discovery is cwd-scoped (§10.4): the same harness in two folders is two
     /// catalogs, so a space switch on the new-chat canvas must miss the cache
     /// and re-probe instead of re-showing the previous folder's entries.
@@ -7271,7 +7584,9 @@ mod tests {
         assert!(w.is_picked(1));
         assert_eq!(w.advance(), WizardStep::Stay);
         assert_eq!(w.counter(), "2/2");
-        assert_eq!(w.select(0), WizardStep::AutoAdvance);
+        // The last page never auto-submits: the pick stays, Submit finishes.
+        assert_eq!(w.select(0), WizardStep::Stay);
+        assert!(w.is_picked(0));
         let WizardStep::Done(answers) = w.advance() else {
             panic!("expected Done")
         };
@@ -7300,7 +7615,8 @@ mod tests {
         let mut w = Wizard::new("req".into(), vec![question("q", &["a", "b"], false)]);
         assert_eq!(w.press_number(9), WizardStep::Stay, "out of range ignored");
         assert_eq!(w.press_number(0), WizardStep::Stay);
-        assert_eq!(w.press_number(2), WizardStep::AutoAdvance);
+        // A single page IS the last page: the pick stays for a manual Submit.
+        assert_eq!(w.press_number(2), WizardStep::Stay);
         assert!(w.is_picked(1));
         assert_eq!(w.select(5), WizardStep::Stay, "bad option ix ignored");
     }
@@ -7331,6 +7647,96 @@ mod tests {
             vec!["custom answer"],
             "typed overrides picked, trimmed"
         );
+    }
+
+    /// ARCHITECTURE.md §11.4 step 4: while the harness's exit gate is parked,
+    /// the composer's send RESOLVES it with feedback — it is neither a Run
+    /// nor a Steer, and it goes back to being one the moment the gate has an
+    /// answer.
+    #[test]
+    fn a_parked_plan_gate_takes_the_send_until_it_is_answered() {
+        assert_eq!(
+            send_intent(Some("req-1"), false, false),
+            SendIntent::PlanFeedback {
+                request_id: "req-1".into()
+            }
+        );
+        // Even mid-run, where the send would otherwise steer.
+        assert_eq!(
+            send_intent(Some("req-1"), false, true),
+            SendIntent::PlanFeedback {
+                request_id: "req-1".into()
+            }
+        );
+        // Answered here already (the card's buttons, or a previous send):
+        // the ordinary send path is back.
+        assert_eq!(send_intent(Some("req-1"), true, true), SendIntent::Steer);
+        assert_eq!(send_intent(Some("req-1"), true, false), SendIntent::Run);
+        assert_eq!(send_intent(None, false, false), SendIntent::Run);
+        assert_eq!(send_intent(None, false, true), SendIntent::Steer);
+    }
+
+    #[test]
+    fn pending_plan_gate_reads_the_latest_assistant_entry() {
+        use comet_doc::{MessageStatus, PlanStatus};
+        let plan = |status: PlanStatus, request_id: Option<&str>| MessagePart::Plan {
+            id: "plan".into(),
+            plan: "# Port the veil".into(),
+            status,
+            request_id: request_id.map(str::to_string),
+            path: None,
+        };
+        let entry = |id: &str, created_at: i64, parts: Vec<MessagePart>| SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at,
+            device_id: "d".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        };
+        let gate = vec![entry(
+            "m",
+            0,
+            vec![plan(PlanStatus::AwaitingApproval, Some("req-1"))],
+        )];
+        assert_eq!(pending_plan_gate(&gate), Some("req-1".into()));
+        // Every other lifecycle state is a card, not a question.
+        for status in [
+            PlanStatus::Drafting,
+            PlanStatus::Approved,
+            PlanStatus::Revising,
+        ] {
+            let t = vec![entry("m", 0, vec![plan(status, Some("req-1"))])];
+            assert!(pending_plan_gate(&t).is_none(), "{status:?}");
+        }
+        // No parked request (a harness with no agent-initiated gate): the
+        // user leaves plan mode with the toggle, so there is nothing to
+        // answer here.
+        let t = vec![entry(
+            "m",
+            0,
+            vec![plan(PlanStatus::AwaitingApproval, None)],
+        )];
+        assert!(pending_plan_gate(&t).is_none());
+        // A newer assistant entry supersedes an unanswered gate.
+        let t = vec![
+            entry(
+                "m",
+                0,
+                vec![plan(PlanStatus::AwaitingApproval, Some("req-1"))],
+            ),
+            entry(
+                "m2",
+                1,
+                vec![MessagePart::Text {
+                    id: "t".into(),
+                    text: "moved on".into(),
+                }],
+            ),
+        ];
+        assert!(pending_plan_gate(&t).is_none());
+        assert!(pending_plan_gate(&[]).is_none());
     }
 
     #[test]

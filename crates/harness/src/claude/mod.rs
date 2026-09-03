@@ -30,6 +30,13 @@
 //!   boundary.
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
+//! - PLAN MODE is the CLI's own (ARCHITECTURE.md §11.2): launch with
+//!   `--permission-mode plan`, switch live with a `set_permission_mode`
+//!   control request, report the mode from `system/init.permissionMode` and
+//!   from a successful `EnterPlanMode`, re-read the plan file after every
+//!   successful Write/Edit on a `**/plans/*.md` path, and answer the
+//!   `ExitPlanMode` `can_use_tool` gate with the user's decision — the one
+//!   permission request that is NOT auto-allowed.
 
 pub mod catalog;
 mod normalize;
@@ -49,11 +56,13 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, PlanDecision, ReasoningLevel, RunRequest,
+    SlashCommand, SteeringMode, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use crate::{
+    Harness, HarnessError, PlanControls, RunControls, Signal, send_signal, shutdown_child,
+};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
@@ -210,7 +219,12 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
+        // Plan mode is a permission mode, so it and `auto_approve`'s bypass
+        // are the same switch: a run REQUESTED in plan mode starts in plan
+        // mode, exactly as `claude --permission-mode plan` would.
+        if request.plan_mode {
+            cmd.args(["--permission-mode", "plan"]);
+        } else if request.auto_approve {
             cmd.args([
                 "--permission-mode",
                 "bypassPermissions",
@@ -411,6 +425,12 @@ impl Harness for ClaudeHarness {
     }
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {
+        true
+    }
+    /// The CLI's `plan` permission mode, driven end to end (ARCHITECTURE.md
+    /// §11.2): launch flag, live `set_permission_mode`, reported mode, plan
+    /// file, and the `ExitPlanMode` gate.
+    fn plan_mode(&self) -> bool {
         true
     }
 
@@ -643,11 +663,23 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        plan,
     } = controls;
+    let PlanControls {
+        mode: mut plan_mode,
+        request_exit,
+    } = plan;
     let request_input = Arc::new(request_input);
+    let request_exit = Arc::new(request_exit);
 
     let mut norm = Normalizer::new();
+    let mut plan_files = PlanFiles::default();
     let mut steering_open = true;
+    let mut plan_watch_open = true;
+    // `set_permission_mode` request id → the mode it asks for; the CLI's
+    // `control_response` for that id is what we report as the new mode.
+    let mut pending_modes: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut any_done = false;
@@ -670,13 +702,46 @@ async fn run_session(session: Session) {
                         }
                     };
                     if let Frame::ControlRequest(req) = frame {
-                        handle_control_request(req, &request_input, &stdin_tx);
+                        handle_control_request(req, &request_input, &request_exit, &stdin_tx, &event_tx);
+                        continue;
+                    }
+                    // The CLI's answer to a mode switch WE asked for is the
+                    // report that flips the toggle on every device.
+                    if let Frame::ControlResponse(resp) = frame {
+                        if let Some(active) = pending_modes.remove(&resp.response.request_id) {
+                            if resp.response.subtype == "success" {
+                                if event_tx.send(Ok(AgentEvent::PlanModeChanged { active })).await.is_err() {
+                                    break 'main;
+                                }
+                            } else {
+                                tracing::debug!(
+                                    target: "comet_harness::claude",
+                                    "set_permission_mode rejected: {}",
+                                    resp.response.error.unwrap_or_default()
+                                );
+                            }
+                        }
                         continue;
                     }
                     for ev in norm.normalize(frame, interrupted) {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
-                        if event_tx.send(Ok(ev)).await.is_err() {
+                        // Claude keeps the plan in a file; a successful write
+                        // to one is the only "plan changed" signal the wire
+                        // has (ARCHITECTURE.md §11.2).
+                        let follow_up = plan_files.follow_up(&ev).await;
+                        // The gate tools ARE the plan card (ARCHITECTURE.md
+                        // §11.2 "Gate tools are the card, not chips"): their
+                        // call/result never fold into a tool chip, only the
+                        // plan events derived from them above.
+                        if !plan_files.is_gate_event(&ev)
+                            && event_tx.send(Ok(ev)).await.is_err()
+                        {
                             break 'main; // consumer gone — reap below
+                        }
+                        for ev in follow_up {
+                            if event_tx.send(Ok(ev)).await.is_err() {
+                                break 'main;
+                            }
                         }
                         if is_done {
                             any_done = true;
@@ -716,6 +781,21 @@ async fn run_session(session: Session) {
                     steering_open = false;
                     let _ = stdin_tx.send(StdinMsg::Close);
                 }
+            },
+
+            changed = plan_mode.changed(), if plan_watch_open && !interrupted => {
+                if changed.is_err() {
+                    // The host dropped the watch (run settling): stop polling
+                    // it, never spin on the closed channel.
+                    plan_watch_open = false;
+                    continue;
+                }
+                let active = *plan_mode.borrow_and_update();
+                let request_id = format!("mode_{}", uuid::Uuid::new_v4());
+                pending_modes.insert(request_id.clone(), active);
+                let _ = stdin_tx.send(StdinMsg::Line(
+                    wire::set_permission_mode_line(&request_id, active),
+                ));
             },
 
             _ = interrupt.cancelled(), if !interrupt_sent => {
@@ -776,23 +856,41 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
+type RequestExitFn = Box<dyn Fn() -> tokio::sync::oneshot::Receiver<PlanDecision> + Send + Sync>;
+
+/// The CLI's own wording for a rejected tool use (verbatim from 2.1.258;
+/// there is no plan-specific variant). The deny `message` is required by the
+/// control-channel schema; the user's feedback never rides it — the CLI's own
+/// TUI delivers feedback as a user message, and so does the engine.
+const TOOL_USE_REJECTED: &str = "The user doesn't want to proceed with this tool use. The tool \
+     use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). \
+     STOP what you are doing and wait for the user to tell you how to proceed.";
+
 /// Serve one `can_use_tool` control request. Every tool is auto-approved
 /// (unattended parity — the CLI still blocks until SOME response arrives, so
-/// every request must be answered); `AskUserQuestion` is intercepted —
-/// surface the questions through the engine's input bridge (which owns the
-/// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
-/// (in a subtask so the frame loop keeps flowing), and hand them back keyed
-/// by question text, as the tool expects.
+/// every request must be answered) except the two that ARE the user's:
+/// `AskUserQuestion` is intercepted — surface the questions through the
+/// engine's input bridge (which owns the `InputRequested`/`InputResolved`
+/// lifecycle), wait for the user's answers (in a subtask so the frame loop
+/// keeps flowing), and hand them back keyed by question text, as the tool
+/// expects — and `ExitPlanMode` is the plan gate (ARCHITECTURE.md §11.2),
+/// answered by the user's own decision.
 fn handle_control_request(
     req: ControlRequestFrame,
     request_input: &Arc<RequestInputFn>,
+    request_exit: &Arc<RequestExitFn>,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) {
     if req.request.subtype != "can_use_tool" {
         tracing::debug!(
             target: "comet_harness::claude",
             "unhandled control_request subtype: {}", req.request.subtype
         );
+        return;
+    }
+    if req.request.tool_name == "ExitPlanMode" {
+        handle_plan_exit(req, request_exit, stdin_tx, event_tx);
         return;
     }
     if req.request.tool_name != "AskUserQuestion" {
@@ -820,6 +918,168 @@ fn handle_control_request(
         let line = control_response_line(&request_id, allow_response(updated));
         let _ = stdin_tx.send(StdinMsg::Line(line));
     });
+}
+
+/// Serve the `ExitPlanMode` gate: the CLI injects the plan file's text and
+/// path into the tool input (`plan` / `planFilePath`), so the plan is
+/// published first, then the user's decision is awaited in a subtask (the
+/// frame loop keeps flowing, exactly as for `AskUserQuestion`).
+///
+/// The ENGINE owns the gate's lifecycle — it mints the request id and is the
+/// sole emitter of `PlanExitRequested`/`PlanExitResolved`; a harness copy
+/// would fold a second, unanswerable card into the doc. A dropped decision
+/// sender (the engine went away) reads as "keep planning", never as a silent
+/// approval.
+fn handle_plan_exit(
+    req: ControlRequestFrame,
+    request_exit: &Arc<RequestExitFn>,
+    stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) {
+    let request_exit = Arc::clone(request_exit);
+    let stdin_tx = stdin_tx.clone();
+    let event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        let request_id = req.request_id;
+        let input = req.request.input;
+        if let Some(text) = input.get("plan").and_then(Value::as_str) {
+            let ev = AgentEvent::PlanUpdated {
+                text: text.to_owned(),
+                path: input
+                    .get("planFilePath")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            };
+            if event_tx.send(Ok(ev)).await.is_err() {
+                return;
+            }
+        }
+        let decision = (request_exit)().await.unwrap_or(PlanDecision {
+            approved: false,
+            feedback: None,
+        });
+        // Keep planning: the CLI's own rejection sentence, never the user's
+        // text — the CLI's TUI denies with that sentence and delivers typed
+        // feedback as a USER message (`feedbackIsFromUser`); the engine
+        // steers the feedback the same way (ARCHITECTURE.md §11.2). Raw
+        // feedback in a tool error read to the model as an injected
+        // instruction (2026-09-02 user report).
+        let response = if decision.approved {
+            wire::plan_exit_allow_response(input)
+        } else {
+            wire::deny_response(TOOL_USE_REJECTED)
+        };
+        let _ = stdin_tx.send(StdinMsg::Line(control_response_line(&request_id, response)));
+        if decision.approved {
+            // The allow payload's `setMode` leaves plan mode for the rest of
+            // the session; report it so the toggle follows on every device.
+            let _ = event_tx
+                .send(Ok(AgentEvent::PlanModeChanged { active: false }))
+                .await;
+        }
+    });
+}
+
+/// Adapter-local plan-file bookkeeping. Claude's plan lives in a file the
+/// model writes (`~/.claude/plans/<slug>.md`, or a project `plansDirectory`),
+/// so a successful Write/Edit on a `**/plans/*.md` path is what "the plan
+/// changed" looks like on the wire; the text is read back from disk (the CLI
+/// runs on this host). `EnterPlanMode` completing is the CLI's own report
+/// that it entered plan mode.
+#[derive(Default)]
+struct PlanFiles {
+    /// tool_use id → plan file, from the call until its result.
+    writes: std::collections::HashMap<String, PathBuf>,
+    /// tool_use ids of `EnterPlanMode` calls awaiting their result.
+    enters: std::collections::HashSet<String>,
+    /// tool_use ids of the gate tools (`EnterPlanMode`/`ExitPlanMode`) seen
+    /// this run: neither their call nor their result renders as a chip.
+    gates: std::collections::HashSet<String>,
+}
+
+impl PlanFiles {
+    /// Whether `event` is a gate tool's call or result (the card's, not a
+    /// chip's). Records gate calls as a side effect; must run AFTER
+    /// [`Self::follow_up`] on the same event so the plan events still derive.
+    fn is_gate_event(&mut self, event: &AgentEvent) -> bool {
+        match event {
+            AgentEvent::ToolCall {
+                id,
+                call: ToolCall::Unknown { name, .. },
+            } if name == "ExitPlanMode" || name == "EnterPlanMode" => {
+                self.gates.insert(id.clone());
+                true
+            }
+            AgentEvent::ToolResult { id, .. } => self.gates.contains(id),
+            _ => false,
+        }
+    }
+
+    /// Record plan-relevant calls, and turn their (non-error) results into
+    /// the plan events. Subagent traffic arrives wrapped in
+    /// `AgentEvent::Subagent` and therefore never matches.
+    async fn follow_up(&mut self, event: &AgentEvent) -> Vec<AgentEvent> {
+        match event {
+            AgentEvent::ToolCall { id, call } => {
+                match call {
+                    ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
+                        if let Some(plan) = plan_file_path(path) {
+                            self.writes.insert(id.clone(), plan);
+                        }
+                    }
+                    ToolCall::Unknown { name, .. } if name == "EnterPlanMode" => {
+                        self.enters.insert(id.clone());
+                    }
+                    _ => {}
+                }
+                Vec::new()
+            }
+            AgentEvent::ToolResult { id, is_error, .. } => {
+                let wrote = self.writes.remove(id);
+                let entered = self.enters.remove(id);
+                if *is_error {
+                    return Vec::new();
+                }
+                let mut out = Vec::new();
+                if entered {
+                    out.push(AgentEvent::PlanModeChanged { active: true });
+                }
+                if let Some(path) = wrote {
+                    match tokio::fs::read_to_string(&path).await {
+                        Ok(text) => out.push(AgentEvent::PlanUpdated {
+                            text,
+                            path: Some(path.display().to_string()),
+                        }),
+                        Err(err) => tracing::debug!(
+                            target: "comet_harness::claude",
+                            path = %path.display(), error = %err,
+                            "plan file unreadable after its write"
+                        ),
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// A path the CLI would keep a plan at: `**/plans/*.md`, `~` expanded.
+fn plan_file_path(raw: &str) -> Option<PathBuf> {
+    let path = match raw.strip_prefix("~/").zip(std::env::var_os("HOME")) {
+        Some((rest, home)) => PathBuf::from(home).join(rest),
+        None => PathBuf::from(raw),
+    };
+    let is_markdown = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"));
+    let in_plans = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("plans");
+    (is_markdown && in_plans).then_some(path)
 }
 
 /// Parse Claude's `AskUserQuestion` tool input into [`UserInputQuestion`]s

@@ -3041,6 +3041,7 @@ mod tests {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
         let config = comet_proto::ChatConfig {
+            plan_mode: false,
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
             reasoning: Some(comet_proto::ReasoningLevel::XHigh),
@@ -3065,6 +3066,7 @@ mod tests {
         state.apply_chat_config(
             "missing",
             comet_proto::ChatConfig {
+                plan_mode: false,
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,

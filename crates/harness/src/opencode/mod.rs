@@ -34,8 +34,15 @@
 //! A prompt that produces NO session-scoped event within
 //! [`default_stall_bound`] (`COMET_OPENCODE_STALL_MS`, 0 disables) errors
 //! out instead of spinning "Working" forever.
+//!
+//! Plan mode (ARCHITECTURE.md §11.2) is opencode's own `plan` agent: the
+//! `agent` field on every `prompt_async` / `command` body ("plan" | "build"),
+//! `plan_enter` / `plan_exit` tool parts completing as the reported mode
+//! (what the opencode TUI itself keys on), the plan file the plan agent is
+//! the only writer of (`.opencode/plans/*.md`, or `<data>/plans/*.md`), and
+//! the `plan_exit` tool's own Yes/No question as the exit gate.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -47,14 +54,14 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, PlanDecision, ReasoningLevel, RunRequest,
+    SlashCommand, SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls, shutdown_child};
+use crate::{Harness, HarnessError, PlanControls, RunControls, shutdown_child};
 
 /// opencode loads plugins and MCP config before the server answers; cold
 /// plugin-heavy starts can take minutes. Shared by chat startup and model
@@ -341,6 +348,13 @@ impl Harness for OpencodeHarness {
     /// `session.status{idle}` is a real terminal frame per turn: the engine
     /// can retire its quiesce watchdogs.
     fn deterministic_turn_end(&self) -> bool {
+        true
+    }
+
+    /// opencode's `plan` agent is a first-class mode on its own wire: the
+    /// `agent` field on every prompt, `plan_enter`/`plan_exit` parts, and the
+    /// `plan_exit` question as the exit gate (§11.2).
+    fn plan_mode(&self) -> bool {
         true
     }
 
@@ -739,6 +753,37 @@ struct Session {
     known_commands: Option<Vec<SlashCommand>>,
 }
 
+type RequestPlanExit = Box<dyn Fn() -> tokio::sync::oneshot::Receiver<PlanDecision> + Send + Sync>;
+
+/// Native plan mode for one run (§11.2, OpenCode row).
+struct PlanRun {
+    /// The REQUESTED mode, read at every send: the agent is a per-prompt
+    /// field and the v1 wire has no session-level mode switch, so a toggle
+    /// mid-run rides the next prompt (the first turn, then each steer).
+    mode: watch::Receiver<bool>,
+    request_exit: RequestPlanExit,
+    /// callIDs of `plan_exit` tool parts seen this run: a `question.asked`
+    /// naming one is the exit gate, not an ordinary ask.
+    exit_calls: HashSet<String>,
+}
+
+impl PlanRun {
+    fn new(controls: PlanControls) -> Self {
+        Self {
+            mode: controls.mode,
+            request_exit: controls.request_exit,
+            exit_calls: HashSet::new(),
+        }
+    }
+
+    /// The agent id this send carries: opencode's two built-in agents,
+    /// `plan` ("Plan mode. Disallows all edit tools.") and the default
+    /// `build`.
+    fn agent(&self) -> &'static str {
+        if *self.mode.borrow() { "plan" } else { "build" }
+    }
+}
+
 fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -855,6 +900,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        plan,
     } = controls;
     let request_input = Arc::new(request_input);
     let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());
@@ -925,6 +971,7 @@ async fn run_session(session: Session) {
     let variant = model.as_ref().and_then(|(provider, model_id)| {
         pick_variant(&providers, provider, model_id, request.reasoning)
     });
+    let mut plan = PlanRun::new(plan);
 
     let mut assistant_message_id = new_message_id();
     if !send(
@@ -982,12 +1029,28 @@ async fn run_session(session: Session) {
         );
     }
     let stall = stall_bound();
+    let agent = plan.agent();
     let first_body = prompt_body(
         &request.prompt,
         &model,
         variant.as_deref(),
         &request.attachments,
+        agent,
     );
+    // The mode we just entered, reported from the agent we send (§11.1
+    // "reported mode"); `plan_enter`/`plan_exit` parts carry every later flip.
+    if !send(
+        &event_tx,
+        AgentEvent::PlanModeChanged {
+            active: agent == "plan",
+        },
+    )
+    .await
+    {
+        bus_handle.abort();
+        server.shutdown(kill_grace).await;
+        return;
+    }
     if let Err(e) = post_prompt(
         &server,
         &session_id,
@@ -995,6 +1058,7 @@ async fn run_session(session: Session) {
         &commands,
         &request.prompt,
         first_body,
+        agent,
     )
     .await
     {
@@ -1072,8 +1136,11 @@ async fn run_session(session: Session) {
                 }).await {
                     break $label;
                 }
-                let body = prompt_body(&steer, &model, variant.as_deref(), &[]);
-                match post_prompt(&server, &session_id, dir, &commands, &steer, body).await {
+                // The mode is read HERE, not at run start: a toggle mid-run
+                // rides the next prompt (opencode has no other switch).
+                let agent = plan.agent();
+                let body = prompt_body(&steer, &model, variant.as_deref(), &[], agent);
+                match post_prompt(&server, &session_id, dir, &commands, &steer, body, agent).await {
                     Ok(()) => {
                         turn = TurnState::begin(stall);
                         continue $label;
@@ -1175,13 +1242,20 @@ async fn run_session(session: Session) {
                         } else {
                             // Between turns (shouldn't happen — the engine
                             // steers live runs — but deliver, don't drop).
-                            let body = prompt_body(&steer.prompt, &model, variant.as_deref(), &[]);
+                            let agent = plan.agent();
+                            let prompt = steer.prompt;
+                            let body =
+                                prompt_body(&prompt, &model, variant.as_deref(), &[], agent);
                             let (prev, next) = rotate(&mut assistant_message_id);
                             let _ = send(&event_tx, AgentEvent::Steered {
                                 assistant_message_id: Some(prev),
                                 next_assistant_message_id: Some(next),
                             }).await;
-                            if post_prompt(&server, &session_id, dir, &commands, &steer.prompt, body).await.is_ok() {
+                            let sent = post_prompt(
+                                &server, &session_id, dir, &commands, &prompt, body, agent,
+                            )
+                            .await;
+                            if sent.is_ok() {
                                 turn = TurnState::begin(stall);
                             }
                         }
@@ -1276,6 +1350,7 @@ async fn run_session(session: Session) {
                             dir,
                             event_tx: &event_tx,
                             request_input: &request_input,
+                            plan: &mut plan,
                             main_feed: &mut main_feed,
                             children: &mut children,
                             pending_spawns: &mut pending_spawns,
@@ -1337,12 +1412,14 @@ fn pick_variant(
         .map(str::to_owned)
 }
 
-/// Build a `prompt_async` body: text part + attachment file parts.
+/// Build a `prompt_async` body: text part + attachment file parts, sent as
+/// `agent` ("plan" | "build" — plan mode is that field, §11.2).
 fn prompt_body(
     prompt: &str,
     model: &Option<(String, String)>,
     variant: Option<&str>,
     attachments: &[String],
+    agent: &str,
 ) -> Value {
     let mut parts = vec![json!({ "type": "text", "text": prompt })];
     for path in attachments {
@@ -1358,6 +1435,7 @@ fn prompt_body(
     }
     let mut body = serde_json::Map::new();
     body.insert("parts".into(), Value::Array(parts));
+    body.insert("agent".into(), Value::String(agent.to_owned()));
     if let Some((provider, model)) = model {
         body.insert(
             "model".into(),
@@ -1402,12 +1480,16 @@ async fn post_prompt(
     commands: &[SlashCommand],
     prompt: &str,
     body: Value,
+    agent: &str,
 ) -> Result<(), HarnessError> {
     if let Some((invocation, command)) = crate::commands::known_invocation(prompt, commands) {
         let path = format!("/session/{session_id}/command");
         // The catalog's own name, not the typed one: opencode resolves the
-        // command server-side by the name it advertised.
-        let cmd_body = json!({ "command": command.name, "arguments": invocation.args });
+        // command server-side by the name it advertised. The command
+        // endpoint takes the same `agent` field as a prompt, so a slash
+        // invocation stays in the requested mode.
+        let cmd_body =
+            json!({ "command": command.name, "arguments": invocation.args, "agent": agent });
         let server_base = server.base.clone();
         let auth = server.auth.clone();
         let dir_owned = dir.map(str::to_owned);
@@ -1468,6 +1550,7 @@ struct BusCtx<'a> {
     dir: Option<&'a str>,
     event_tx: &'a mpsc::Sender<Result<AgentEvent, HarnessError>>,
     request_input: &'a Arc<RequestInput>,
+    plan: &'a mut PlanRun,
     main_feed: &'a mut SessionFeed,
     children: &'a mut HashMap<String, ChildRun>,
     pending_spawns: &'a mut VecDeque<PendingSpawn>,
@@ -1518,6 +1601,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         dir,
         event_tx,
         request_input,
+        plan,
         main_feed,
         children,
         pending_spawns,
@@ -1710,7 +1794,10 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 return BusOutcome::Continue;
             };
             if session == session_id {
-                let events = part_snapshot_events(
+                if let Some(call) = plan_exit_call(part) {
+                    plan.exit_calls.insert(call);
+                }
+                let mut events = part_snapshot_events(
                     main_feed,
                     part,
                     true,
@@ -1754,7 +1841,25 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                         ));
                     }
                 }
+                // A completion decoded HERE (the ToolResult) is the one that
+                // carries a plan signal; re-delivered snapshots emit neither.
+                let completed = events
+                    .iter()
+                    .any(|ev| matches!(ev, AgentEvent::ToolResult { .. }));
+                if is_gate_tool(part) {
+                    // The plan card already represents the gate: its tool
+                    // parts must not also fold into a chip (a rejected
+                    // `plan_exit` would render as a failed tool). The mode
+                    // signals below still ride them.
+                    events.retain(|ev| {
+                        !matches!(
+                            ev,
+                            AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
+                        )
+                    });
+                }
                 let mut all = events;
+                all.extend(plan_signals(part, completed).await);
                 all.extend(settle);
                 return forward(event_tx, all).await;
             }
@@ -1842,6 +1947,57 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             let Some(id) = props.get("id").and_then(Value::as_str) else {
                 return BusOutcome::Continue;
             };
+            // The plan-exit gate rides the SAME question service, bound to
+            // the `plan_exit` tool call (§11.2): it is the user's plan
+            // decision, not an ordinary ask, so it goes to the plan bridge —
+            // the ENGINE mints the request id and its events.
+            let bound_call = props
+                .get("tool")
+                .and_then(|t| t.get("callID"))
+                .and_then(Value::as_str);
+            if bound_call.is_some_and(|call| plan.exit_calls.contains(call)) {
+                let rx = (plan.request_exit)();
+                let base = server.base.clone();
+                let auth = server.auth.clone();
+                let dir_owned = dir.map(str::to_owned);
+                let request_id = id.to_owned();
+                tokio::spawn(async move {
+                    let server = Server {
+                        child: None,
+                        base,
+                        auth,
+                        client: http_client(),
+                        stderr_tail: crate::StderrTail::default(),
+                    };
+                    // A dropped sender reads as "keep planning" — never a
+                    // silent approval.
+                    let decision = rx.await.unwrap_or(PlanDecision {
+                        approved: false,
+                        feedback: None,
+                    });
+                    // The answer is the whole of the adapter's job. "Yes":
+                    // the server injects its own build message and switches
+                    // the agent. "No": the tool is rejected and the model
+                    // keeps planning — any typed feedback is delivered by
+                    // the ENGINE as the user's next message through the
+                    // ordinary steer path, so the adapter posts nothing.
+                    let answer = if decision.approved { "Yes" } else { "No" };
+                    if let Err(e) = server
+                        .post_json(
+                            &format!("/question/{request_id}/reply"),
+                            dir_owned.as_deref(),
+                            &json!({ "answers": [[answer]] }),
+                        )
+                        .await
+                    {
+                        tracing::debug!(
+                            target: "comet_harness::opencode",
+                            "plan exit reply failed: {e}"
+                        );
+                    }
+                });
+                return BusOutcome::Continue;
+            }
             let questions = map_questions(props);
             if questions.is_empty() {
                 return BusOutcome::Continue;
@@ -2297,6 +2453,95 @@ fn part_delta_events(
             text: delta.to_owned(),
         }
     }]
+}
+
+/// The callID of a `plan_exit` tool part, at any status: the question that
+/// tool raises IS the exit gate, and it can land before the part completes.
+fn plan_exit_call(part: &Value) -> Option<String> {
+    if part.get("type").and_then(Value::as_str) != Some("tool")
+        || part.get("tool").and_then(Value::as_str) != Some("plan_exit")
+    {
+        return None;
+    }
+    part.get("callID")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
+}
+
+/// A plan-gate tool part (`plan_exit` / `plan_enter`). The plan card is the
+/// gate's representation, so these parts carry their mode signal but never a
+/// tool chip on the main feed.
+fn is_gate_tool(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("tool")
+        && matches!(
+            part.get("tool").and_then(Value::as_str),
+            Some("plan_exit" | "plan_enter")
+        )
+}
+
+/// Plan-mode signals carried by a MAIN-feed tool part that just completed
+/// (§11.2, OpenCode row): `plan_enter` / `plan_exit` flip the reported mode
+/// — the exact predicate the opencode TUI keys on (completed, non-error, once
+/// per part) — and a completed `edit`/`write` on a plan file re-reads it as
+/// the current plan. The plan agent may write only `**/plans/*.md`
+/// (`.opencode/plans` in a VCS worktree, else `<data>/plans`) and the server
+/// runs on this host, so the file is readable from here.
+async fn plan_signals(part: &Value, completed: bool) -> Vec<AgentEvent> {
+    if !completed || part.get("type").and_then(Value::as_str) != Some("tool") {
+        return Vec::new();
+    }
+    let state = part.get("state").unwrap_or(&Value::Null);
+    if state.get("status").and_then(Value::as_str) != Some("completed") {
+        return Vec::new();
+    }
+    match part.get("tool").and_then(Value::as_str).unwrap_or_default() {
+        "plan_enter" => vec![AgentEvent::PlanModeChanged { active: true }],
+        "plan_exit" => vec![AgentEvent::PlanModeChanged { active: false }],
+        "edit" | "write" => {
+            let path = state
+                .get("input")
+                .and_then(|i| {
+                    i.get("filePath")
+                        .or_else(|| i.get("file_path"))
+                        .or_else(|| i.get("path"))
+                })
+                .and_then(Value::as_str)
+                .filter(|p| is_plan_file(p))
+                .unwrap_or_default();
+            if path.is_empty() {
+                return Vec::new();
+            }
+            match tokio::fs::read_to_string(path).await {
+                Ok(text) => vec![AgentEvent::PlanUpdated {
+                    text,
+                    path: Some(path.to_owned()),
+                }],
+                Err(e) => {
+                    tracing::debug!(
+                        target: "comet_harness::opencode",
+                        "plan file {path} unreadable: {e}"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A markdown file directly inside a `plans` directory — where opencode's
+/// plan agent is allowed to write, and nowhere else.
+fn is_plan_file(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+        && path
+            .parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            == Some("plans")
 }
 
 /// `question.asked` → the input panel's questions (ids are positional).
