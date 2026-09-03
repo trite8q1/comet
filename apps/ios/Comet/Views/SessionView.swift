@@ -117,7 +117,8 @@ struct SessionView: View {
         // keyboard-dismiss (scrollDismissesKeyboard(.interactively) in
         // TranscriptView) track a downward drag — with a sibling composer the
         // scroll view ends above the keyboard and the pan never engages it.
-        return TranscriptView(store: store, chatId: chat.id, scroll: scroll)
+        return TranscriptView(store: store, chatId: chat.id,
+                              harness: chat.config?.harness, scroll: scroll)
             // The registry row says this session HAS messages; an empty
             // transcript is therefore still hydrating (no disk snapshot yet,
             // checkpoint in flight) — show the pulse, not a black void. This

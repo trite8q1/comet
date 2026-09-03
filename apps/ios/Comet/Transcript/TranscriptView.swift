@@ -13,14 +13,17 @@ import SwiftUI
 struct TranscriptView: View {
     let store: SessionStore
     let chatId: String
+    /// `ChatConfig.harness` — the plan card's brand mark.
+    let harness: String?
     /// Owned by SessionView so IT can report the composer inset's global
     /// frame into `insetTopGlobalY` — the measured truth `correctPin`
     /// re-pins against.
     let scroll: ScrollState
 
-    init(store: SessionStore, chatId: String, scroll: ScrollState) {
+    init(store: SessionStore, chatId: String, harness: String?, scroll: ScrollState) {
         self.store = store
         self.chatId = chatId
+        self.harness = harness
         self.scroll = scroll
         // NOT seeded from store.hasRevealed anymore. That seed (meant to stop
         // a blink on mid-typing view re-creation) un-gated every warm RE-OPEN:
@@ -417,6 +420,22 @@ struct TranscriptView: View {
 
             case .inputChip(let header, let resolved):
                 InputChipView(header: header, resolved: resolved)
+
+            case .planCard(let blocks, let title, let status, let requestId):
+                // Open while the plan is still in play, folded once approved.
+                let autoOpen = status != .approved
+                PlanCardView(blocks: blocks, title: title, status: status,
+                             requestId: requestId, harness: harness, cacheKey: row.id,
+                             open: folds[row.id] ?? autoOpen,
+                             toggle: {
+                                 withAnimation(reduceMotion ? nil : Motion.resize) {
+                                     folds[row.id] = !(folds[row.id] ?? autoOpen)
+                                 }
+                             },
+                             respond: { approved in
+                                 guard let requestId else { return }
+                                 store.respondPlanExit(requestId: requestId, approved: approved)
+                             })
 
             case .errorChip(let message):
                 ErrorChipView(message: message)

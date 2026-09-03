@@ -473,6 +473,14 @@ final class SessionStore {
             }
             return .input(id: id, requestId: id, questions: questions,
                           resolved: m["resolved"]?.boolValue ?? false)
+        case "plan":
+            // The body rides `plan` (a LoroText, deep-valued to a string),
+            // never `text` — schema.rs to_doc_part.
+            return .plan(id: id, plan: m["plan"]?.stringValue ?? "",
+                         status: m["planStatus"]?.stringValue
+                             .flatMap(PlanStatus.init(rawValue:)) ?? .drafting,
+                         requestId: m["requestId"]?.stringValue,
+                         path: m["path"]?.stringValue)
         case "error":
             return .error(id: id, message: m["message"]?.stringValue ?? "")
         default:
@@ -519,10 +527,34 @@ final class SessionStore {
         return nil
     }
 
+    /// The parked plan-exit gate to answer (ARCHITECTURE.md §11.4): while one
+    /// stands, the card shows Approve / Keep planning and the composer's send
+    /// carries feedback instead of a run.
+    var pendingPlanExit: (entryId: String, requestId: String)? {
+        Self.pendingPlanExit(in: entries)
+    }
+
+    /// Pure half of `pendingPlanExit` — the newest unanswered gate.
+    nonisolated static func pendingPlanExit(in entries: [MessageEntry])
+        -> (entryId: String, requestId: String)? {
+        for entry in entries.reversed() {
+            for part in entry.parts.reversed() {
+                guard case .plan(_, _, let status, let requestId, _) = part else { continue }
+                guard status == .awaitingApproval, let requestId else { continue }
+                return (entry.id, requestId)
+            }
+        }
+        return nil
+    }
+
     // MARK: Command plane (ledger rule 1: append-only, own entries only)
 
+    /// `planMode` overrides the chat config's requested mode for this one
+    /// request: `/plan <description>` enters the mode and sends in the same
+    /// gesture (§11.9), and the config write has not round-tripped through the
+    /// doc by then. Everything else reads the config, as before.
     func sendRun(prompt: String, chat: Chat, attachments: [String] = [],
-                 worktree: WorktreeSpec? = nil) {
+                 worktree: WorktreeSpec? = nil, planMode: Bool? = nil) {
         if offline {
             demoResponder?(prompt)
             return
@@ -536,7 +568,8 @@ final class SessionStore {
                                  cwd: chat.cwd ?? "",
                                  sandbox: chat.config?.sandbox ?? "workspace-write",
                                  attachments: attachments,
-                                 worktree: worktree)
+                                 worktree: worktree,
+                                 planMode: planMode ?? chat.config?.planMode ?? false)
         queueCommand(kind: "run", payload: [
             "kind": "run",
             "request": encodableJSON(request),
@@ -596,6 +629,30 @@ final class SessionStore {
             "kind": "respondInput",
             "requestId": requestId,
             "answers": answers.map(encodableJSON),
+        ])
+    }
+
+    /// Answer the harness's plan-exit gate (commands.rs RespondPlanExit).
+    /// `feedback` rides the "keep planning" answer wherever the CLI's gate has
+    /// a message channel; an empty one is omitted, like the host's shape.
+    func respondPlanExit(requestId: String, approved: Bool, feedback: String? = nil) {
+        var payload: [String: Any] = [
+            "kind": "respondPlanExit",
+            "requestId": requestId,
+            "approved": approved,
+        ]
+        if let feedback, !feedback.isEmpty {
+            payload["feedback"] = feedback
+        }
+        queueCommand(kind: "respondPlanExit", payload: payload)
+    }
+
+    /// Push the requested plan mode into a live run (commands.rs SetPlanMode);
+    /// an idle chat applies nothing — the next run carries the config value.
+    func setPlanMode(active: Bool) {
+        queueCommand(kind: "setPlanMode", payload: [
+            "kind": "setPlanMode",
+            "active": active,
         ])
     }
 

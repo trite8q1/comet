@@ -323,9 +323,10 @@ func slashCaret(in text: String, selection: TextSelection?) -> Int {
 /// need one (§10.4 "Freshness").
 @MainActor
 func syncSlash(_ slash: Binding<SlashCommandsModel>, text: String, selection: TextSelection?,
-               key: SlashCatalogKey?, model: AppModel) {
+               key: SlashCatalogKey?, planOffered: Bool, model: AppModel) {
     guard let fetch = slash.wrappedValue.update(
-        text: text, cursor: slashCaret(in: text, selection: selection), key: key)
+        text: text, cursor: slashCaret(in: text, selection: selection), key: key,
+        planOffered: planOffered)
     else { return }
     Task { @MainActor in
         switch await model.listCommands(deviceId: fetch.deviceId, harness: fetch.harness,
@@ -372,6 +373,9 @@ struct ComposerView: View {
     @State private var showTraitPicker = false
     /// Live catalog for the chat's harness from its space's device.
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    /// Live harness list from the same device — the Plan toggle's gate
+    /// (§11.6: composers branch on the descriptor, never on a harness id).
+    @State private var harnessCatalog: [HarnessInfo] = HarnessCatalog.harnesses
 
     private var harness: String { chat.config?.harness ?? "claude-code" }
 
@@ -388,6 +392,10 @@ struct ComposerView: View {
         if let r = chat.config?.reasoning, currentModel.reasoningLevels.contains(r) { return r }
         return HarnessCatalog.defaultReasoning(for: currentModel)
     }
+
+    /// The parked plan-exit gate, if any — it takes over the send on every
+    /// harness (§11.2 Feedback delivery).
+    private var pendingPlanExit: String? { store.pendingPlanExit?.requestId }
 
     var body: some View {
         // Subscribe to the connectivity pulse so the degraded caption follows
@@ -430,6 +438,7 @@ struct ComposerView: View {
             )
             ComposerShell(
                 draft: $text,
+                placeholder: pendingPlanExit != nil ? planFeedbackPlaceholder : "Message",
                 sendEnabled: true,
                 showStop: runLive,
                 busy: uploading,
@@ -456,6 +465,9 @@ struct ComposerView: View {
                     ComposerChip(label: HarnessCatalog.reasoningLabel(currentReasoning)) {
                         showTraitPicker = true
                     }
+                }
+                if planOffered {
+                    PlanModeChip(active: chat.config?.planMode ?? false, toggle: togglePlanMode)
                 }
             }
         }
@@ -491,11 +503,13 @@ struct ComposerView: View {
         }
         .task(id: "\(chat.id)/\(harness)") {
             guard let space = model.space(for: chat) else { return }
+            harnessCatalog = await model.listHarnesses(space: space)
             catalogs[harness] = await model.listModels(space: space, harness: harness)
         }
         .onChange(of: text) { syncSlashCommands() }
         .onChange(of: selection) { syncSlashCommands() }
         .onChange(of: harness) { syncSlashCommands() }
+        .onChange(of: harnessCatalog) { syncSlashCommands() }
         .onAppear {
             if model.launchSheet == "config" {
                 model.launchSheet = nil
@@ -509,7 +523,12 @@ struct ComposerView: View {
     private func syncSlashCommands() {
         syncSlash($slash, text: text, selection: selection,
                   key: SlashCatalogKey(deviceId: chat.deviceId, harness: harness, cwd: chat.cwd),
-                  model: model)
+                  planOffered: planOffered, model: model)
+    }
+
+    /// Whether `/plan` is on offer here at all — the chip's own gate (§11.9).
+    private var planOffered: Bool {
+        planModeAvailable(harness: harness, catalog: harnessCatalog)
     }
 
     /// Merge a model/effort change into the chat's config row (LWW; the host
@@ -520,6 +539,28 @@ struct ComposerView: View {
         config.model = newModel
         config.reasoning = newReasoning
         model.setChatConfig(chatId: chat.id, config: config)
+    }
+
+    /// Flip the requested plan mode: the config row is the durable request
+    /// (it rides the next run), the ledger command reaches a run already live
+    /// (§11.4 steps 1-2). An idle chat's command applies nothing.
+    private func togglePlanMode() {
+        writePlanMode(!(chat.config?.planMode ?? false))
+    }
+
+    /// `/plan`'s entry: the chip's own path pointed one way (§11.9 — no
+    /// `/plan off` exists natively). Already-on is a no-op.
+    private func enterPlanMode() {
+        guard chat.config?.planMode != true else { return }
+        writePlanMode(true)
+    }
+
+    private func writePlanMode(_ active: Bool) {
+        var config = chat.config ?? ChatConfig(harness: harness, model: nil,
+                                               reasoning: nil, sandbox: "workspace-write")
+        config.planMode = active
+        model.setChatConfig(chatId: chat.id, config: config)
+        store.setPlanMode(active: active)
     }
 
     /// Load picked photos into staged attachments (HEIC transcodes to JPEG;
@@ -550,6 +591,33 @@ struct ComposerView: View {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let staged = attachments
         guard !prompt.isEmpty || !staged.isEmpty else { return }
+
+        // A parked plan-exit gate owns the send: the text is feedback on the
+        // plan, not a new turn (§11.4 step 4).
+        if case .planFeedback(let requestId) = composerSendAction(pendingPlanExit: pendingPlanExit,
+                                                                 prompt: prompt) {
+            store.respondPlanExit(requestId: requestId, approved: false, feedback: prompt)
+            clearDraft()
+            return
+        }
+
+        // `/plan` is the composer's own command — it IS the chip (§11.9), so
+        // it never reaches the harness as text. `/plan` alone only enters the
+        // mode; a description enters it and runs in the same gesture.
+        if case .plan(let description) = composerBuiltin(text: prompt, planOffered: planOffered) {
+            enterPlanMode()
+            clearDraft()
+            if let description {
+                if runLive {
+                    store.sendSteer(prompt: description)
+                } else {
+                    // The config write has not round-tripped through the doc
+                    // yet, so the flipped mode rides the request explicitly.
+                    store.sendRun(prompt: description, chat: chat, planMode: true)
+                }
+            }
+            return
+        }
 
         if staged.isEmpty {
             deliver(content: prompt, paths: [])
@@ -637,6 +705,14 @@ struct ComposerView: View {
 
 // MARK: - Question panel (composer.rs Wizard)
 
+/// Whether picking an option advances the panel by itself. Only BETWEEN
+/// pages: on the last page the pick would submit the whole request, so the
+/// user taps Submit themselves. Multi-select never auto-advances — the pick
+/// is a toggle.
+func questionPanelAutoAdvances(page: Int, count: Int, multiSelect: Bool) -> Bool {
+    !multiSelect && page < count - 1
+}
+
 struct QuestionPanel: View {
     let requestId: String
     let questions: [UserInputQuestion]
@@ -704,7 +780,7 @@ struct QuestionPanel: View {
                 .padding(.top, 6)
             }
 
-            HStack {
+            HStack(spacing: 14) {
                 if page > 0 {
                     Button("Back") {
                         page -= 1
@@ -712,6 +788,12 @@ struct QuestionPanel: View {
                     .font(Theme.sans(13, weight: .medium))
                     .foregroundStyle(Theme.textMuted)
                 }
+                Button("Skip") {
+                    autoAdvanceTask?.cancel()
+                    respond(requestId, [])
+                }
+                .font(Theme.sans(13, weight: .medium))
+                .foregroundStyle(Theme.textMuted)
                 Spacer()
                 Button(page < questions.count - 1 ? "Next" : "Submit") {
                     advance()
@@ -772,8 +854,11 @@ struct QuestionPanel: View {
             picked[question.id] = set
         } else {
             picked[question.id] = [option]
-            // Single-select auto-advances after 220ms (AUTO_ADVANCE_MS).
+            // Single-select auto-advances after 220ms (AUTO_ADVANCE_MS) —
+            // between pages only; the last page waits for Submit.
             autoAdvanceTask?.cancel()
+            guard questionPanelAutoAdvances(page: page, count: questions.count,
+                                            multiSelect: false) else { return }
             autoAdvanceTask = Task {
                 try? await Task.sleep(nanoseconds: 220_000_000)
                 guard !Task.isCancelled else { return }

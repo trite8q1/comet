@@ -9,6 +9,11 @@ import Foundation
 struct HarnessInfo: Identifiable, Hashable {
     let id: String
     let label: String
+    /// Whether the agent's own wire has a plan mode comet drives natively
+    /// (registry.rs `HarnessDescriptor.plan_mode`). Gates the composer's Plan
+    /// toggle — composers branch on this, never on the harness id. Absent on
+    /// catalogs from older engines ⇒ false.
+    var planMode: Bool = false
 }
 
 struct ModelInfo: Identifiable, Hashable {
@@ -25,8 +30,8 @@ enum HarnessCatalog {
     /// `ListHarnesses` catalog — they're opt-in per device via
     /// Settings → Agents on the desktop.
     static let harnesses: [HarnessInfo] = [
-        HarnessInfo(id: "claude-code", label: "Claude Code"),
-        HarnessInfo(id: "codex", label: "Codex"),
+        HarnessInfo(id: "claude-code", label: "Claude Code", planMode: true),
+        HarnessInfo(id: "codex", label: "Codex", planMode: false),
     ]
 
     /// Display names for every harness id the fleet can produce, including

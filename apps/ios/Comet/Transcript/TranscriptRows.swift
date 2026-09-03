@@ -14,6 +14,9 @@ enum RowKind {
     case markdown(block: MDBlock, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
     case inputChip(header: String, resolved: Bool)
+    /// The harness's plan for this segment (ARCHITECTURE.md §11.6) — the body
+    /// is the plan markdown, parsed like assistant prose.
+    case planCard(blocks: [TopBlock], title: String, status: PlanStatus, requestId: String?)
     case errorChip(message: String)
 }
 
@@ -187,6 +190,23 @@ enum TranscriptRowBuilder {
                                           entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
 
+            case .plan(let partId, let plan, let status, let requestId, _):
+                flushTools(lastIx: ix - 1)
+                let key = "\(entry.id)#\(partId)"
+                live.insert(key)
+                // A draft is a whole rewrite, never an append, so the memo
+                // (keyed by content) carries it — not the incremental parser.
+                let blocks = parse(text: plan, key: key, streaming: false,
+                                   parsers: &parsers, completed: &completed)
+                rows.append(TranscriptRow(id: key,
+                                          version: planVersion(plan: plan, status: status,
+                                                               requestId: requestId),
+                                          turnStart: first,
+                                          kind: .planCard(blocks: blocks, title: planTitle(plan),
+                                                          status: status, requestId: requestId),
+                                          entryId: entry.id, timestamp: nil, partKey: nil))
+                first = false
+
             case .error(let partId, let message):
                 flushTools(lastIx: ix - 1)
                 rows.append(TranscriptRow(id: "\(entry.id)#\(partId)", version: fnv1a(message),
@@ -222,6 +242,24 @@ enum TranscriptRowBuilder {
             : MarkdownParser.parse(text)
         completed[key] = CompletedParse(source: text, blocks: blocks)
         return blocks
+    }
+
+    /// The card's detail line: the plan's first `# ` heading, else "Plan".
+    static func planTitle(_ plan: String) -> String {
+        for line in plan.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("# ") else { continue }
+            let title = trimmed.dropFirst(2).trimmingCharacters(in: .whitespaces)
+            if !title.isEmpty { return title }
+        }
+        return "Plan"
+    }
+
+    /// Diff key for a plan part. The part is refreshed IN PLACE by every
+    /// `PlanUpdated`, so the row id never moves — the version has to carry
+    /// every visible change: the draft's length, the status, the parked gate.
+    static func planVersion(plan: String, status: PlanStatus, requestId: String?) -> UInt64 {
+        fnv1a("\(plan.count)|\(status.rawValue)|\(requestId ?? "")")
     }
 
     private static func toolFingerprint(_ tools: [ToolItem]) -> UInt64 {
