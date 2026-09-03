@@ -4802,6 +4802,21 @@ impl Composer {
                 }
             }
         }
+        // Picking a different project/device on the new-chat canvas moves the
+        // slash key with no input edit to drive `update_slash` (§10.6): with a
+        // `/` popup already open, re-run discovery so the new folder's list
+        // replaces the previous one at once, never lingering until the next
+        // keystroke.
+        if self.wizard.is_none()
+            && self.slash.token.is_some()
+            && self.slash_key(cx) != self.slash.key
+        {
+            let (text, cursor) = {
+                let input = self.input.read(cx);
+                (input.text().to_string(), input.cursor_offset())
+            };
+            self.update_slash(&text, cursor, cx);
+        }
         cx.notify();
     }
 
