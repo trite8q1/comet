@@ -610,6 +610,18 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:plan-gate-unreported*)
+  # The same generic exit gate, but the agent NEVER reports its mode (no
+  # `current_mode_update`). The tool name alone has to stop the auto-approve —
+  # gating on a reported mode bit would silently approve the exit here.
+  emit "{\"id\":72,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"x1\",\"title\":\"exit_plan_mode\",\"kind\":\"other\"},\"options\":[{\"optionId\":\"yes\",\"name\":\"Approve\",\"kind\":\"allow_once\"},{\"optionId\":\"keep\",\"name\":\"Keep planning\",\"kind\":\"reject_once\"}]}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":72' && has "$ans" '"optionId":"keep"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"still planning"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:plan-file*)
   # grok writes the plan to a file and edits it with a normal edit tool; the
   # FILE (not the hunk) is the plan, so the adapter re-reads it from disk.

@@ -1167,11 +1167,13 @@ fn plan_status_bits(status: PlanStatus) -> u8 {
     }
 }
 
-/// The plan row's diff key: length + lifecycle + the parked request. The
-/// harness refreshes the part in place, so every draft has to move this.
+/// The plan row's diff key: CONTENT + lifecycle + the parked request. The
+/// harness refreshes the part in place, so every draft has to move this — and
+/// a redraft can rewrite the plan without changing its length (a reordered
+/// step, a swapped word), so the key hashes the bytes, not `len()`.
 fn plan_version(plan: &str, status: PlanStatus, request_id: Option<&str>) -> u64 {
-    let mut acc = Vec::with_capacity(request_id.map_or(0, str::len) + 9);
-    acc.extend_from_slice(&(plan.len() as u64).to_le_bytes());
+    let mut acc = Vec::with_capacity(request_id.map_or(0, str::len) + 17);
+    acc.extend_from_slice(&fnv1a(plan.as_bytes()).to_le_bytes());
     acc.push(plan_status_bits(status));
     acc.extend_from_slice(request_id.unwrap_or_default().as_bytes());
     fnv1a(&acc)
@@ -2304,9 +2306,6 @@ pub struct Transcript {
     /// Shared with the measuring canvas, so it must outlive the borrow the
     /// element tree takes — the [`RenderCache`] arrangement.
     plan_heights: Rc<RefCell<HashMap<SharedString, PlanBodyMeasure>>>,
-    /// Plan-exit requests answered from THIS card, held until the doc frame
-    /// flips the part's status (the composer's `answered_requests` latch).
-    answered_plan_gates: std::collections::HashSet<String>,
     /// The in-flight `RespondPlanExit` QueueCommand.
     plan_task: Option<Task<()>>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
@@ -2533,7 +2532,6 @@ impl Transcript {
             folds: HashMap::new(),
             tool_details: HashMap::new(),
             plan_heights: Rc::default(),
-            answered_plan_gates: std::collections::HashSet::new(),
             plan_task: None,
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
@@ -5210,9 +5208,9 @@ impl Transcript {
 
     /// The card's answer to the harness's own exit gate: the ledger command
     /// the host executes, queued through the very RPC the composer sends a
-    /// Run or a `RespondInput` with. The request is marked answered locally
-    /// so the buttons go quiet until the doc frame flips the part's status
-    /// (the composer's `answered_requests` latch), and un-marked when the
+    /// Run or a `RespondInput` with. The request is marked answered in the
+    /// SHARED latch so both the buttons and the composer's send go quiet
+    /// until the doc frame flips the part's status, and un-marked when the
     /// queue call itself fails — the gate must stay answerable.
     fn answer_plan_gate(&mut self, request_id: String, approved: bool, cx: &mut Context<Self>) {
         let (Some(chat_id), Some(engine)) =
@@ -5228,7 +5226,9 @@ impl Transcript {
         let Ok(command) = serde_json::to_value(&command) else {
             return;
         };
-        self.answered_plan_gates.insert(request_id.clone());
+        self.state.update(cx, |state, _| {
+            state.mark_plan_gate_answered(&request_id);
+        });
         let params = serde_json::json!({ "chatId": chat_id, "command": command });
         self.plan_task = Some(cx.spawn(async move |this, cx| {
             let result = crate::attachments::call_with_timeout(
@@ -5242,7 +5242,9 @@ impl Transcript {
             if let Err(err) = result {
                 tracing::warn!(error = %err, "RespondPlanExit queue failed");
                 this.update(cx, |this, cx| {
-                    this.answered_plan_gates.remove(&request_id);
+                    this.state.update(cx, |state, _| {
+                        state.unmark_plan_gate_answered(&request_id);
+                    });
                     cx.notify();
                 })
                 .ok();
@@ -5337,7 +5339,7 @@ impl Transcript {
                 highlight.get(&ix).cloned().flatten()
             });
             let answered =
-                request_id.is_some_and(|id| self.answered_plan_gates.contains(id.as_ref()));
+                request_id.is_some_and(|id| self.state.read(cx).plan_gate_answered(id.as_ref()));
             let actions = request_id
                 .filter(|_| status == PlanStatus::AwaitingApproval)
                 .map(|request_id| plan_actions(row_id, request_id.clone(), answered, theme, cx));
@@ -6333,12 +6335,17 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         // A plan part mutates in place: the exit gate flips its status (and
         // parks a request id) without touching a byte of the plan, so the
         // `byte_len` above alone would leave the cached card showing
-        // "Drafting…" forever.
+        // "Drafting…" forever — and a same-LENGTH redraft moves neither, so
+        // the plan body is hashed here too (`plan_version` does the same).
         if let MessagePart::Plan {
-            status, request_id, ..
+            plan,
+            status,
+            request_id,
+            ..
         } = part
         {
             acc.push(0x20 | plan_status_bits(*status));
+            acc.extend_from_slice(&fnv1a(plan.as_bytes()).to_le_bytes());
             acc.extend_from_slice(request_id.as_deref().unwrap_or_default().as_bytes());
         }
     }
@@ -7316,6 +7323,35 @@ mod tests {
         assert_ne!(
             fingerprint(PlanStatus::AwaitingApproval, Some("req-1")),
             fingerprint(PlanStatus::Approved, Some("req-1")),
+        );
+    }
+
+    /// A redraft that keeps the plan's LENGTH (a reordered step, a swapped
+    /// word) still has to re-render: both diff keys hash the plan's bytes.
+    #[test]
+    fn a_same_length_plan_redraft_still_re_renders() {
+        let before = "# Plan\n\n1. read\n2. write\n";
+        let after = "# Plan\n\n1. scan\n2. write\n";
+        assert_eq!(before.len(), after.len(), "the point of the test");
+        assert_ne!(
+            plan_version(before, PlanStatus::Drafting, None),
+            plan_version(after, PlanStatus::Drafting, None),
+            "the row version moves",
+        );
+        let fingerprint = |plan: &str| {
+            entry_fingerprint(
+                &assistant(
+                    "m1",
+                    MessageStatus::Complete,
+                    vec![plan_part(plan, PlanStatus::AwaitingApproval, Some("req-1"))],
+                ),
+                false,
+            )
+        };
+        assert_ne!(
+            fingerprint(before),
+            fingerprint(after),
+            "the cached-rows fingerprint moves",
         );
     }
 

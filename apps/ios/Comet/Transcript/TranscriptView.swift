@@ -435,7 +435,8 @@ struct TranscriptView: View {
                              respond: { approved in
                                  guard let requestId else { return }
                                  store.respondPlanExit(requestId: requestId, approved: approved)
-                             })
+                             },
+                             answered: requestId.map(store.answeredPlanGates.contains) ?? false)
 
             case .errorChip(let message):
                 ErrorChipView(message: message)

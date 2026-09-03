@@ -639,6 +639,11 @@ pub struct AppState {
     transfers: HashMap<String, (u64, u64)>,
     /// Written by the changes pane, read by the composer.
     diff_comments: HashMap<String, Vec<DiffComment>>,
+    /// Plan-exit request ids answered from THIS device, held until the doc
+    /// frame flips the part's status. Shared, because the card's buttons and
+    /// the composer's send answer the SAME gate: two latches would let a send
+    /// right after an Approve take the gate again as "keep planning".
+    answered_plan_gates: HashSet<String>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -692,6 +697,7 @@ impl AppState {
             upload_progress: None,
             transfers: HashMap::new(),
             diff_comments: HashMap::new(),
+            answered_plan_gates: HashSet::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
@@ -747,6 +753,23 @@ impl AppState {
 
     pub fn purge_diff_comments(&mut self, key: &str) {
         self.diff_comments.remove(key);
+    }
+
+    /// Whether this device already answered that plan-exit gate.
+    pub fn plan_gate_answered(&self, request_id: &str) -> bool {
+        self.answered_plan_gates.contains(request_id)
+    }
+
+    /// Latch a gate as answered the moment the command is queued, so nothing
+    /// else on this device answers it again while the doc round-trips.
+    pub fn mark_plan_gate_answered(&mut self, request_id: &str) {
+        self.answered_plan_gates.insert(request_id.to_string());
+    }
+
+    /// The queue call failed — the answer never left this device, so the gate
+    /// must stay answerable.
+    pub fn unmark_plan_gate_answered(&mut self, request_id: &str) {
+        self.answered_plan_gates.remove(request_id);
     }
 
     // ---- reducers (pure) ----

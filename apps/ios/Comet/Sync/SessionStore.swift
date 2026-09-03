@@ -60,6 +60,12 @@ final class SessionStore {
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [PendingSend] = []
+    /// Plan-exit request ids answered from THIS device, held until the doc
+    /// frame flips the part's status. Store-owned because the card's buttons
+    /// and the composer's send answer the SAME gate: a latch private to the
+    /// card would let a send right after an Approve take the gate again as
+    /// "keep planning".
+    private(set) var answeredPlanGates: Set<String> = []
 
     let doc = LoroDoc()
     /// The chat2 room cursor — the last server row seq folded into `doc`.
@@ -529,20 +535,25 @@ final class SessionStore {
 
     /// The parked plan-exit gate to answer (ARCHITECTURE.md §11.4): while one
     /// stands, the card shows Approve / Keep planning and the composer's send
-    /// carries feedback instead of a run.
+    /// carries feedback instead of a run. Minus the gates already answered
+    /// from here, which stand in the doc until the frame flips them.
     var pendingPlanExit: (entryId: String, requestId: String)? {
-        Self.pendingPlanExit(in: entries)
+        guard let gate = Self.pendingPlanExit(in: entries),
+              !answeredPlanGates.contains(gate.requestId) else { return nil }
+        return gate
     }
 
-    /// Pure half of `pendingPlanExit` — the newest unanswered gate.
+    /// Pure half of `pendingPlanExit` — the gate on the LAST assistant entry,
+    /// matching the desktop rule (`composer.rs pending_plan_gate`): a newer
+    /// assistant entry supersedes an unanswered gate, so the composer never
+    /// binds its send to a stale card.
     nonisolated static func pendingPlanExit(in entries: [MessageEntry])
         -> (entryId: String, requestId: String)? {
-        for entry in entries.reversed() {
-            for part in entry.parts.reversed() {
-                guard case .plan(_, _, let status, let requestId, _) = part else { continue }
-                guard status == .awaitingApproval, let requestId else { continue }
-                return (entry.id, requestId)
-            }
+        guard let entry = entries.last(where: { $0.role == .assistant }) else { return nil }
+        for part in entry.parts.reversed() {
+            guard case .plan(_, _, let status, let requestId, _) = part else { continue }
+            guard status == .awaitingApproval, let requestId else { continue }
+            return (entry.id, requestId)
         }
         return nil
     }
@@ -644,6 +655,10 @@ final class SessionStore {
         if let feedback, !feedback.isEmpty {
             payload["feedback"] = feedback
         }
+        // Latched before the append: the ledger write is local and always
+        // lands, so nothing else on this device answers the same gate while
+        // the host's frame is on its way back.
+        answeredPlanGates.insert(requestId)
         queueCommand(kind: "respondPlanExit", payload: payload)
     }
 

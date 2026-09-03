@@ -302,6 +302,54 @@ fn turn_boundary_harness() -> Arc<PlanHarness> {
     })
 }
 
+/// Stop with the gate still parked: the drain answers the harness "keep
+/// planning" (never a silent approval), and the CARD has to settle with it.
+/// Left `AwaitingApproval` the plan part would outlive its run — buttons live
+/// on a dead request id, and every later composer send taken as feedback on a
+/// plan nobody is waiting for.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupting_a_parked_gate_settles_the_card() {
+    let h = turn_boundary_harness();
+    let (_tmp, core) = assemble(h.clone()).await;
+    core.doc_host
+        .queue_command(CHAT, run_payload("m-1", true))
+        .expect("queue run");
+    wait_for(
+        || {
+            matches!(
+                plan_status(&core),
+                Some((PlanStatus::AwaitingApproval, Some(_), _))
+            )
+        },
+        "gate",
+    )
+    .await;
+    core.sessions.interrupt(CHAT).await.expect("interrupt");
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "settles",
+    )
+    .await;
+    let (status, _, _) = plan_status(&core).expect("the card survives as history");
+    assert_eq!(
+        status,
+        PlanStatus::Revising,
+        "a stopped gate settles where the drain answered it",
+    );
+    assert_eq!(
+        h.decisions.lock().unwrap().clone(),
+        vec![PlanDecision {
+            approved: false,
+            feedback: None
+        }],
+        "the drain must never silently approve",
+    );
+}
+
 /// ARCHITECTURE.md §11.2 "Feedback delivery" on a turn-boundary agent: a
 /// message queued behind the parked gate keeps the session AwaitingInput
 /// (never a Working spinner over nothing), and "keep planning" feedback

@@ -1618,7 +1618,6 @@ fn non_plan_mode_id(session_response: &Value, plan_id: &str) -> String {
 struct PlanGate {
     exit_method: Option<&'static str>,
     exit_tools: &'static [&'static str],
-    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     request_exit: std::sync::Arc<RequestExitFn>,
 }
 
@@ -1862,12 +1861,14 @@ fn handle_server_request_live(
         .unwrap_or_default();
     // The plan-exit gate as a plain permission request (§11.2, the shape a
     // generic ACP agent raises). It is the ONE permission that stops
-    // auto-approving, and only while plan mode is reported active — every
-    // other approval keeps today's unattended behavior.
-    if plan.active.load(std::sync::atomic::Ordering::SeqCst)
-        && params
-            .get("toolCall")
-            .is_some_and(|call| is_plan_exit_call(call, plan.exit_tools))
+    // auto-approving; every other approval keeps today's unattended
+    // behavior. The TOOL NAME is the whole gate — exactly as Claude keys off
+    // `ExitPlanMode` and grok off `_x.ai/exit_plan_mode`. Gating this on the
+    // reported mode bit instead would silently approve the exit whenever the
+    // agent's `current_mode_update` is absent or arrives after the request.
+    if params
+        .get("toolCall")
+        .is_some_and(|call| is_plan_exit_call(call, plan.exit_tools))
     {
         spawn_plan_exit(client, id, plan, open_questions, Some(options));
         return Vec::new();
@@ -2201,7 +2202,6 @@ async fn run_session(session: Session) {
     let plan_gate = PlanGate {
         exit_method: plan_exit_method,
         exit_tools: plan_exit_tools,
-        active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         request_exit: std::sync::Arc::new(request_exit),
     };
 
@@ -2439,9 +2439,6 @@ async fn run_session(session: Session) {
     // drops notifications. Report it now, after SessionStarted so the event
     // lands on a live segment (§11.4 step 1).
     if plan_entered {
-        plan_gate
-            .active
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         if !send(&event_tx, AgentEvent::PlanModeChanged { active: true }).await {
             shutdown_child(&mut child, kill_grace).await;
             return;
@@ -2827,14 +2824,6 @@ async fn run_session(session: Session) {
                                     );
                     for ev in events {
                         track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
-                        // The REPORTED mode gates the generic permission
-                        // interception: only a plan-mode session's exit tool
-                        // stops auto-approving.
-                        if let AgentEvent::PlanModeChanged { active } = &ev {
-                            plan_gate
-                                .active
-                                .store(*active, std::sync::atomic::Ordering::SeqCst);
-                        }
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }

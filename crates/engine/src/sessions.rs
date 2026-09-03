@@ -2255,9 +2255,20 @@ async fn drive_run(
             // errored, interrupted) terminally resolves its input parts — an
             // unresolved question must not outlive the run that asked it
             // (its resolver died with the run; an answer could never land).
+            // A parked PLAN GATE settles the same way, and to the same place
+            // the drain above just told the harness: `Revising`, never an
+            // approval. Left `AwaitingApproval` the card would stay actionable
+            // on a dead request id, and the composer's send would keep being
+            // taken as feedback on a plan nobody is waiting for.
             for part in folded.iter_mut() {
-                if let MessagePart::Input { resolved, .. } = part {
-                    *resolved = true;
+                match part {
+                    MessagePart::Input { resolved, .. } => *resolved = true,
+                    MessagePart::Plan { status, .. }
+                        if *status == comet_doc::PlanStatus::AwaitingApproval =>
+                    {
+                        *status = comet_doc::PlanStatus::Revising;
+                    }
+                    _ => {}
                 }
             }
             // A Done landing on a PARKED session with nothing streamed (the

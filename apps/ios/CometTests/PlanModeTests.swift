@@ -103,6 +103,37 @@ final class PlanModeTests: XCTestCase {
         XCTAssertNotEqual(parked.version, approved.version)
     }
 
+    /// A redraft that keeps the plan's LENGTH (a reordered step, a swapped
+    /// word) still has to re-render: the version hashes the body, not `count`.
+    func testASameLengthRedraftStillMovesTheVersion() {
+        let before = "# Plan\n\n1. read\n2. write\n"
+        let after = "# Plan\n\n1. scan\n2. write\n"
+        XCTAssertEqual(before.count, after.count, "the point of the test")
+        XCTAssertNotEqual(
+            TranscriptRowBuilder.planVersion(plan: before, status: .drafting, requestId: nil),
+            TranscriptRowBuilder.planVersion(plan: after, status: .drafting, requestId: nil))
+    }
+
+    /// The gate on the LAST assistant entry is the one the composer serves
+    /// (the desktop rule): a newer assistant entry supersedes an unanswered
+    /// card, so the send is never bound to a stale request id.
+    func testANewerAssistantEntrySupersedesAnUnansweredGate() {
+        let gate = MessageEntry(id: "m1", role: .assistant, parts: [
+            .plan(id: "plan", plan: "# P", status: .awaitingApproval,
+                  requestId: "req-7", path: nil),
+        ], createdAt: 1, deviceId: "d", status: .complete, continuationOf: nil)
+        XCTAssertEqual(SessionStore.pendingPlanExit(in: [gate])?.requestId, "req-7")
+        let newer = MessageEntry(id: "m2", role: .assistant, parts: [
+            .text(id: "t", text: "moving on"),
+        ], createdAt: 2, deviceId: "d", status: .complete, continuationOf: nil)
+        XCTAssertNil(SessionStore.pendingPlanExit(in: [gate, newer]))
+        // A user message in between is not a new assistant turn.
+        let typed = MessageEntry(id: "u1", role: .user, parts: [
+            .text(id: "t", text: "hi"),
+        ], createdAt: 2, deviceId: "d", status: .complete, continuationOf: nil)
+        XCTAssertEqual(SessionStore.pendingPlanExit(in: [gate, typed])?.requestId, "req-7")
+    }
+
     // MARK: Composer decisions (pure)
 
     func testTheToggleIsOfferedOnlyWhereTheDescriptorHasAPlanMode() {

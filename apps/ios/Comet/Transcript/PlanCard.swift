@@ -24,10 +24,10 @@ struct PlanCardView: View {
     let toggle: () -> Void
     /// Approve (true) / Keep planning (false) — resolves `requestId`.
     let respond: (Bool) -> Void
-
-    /// Local latch: the buttons go quiet the moment they're tapped and stay
-    /// quiet until the doc flips the status out of `awaitingApproval`.
-    @State private var answered = false
+    /// The store's answered-gate latch: the buttons go quiet the moment this
+    /// gate is answered from this device — by these buttons OR by a composer
+    /// send — and stay quiet until the doc flips the status.
+    let answered: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -47,7 +47,6 @@ struct PlanCardView: View {
         }
         .background(whiteAlpha(0.03), in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
-        .onChange(of: status) { answered = false }
     }
 
     private var header: some View {
@@ -129,7 +128,6 @@ struct PlanCardView: View {
 
     private func answer(_ approved: Bool) {
         guard !answered else { return }
-        answered = true
         respond(approved)
     }
 }

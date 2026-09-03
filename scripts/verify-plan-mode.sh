@@ -91,6 +91,21 @@ for f in apps/ios/Comet/Transcript/PlanCard.swift apps/ios/Comet/Composer/PlanMo
   fi
 done
 
+# ONE optimistic answered-gate latch per surface: the plan card's buttons and
+# the composer's send answer the SAME request, so a private set on either side
+# lets a send right after an Approve take the gate again as "keep planning".
+if grep -nE 'answered_plan_gates: *(std::collections::)?HashSet' \
+     crates/ui/src/transcript.rs crates/ui/src/composer.rs >/dev/null; then
+  fail "the desktop plan card keeps a private answered-gate set (share AppState's)"
+else
+  ok "desktop shares one answered-gate latch"
+fi
+if grep -rn 'answeredPlanGates' apps/ios/Comet/Sync/SessionStore.swift >/dev/null; then
+  ok "phone shares one answered-gate latch"
+else
+  fail "apps/ios/Comet/Sync/SessionStore.swift lacks the shared answered-gate latch"
+fi
+
 # `/plan` is the one composer-owned slash command (§11.9): one resolver per
 # surface, both harness-agnostic, and no adapter re-implements it.
 if grep -q 'fn composer_builtin' crates/ui/src/composer.rs; then

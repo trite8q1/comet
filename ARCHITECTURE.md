@@ -622,9 +622,12 @@ card Approve/Keep planning ──QueueCommand RespondPlanExit──▶ host ─o
    `PlanModeChanged(false)` from the CLI's own signal, which reconciles the toggle.
 5. No gate (Cursor, Codex, an ACP agent without one): the plan part stays `drafting` with the
    final text; the user flips the toggle and sends the next message, as in the CLI.
-6. Recovery: an unanswered gate on a settled entry gets the same orphan handling as an
-   unanswered question (`RespondInput`'s fallback); a run revived after an engine restart
-   relaunches with the chat's requested mode.
+6. Recovery: a gate still parked when its run ends (Stop, an error, the turn finishing) is
+   answered "keep planning" as the run tears down, and its part settles `revising` with it —
+   never a silent approval, and never a card left actionable on a dead request id. Unlike an
+   unanswered question there is no orphan fallback: a later `RespondPlanExit` is rejected,
+   because re-asking the gate would be comet inventing an approval. A run revived after an
+   engine restart relaunches with the chat's requested mode.
 
 ### 11.5 Plan state and sync
 

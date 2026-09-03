@@ -4971,11 +4971,12 @@ impl Composer {
     }
 
     /// The parked plan-exit gate this composer serves: the transcript's, minus
-    /// the ones already answered from this device (the card's buttons and this
-    /// composer share the latch through the doc, not through each other).
+    /// the ones already answered from this device. The latch lives in
+    /// `AppState` because the card's buttons answer the SAME gate — a private
+    /// one here would let a send right after an Approve answer it again.
     fn pending_plan_gate(&self, cx: &App) -> Option<String> {
         pending_plan_gate(&self.state.read(cx).transcript)
-            .filter(|request_id| !self.answered_requests.contains(request_id))
+            .filter(|request_id| !self.state.read(cx).plan_gate_answered(request_id))
     }
 
     fn run_live(&self, cx: &App) -> bool {
@@ -5036,7 +5037,7 @@ impl Composer {
                 let pending = pending_plan_gate(&self.state.read(cx).transcript);
                 let answered = pending
                     .as_deref()
-                    .is_some_and(|id| self.answered_requests.contains(id));
+                    .is_some_and(|id| self.state.read(cx).plan_gate_answered(id));
                 match send_intent(pending.as_deref(), answered, mode == SendButtonMode::Steer) {
                     SendIntent::PlanFeedback { request_id } => {
                         self.send_plan_feedback(request_id, text, cx)
@@ -5103,7 +5104,9 @@ impl Composer {
         let Ok(command) = serde_json::to_value(&command) else {
             return;
         };
-        self.answered_requests.insert(request_id.clone());
+        self.state.update(cx, |state, _| {
+            state.mark_plan_gate_answered(&request_id);
+        });
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
         self.failure = None;
@@ -5116,7 +5119,9 @@ impl Composer {
                     composer.failure = Some(format!("Plan feedback failed: {err}").into());
                     composer.failure_key = Some(failure_chat);
                     // It never left this device — hand the gate back.
-                    composer.answered_requests.remove(&request_id);
+                    composer.state.update(cx, |state, _| {
+                        state.unmark_plan_gate_answered(&request_id);
+                    });
                     cx.notify();
                 })
                 .ok();

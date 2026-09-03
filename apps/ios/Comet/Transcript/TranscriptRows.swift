@@ -257,9 +257,11 @@ enum TranscriptRowBuilder {
 
     /// Diff key for a plan part. The part is refreshed IN PLACE by every
     /// `PlanUpdated`, so the row id never moves — the version has to carry
-    /// every visible change: the draft's length, the status, the parked gate.
+    /// every visible change: the draft's CONTENT, the status, the parked gate.
+    /// Hashing the length instead would miss a same-length rewrite (a
+    /// reordered step, a swapped word) and keep stale markdown on the card.
     static func planVersion(plan: String, status: PlanStatus, requestId: String?) -> UInt64 {
-        fnv1a("\(plan.count)|\(status.rawValue)|\(requestId ?? "")")
+        fnv1a("\(fnv1a(plan))|\(status.rawValue)|\(requestId ?? "")")
     }
 
     private static func toolFingerprint(_ tools: [ToolItem]) -> UInt64 {

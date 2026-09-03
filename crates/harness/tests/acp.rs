@@ -1320,6 +1320,30 @@ async fn plan_exit_permission_is_the_only_one_that_stops_auto_approving() {
     );
 }
 
+/// The gate is the TOOL NAME, not the reported mode bit: an agent that never
+/// sends `current_mode_update` (or sends it after the request) must still stop
+/// the auto-approve, or §11.2's one non-auto-approving permission silently
+/// approves the exit and the agent starts executing the plan.
+#[tokio::test]
+async fn an_unreported_plan_mode_still_stops_the_exit_auto_approve() {
+    let (controls, _steer, _mode, calls) = plan_controls(
+        false,
+        PlanDecision {
+            approved: false,
+            feedback: None,
+        },
+    );
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-gate-unreported", "/tmp", false),
+        controls,
+    )
+    .await;
+    assert!(plan_modes(&events).is_empty(), "{events:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{events:?}");
+    assert_eq!(texts(&events), "still planning", "{events:?}");
+}
+
 /// §11.6: the plan card represents the gate, so the `enter_plan_mode` /
 /// `exit_plan_mode` tool calls must NOT also fold into a tool chip (a
 /// rejected exit otherwise reads as a stray failed tool). The plan events
