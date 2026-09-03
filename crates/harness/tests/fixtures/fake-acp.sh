@@ -15,6 +15,33 @@ update() { # $1 = update json object body
   emit "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":$1}}"
 }
 
+# Real `availableCommands` entries, captured live from the three ACP agents
+# (grok 1.0.13, Hermes Agent 0.13.0, pi-acp 0.0.33 driving pi 0.84.3):
+#   grok   — skills under their bare name, qualified (`user:goal`,
+#            `vercel:workflow`) only where a bare name collides; `input: null`
+#            on skills, `input.hint` on argument-taking builtins/workflows;
+#            `_meta` carrying scope/path/bareName/qualifiedName/pluginName.
+#   pi-acp — skills as `skill:<name>` with NO `input` key at all.
+#   hermes — nine built-ins, serialized description-first, no skills at all.
+# Comet reads `name`, `description` and `input.hint` and nothing else; the
+# agent's own qualification and filtering is the catalog (ARCHITECTURE §10.4).
+SKILL_COMMANDS='[
+{"name":"compact","description":"Compress conversation history to save context window","input":{"hint":"optional context about what to preserve"}},
+{"name":"deep-research","description":"Research with bounded parallel agents","input":{"hint":"<query>"},"_meta":{"workflowSource":"builtin","workflowPath":"/x/deep_research.rhai"}},
+{"name":"automate","description":"Use this skill to create Cursor Automations.","input":null,"_meta":{"scope":"user","path":"/h/.agents/skills/automate/SKILL.md","bareName":"automate","qualifiedName":"user:automate"}},
+{"name":"user:goal","description":"Set a goal that Cursor will pursue to completion.","input":null,"_meta":{"scope":"user","path":"/h/.agents/skills/goal/SKILL.md","bareName":"goal","qualifiedName":"user:goal"}},
+{"name":"vercel:workflow","description":"Vercel Workflow SDK expert guidance.","input":null,"_meta":{"scope":"user","path":"/h/plugins/vercel/skills/workflow/SKILL.md","bareName":"workflow","qualifiedName":"vercel:workflow","pluginName":"vercel"}},
+{"name":"skill:rename-chat","description":"Rename the current chat to match its focus."},
+{"name":"name","description":"Set session display name","input":{"hint":"<name>"}},
+{"description":"List available commands","name":"help"},
+{"description":"Show current model and provider, or switch models","input":{"hint":"model name to switch to"},"name":"model"}
+]'
+
+skills_update() { # advertise the captured catalog on the session channel
+  body=$(printf '%s' "$SKILL_COMMANDS" | tr -d '\n')
+  update "{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":$body}"
+}
+
 xnotify() { # $1 = update json object body — grok's extension channel (the
   # subagent lifecycle rides _x.ai/session_notification, NOT session/update;
   # same {sessionId, update} envelope. Verified live, 1.0.4.)
@@ -27,7 +54,15 @@ has "$line" '"method":"initialize"' || exit 1
 has "$line" '"protocolVersion":1' || exit 1
 has "$line" '"name":"comet"' || exit 1
 has "$line" '"readTextFile":false' || exit 1
-emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"_meta\":{\"availableCommands\":[{\"name\":\"compact\",\"description\":\"Compact the session\"},{\"name\":\"goal\",\"description\":\"Set a goal\",\"input\":{\"hint\":\"the goal\"}}]}},\"_meta\":{\"steering\":{\"supported\":true}}}}"
+# `comet-skill-probe` in the probe cwd = behave like grok, whose handshake
+# `_meta` carries a PARTIAL catalog (built-ins only, no skills) that the
+# session channel then completes. Without it the fixture advertises a
+# handshake list the session never completes — the login-refused fallback.
+if [ -f ./comet-skill-probe ]; then
+  emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"_meta\":{\"availableCommands\":[{\"name\":\"compact\",\"description\":\"Compress conversation history to save context window\",\"input\":{\"hint\":\"optional context about what to preserve\"}},{\"name\":\"session-info\",\"description\":\"Show session details (model, turns, context usage)\"}]}},\"_meta\":{\"steering\":{\"supported\":true}}}}"
+else
+  emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"_meta\":{\"availableCommands\":[{\"name\":\"compact\",\"description\":\"Compact the session\"},{\"name\":\"goal\",\"description\":\"Set a goal\",\"input\":{\"hint\":\"the goal\"}}]}},\"_meta\":{\"steering\":{\"supported\":true}}}}"
+fi
 
 # ---- session new / load ----------------------------------------------------
 read -r line || exit 1
@@ -74,6 +109,12 @@ elif has "$line" '"method":"session/new"'; then
     emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"currentModelId\":\"grok-4-fast\",\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]}}}"
   else
     emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}],\"currentModelId\":\"grok-4.5\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
+  fi
+  if [ -f ./comet-skill-probe ]; then
+    # Record the cwd the client asked for: grok's catalog is cwd-scoped, so
+    # the probe must stand in the project, not in $HOME.
+    printf '%s' "$line" | sed 's/.*"cwd":"\([^"]*\)".*/\1/' > ./probe-cwd.txt
+    skills_update
   fi
 else
   exit 1
@@ -439,6 +480,16 @@ case "$promptline" in
 
 *scenario:resumed*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"back again"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*'"text":"/'*)
+  # Invocation parity (ARCHITECTURE §10.5): ACP has no command RPC — an
+  # invocation IS the prompt text, `/name args` and all. Echo back exactly
+  # what landed on the wire so the test can prove the adapter translated
+  # nothing, for a catalogued name and for an unknown one alike.
+  text=$(printf '%s' "$promptline" | sed 's/.*"text":"\([^"]*\)".*/\1/')
+  update "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"invocation:$text\"}}"
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 

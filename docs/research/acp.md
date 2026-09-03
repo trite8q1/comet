@@ -83,6 +83,11 @@
   (stable id `acp-plan`); `available_commands_update` →
   `AgentEvent::AvailableCommands`. `usage_update` is a context gauge, not
   per-turn tokens — deliberately unmapped.
+  RETIRED since ARCHITECTURE.md §10.4 "One discovery path":
+  `available_commands_update` now maps to no events — the catalog reaches the
+  composer through `Harness::commands()` alone (the same update read by the
+  probe's own `session/new`), and `AgentEvent::AvailableCommands` survives
+  decode-only for pre-retirement run journals.
 - `session/request_permission` → auto-accept the preferred allow option
   (`allow_always` > `allow_once` > first) — parity with claude
   bypassPermissions / codex approvalPolicy never. Question-shaped means

@@ -376,16 +376,27 @@ fn tool_names_type_the_common_calls() {
 
 #[test]
 fn commands_map_from_wire() {
+    // `GET /command` is the whole invocable catalog: `.opencode/command/*.md`
+    // entries and skills alike, told apart only by `source` (live 1.18.10 —
+    // `Command.source` is one of command | mcp | skill). Skills are therefore
+    // explicitly invocable here, not implicit-only, and comet catalogs them
+    // exactly as the server lists them: no `source` filter, no SKILL.md scan.
     let wire = json!([
-        {"name": "init", "description": "Create AGENTS.md"},
+        {"name": "init", "description": "Create AGENTS.md", "source": "command", "hints": ["$ARGUMENTS"]},
         {"name": "share"},
+        {"name": "cometalpha", "description": "Alpha probe skill.", "source": "skill", "hints": []},
         {"description": "nameless is dropped"},
     ]);
     let commands = commands_from_wire(&wire);
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 3);
     assert_eq!(commands[0].name, "init");
     assert_eq!(commands[0].description, "Create AGENTS.md");
     assert_eq!(commands[1].name, "share");
+    assert_eq!(commands[2].name, "cometalpha");
+    assert_eq!(commands[2].description, "Alpha probe skill.");
+    // `hints` is the template's placeholder list ("$ARGUMENTS"), not a
+    // user-facing argument hint, so the popup shows none.
+    assert_eq!(commands[0].input_hint, None);
 }
 
 #[test]

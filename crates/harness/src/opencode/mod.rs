@@ -202,7 +202,9 @@ pub struct OpencodeHarness {
     kill_grace: Duration,
     startup_timeout: Duration,
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
-    commands_cache: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Command discovery cache, per probe cwd: `/command` answers for the
+    /// directory it is asked about (ARCHITECTURE.md §10.4).
+    commands_cache: crate::commands::CommandCache,
     /// Coalesce concurrent picker/title probes: several cold opencode boots
     /// at once are slower than one.
     probe_lock: tokio::sync::Mutex<()>,
@@ -217,7 +219,7 @@ impl Default for OpencodeHarness {
             kill_grace: Duration::from_secs(3),
             startup_timeout: startup_timeout(),
             models_cache: tokio::sync::OnceCell::new(),
-            commands_cache: tokio::sync::OnceCell::new(),
+            commands_cache: crate::commands::CommandCache::default(),
             probe_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -282,7 +284,9 @@ impl OpencodeHarness {
                 ));
             }
             if let Ok(commands) = server.get_json("/command", None).await {
-                let _ = self.commands_cache.set(commands_from_wire(&commands));
+                self.commands_cache
+                    .insert(None, commands_from_wire(&commands))
+                    .await;
             }
             Ok(models)
         }
@@ -291,14 +295,17 @@ impl OpencodeHarness {
         result
     }
 
-    async fn probe_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let _guard = self.probe_lock.lock().await;
-        if let Some(commands) = self.commands_cache.get() {
-            return Ok(commands.clone());
-        }
-        let mut server = self.server(None).await?;
+    /// `/command` for one directory: the server boots there and the request
+    /// carries the same directory scope a run's would, so the project's own
+    /// commands and skills are in the answer.
+    async fn probe_commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
+        let dir = cwd.map(|p| p.display().to_string());
+        let mut server = self.server(dir.as_deref()).await?;
         let result = server
-            .get_json("/command", None)
+            .get_json("/command", dir.as_deref())
             .await
             .map(|v| commands_from_wire(&v));
         server.shutdown(self.kill_grace).await;
@@ -349,11 +356,13 @@ impl Harness for OpencodeHarness {
             .cloned()
     }
 
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands_cache
-            .get_or_try_init(|| self.probe_commands())
+            .get_or_try_init(cwd, async || self.probe_commands(cwd).await)
             .await
-            .cloned()
     }
 
     async fn run(
@@ -371,7 +380,10 @@ impl Harness for OpencodeHarness {
             request,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
-            known_commands: self.commands_cache.get().cloned(),
+            known_commands: self
+                .commands_cache
+                .get(cwd.as_deref().map(std::path::Path::new))
+                .await,
         }));
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
             rx.recv().await.map(|ev| (ev, rx))
@@ -705,6 +717,7 @@ fn commands_from_wire(commands: &Value) -> Vec<SlashCommand> {
                             .unwrap_or_default()
                             .to_owned(),
                         input_hint: None,
+                        aliases: Vec::new(),
                     })
                 })
                 .collect()
@@ -931,7 +944,9 @@ async fn run_session(session: Session) {
         return;
     }
 
-    // Advertise slash commands (composer popup); a warm cache skips the call.
+    // This run's own catalog, for routing a `/name` to the command endpoint
+    // (§10.5) — the composer's list comes from `commands()`, never from here
+    // (§10.4 "One discovery path"). A warm cache skips the call.
     let commands = match known_commands {
         Some(commands) => commands,
         None => server
@@ -940,18 +955,6 @@ async fn run_session(session: Session) {
             .map(|v| commands_from_wire(&v))
             .unwrap_or_default(),
     };
-    if !commands.is_empty()
-        && !send(
-            &event_tx,
-            AgentEvent::AvailableCommands {
-                commands: commands.clone(),
-            },
-        )
-        .await
-    {
-        server.shutdown(kill_grace).await;
-        return;
-    }
 
     // ---- SSE bus ----------------------------------------------------------
     let (bus_tx, mut bus_rx) = mpsc::channel::<BusMsg>(256);
@@ -1383,9 +1386,12 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
-/// Send a turn: a leading `/command` known to the agent routes through the
-/// command endpoint (the desktop parity — the server does NOT parse slash
-/// text out of an ordinary prompt); everything else is `prompt_async`.
+/// Send a turn: a leading `/name args` the agent's own catalog knows routes
+/// through the command endpoint (the desktop parity — the server does NOT
+/// parse slash text out of an ordinary prompt); everything else, an unknown
+/// `/name` included, is `prompt_async`. The catalog covers skills too:
+/// `GET /command` lists them beside commands under `source: "skill"`, and the
+/// endpoint resolves either kind by name (verified live, 1.18.10).
 /// Both are fire-and-forget for the loop: the command endpoint is
 /// synchronous on the wire, so it rides a detached task and the bus
 /// delivers the actual turn.
@@ -1397,45 +1403,42 @@ async fn post_prompt(
     prompt: &str,
     body: Value,
 ) -> Result<(), HarnessError> {
-    if let Some(rest) = prompt.strip_prefix('/') {
-        let mut split = rest.splitn(2, char::is_whitespace);
-        let name = split.next().unwrap_or_default();
-        let arguments = split.next().unwrap_or_default().trim().to_owned();
-        if !name.is_empty() && commands.iter().any(|c| c.name == name) {
-            let path = format!("/session/{session_id}/command");
-            let cmd_body = json!({ "command": name, "arguments": arguments });
-            let server_base = server.base.clone();
-            let auth = server.auth.clone();
-            let dir_owned = dir.map(str::to_owned);
-            let path_owned = path.clone();
-            tokio::spawn(async move {
-                let server = Server {
-                    child: None,
-                    base: server_base,
-                    auth,
-                    client: http_client(),
-                    stderr_tail: crate::StderrTail::default(),
-                };
-                // The command endpoint blocks for the whole turn; the bus
-                // carries the real events, so this response is ignored —
-                // but it must not be cut off mid-turn by CALL_TIMEOUT.
-                let mut req = server
-                    .request(reqwest::Method::POST, &path_owned)
-                    .json(&cmd_body);
-                if let Some(dir) = dir_owned.as_deref() {
-                    req = req
-                        .query(&[("directory", dir)])
-                        .header("x-opencode-directory", encode_directory(dir));
-                }
-                if let Err(e) = req.send().await {
-                    tracing::debug!(
-                        target: "comet_harness::opencode",
-                        "command turn failed: {e}"
-                    );
-                }
-            });
-            return Ok(());
-        }
+    if let Some((invocation, command)) = crate::commands::known_invocation(prompt, commands) {
+        let path = format!("/session/{session_id}/command");
+        // The catalog's own name, not the typed one: opencode resolves the
+        // command server-side by the name it advertised.
+        let cmd_body = json!({ "command": command.name, "arguments": invocation.args });
+        let server_base = server.base.clone();
+        let auth = server.auth.clone();
+        let dir_owned = dir.map(str::to_owned);
+        let path_owned = path.clone();
+        tokio::spawn(async move {
+            let server = Server {
+                child: None,
+                base: server_base,
+                auth,
+                client: http_client(),
+                stderr_tail: crate::StderrTail::default(),
+            };
+            // The command endpoint blocks for the whole turn; the bus
+            // carries the real events, so this response is ignored —
+            // but it must not be cut off mid-turn by CALL_TIMEOUT.
+            let mut req = server
+                .request(reqwest::Method::POST, &path_owned)
+                .json(&cmd_body);
+            if let Some(dir) = dir_owned.as_deref() {
+                req = req
+                    .query(&[("directory", dir)])
+                    .header("x-opencode-directory", encode_directory(dir));
+            }
+            if let Err(e) = req.send().await {
+                tracing::debug!(
+                    target: "comet_harness::opencode",
+                    "command turn failed: {e}"
+                );
+            }
+        });
+        return Ok(());
     }
     let path = format!("/session/{session_id}/prompt_async");
     server.post_json(&path, dir, &body).await.map(|_| ())

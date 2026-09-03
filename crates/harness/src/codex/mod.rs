@@ -34,6 +34,10 @@
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends `turn/interrupt`,
 //!   escalating to SIGTERM → SIGKILL if the child is unresponsive; the stream
 //!   always ends with `Done { status: Interrupted }`.
+//! - Skills (ARCHITECTURE.md §10): `skills/list` is the catalog, `enabled ==
+//!   false` entries dropped, and a leading `/name` that the session's own
+//!   catalog lists is translated into the TUI's own frame — the text with the
+//!   native `$name` mention, then a `skill` input item carrying `SKILL.md`.
 
 pub(crate) mod catalog;
 mod normalize;
@@ -57,6 +61,7 @@ use comet_proto::{
     SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
+use crate::commands::{known_invocation, split_invocation};
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
@@ -115,9 +120,10 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Command discovery cache, per probe cwd: only a successful probe is
+    /// cached, so a broken CLI retries on the next picker open (ACP-harness
+    /// parity).
+    skills: crate::commands::CommandCache,
 }
 
 impl Default for CodexHarness {
@@ -126,7 +132,7 @@ impl Default for CodexHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
+            skills: crate::commands::CommandCache::default(),
         }
     }
 }
@@ -168,8 +174,14 @@ impl CodexHarness {
     /// `skills/list` — the only invocable-listing method the 0.146.x wire has
     /// (custom `~/.codex/prompts` are NOT exposed; the TUI-only built-ins
     /// aren't either). Skills are what the codex TUI itself surfaces as
-    /// slash-invocables, listed per-cwd and deduped by name here.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// slash-invocables, listed per-cwd and deduped by name here. `cwds`
+    /// carries the run's directory when there is one, so the repo-scoped
+    /// skills codex would offer there are in the answer; `None` asks for the
+    /// default groups codex lists on its own.
+    async fn discover_skills(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<SkillCatalog, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
@@ -207,8 +219,12 @@ impl CodexHarness {
                 )
                 .await?;
             client.notify("initialized", None);
-            let skills = client.request("skills/list", json!({})).await?;
-            Ok::<Vec<SlashCommand>, HarnessError>(parse_skill_commands(&skills))
+            let params = match cwd {
+                Some(dir) => json!({ "cwds": [dir.display().to_string()] }),
+                None => json!({}),
+            };
+            let skills = client.request("skills/list", params).await?;
+            Ok::<SkillCatalog, HarnessError>(parse_skills(&skills))
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -219,13 +235,27 @@ impl CodexHarness {
     }
 }
 
+/// One `skills/list` answer: the picker rows plus the `SKILL.md` path each
+/// skill's native `skill` input item carries (see [`turn_input`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SkillCatalog {
+    commands: Vec<SlashCommand>,
+    /// Skill name → its `SKILL.md` path. A wire entry without one stays a
+    /// picker row but is never translated (nothing to point the item at).
+    paths: HashMap<String, String>,
+}
+
 /// `skills/list` result → picker commands. `data` groups skills by cwd; the
 /// same skill appears under every root, so dedupe by name keeping first
-/// appearance order. The interface's shortDescription is picker-sized; the
-/// top-level description is a model-facing paragraph, kept only as fallback.
-fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
+/// appearance order (codex lists the repo-scoped copy of a shadowed name
+/// first, which is the one it would run). `enabled: false` — a
+/// `[[skills.config]]` opt-out in `config.toml` — is dropped: codex's own
+/// pickers do not offer those. The interface's shortDescription is
+/// picker-sized; the top-level description is a model-facing paragraph, kept
+/// only as fallback.
+fn parse_skills(result: &Value) -> SkillCatalog {
     let mut seen = std::collections::HashSet::new();
-    let mut commands = Vec::new();
+    let mut catalog = SkillCatalog::default();
     for group in result
         .get("data")
         .and_then(Value::as_array)
@@ -246,6 +276,13 @@ fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
             else {
                 continue;
             };
+            if !skill
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                continue;
+            }
             if !seen.insert(name.to_owned()) {
                 continue;
             }
@@ -256,14 +293,71 @@ fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
                 .filter(|d| !d.is_empty())
                 .or_else(|| skill.get("description").and_then(Value::as_str))
                 .unwrap_or_default();
-            commands.push(SlashCommand {
+            if let Some(path) = skill.get("path").and_then(Value::as_str) {
+                catalog.paths.insert(name.to_owned(), path.to_owned());
+            }
+            catalog.commands.push(SlashCommand {
                 name: name.to_owned(),
                 description: description.to_owned(),
                 input_hint: None,
+                aliases: Vec::new(),
             });
         }
     }
-    commands
+    catalog
+}
+
+/// A fresh `skills/list` on the LIVE run session, whose cwd is the run's cwd —
+/// so repo-scoped skills are exactly the ones codex would offer here. Probed
+/// lazily (only a prompt that looks like an invocation pays for it) and kept
+/// for the session. A failure is not fatal: with no catalog every `/name`
+/// stays plain text, which is what an unknown name does natively anyway.
+async fn session_skills(client: &RpcClient) -> SkillCatalog {
+    match client.request("skills/list", json!({})).await {
+        Ok(result) => parse_skills(&result),
+        Err(e) => {
+            tracing::debug!(
+                target: "comet_harness::codex",
+                "skills/list failed (slash invocations stay plain text): {e}"
+            );
+            SkillCatalog::default()
+        }
+    }
+}
+
+/// The `input` array for one prompt (ARCHITECTURE.md §10.5).
+///
+/// Parity with the codex TUI, which submits the typed text FIRST and then
+/// appends one `{"type":"skill", name, path}` item per skill the text mentions
+/// with the native `$` sigil (codex-rs `tui/src/chatwidget/input_submission.rs`
+/// on 0.151.0). A leading `/name` the session's own catalog lists becomes that
+/// same frame — `$name` carrying the untouched arguments, plus the item that
+/// makes the invocation explicit. Anything else is sent verbatim as text so
+/// the CLI reacts exactly as it would natively.
+async fn turn_input(client: &RpcClient, cache: &mut Option<SkillCatalog>, text: &str) -> Value {
+    let plain = || json!([{ "type": "text", "text": text }]);
+    if split_invocation(text).is_none() {
+        return plain();
+    }
+    let catalog = match cache {
+        Some(catalog) => catalog,
+        None => cache.insert(session_skills(client).await),
+    };
+    let Some((invocation, command)) = known_invocation(text, &catalog.commands) else {
+        return plain();
+    };
+    let Some(path) = catalog.paths.get(&command.name) else {
+        return plain();
+    };
+    let mention = if invocation.args.is_empty() {
+        format!("${}", command.name)
+    } else {
+        format!("${} {}", command.name, invocation.args)
+    };
+    json!([
+        { "type": "text", "text": mention },
+        { "type": "skill", "name": command.name, "path": path },
+    ])
 }
 
 #[async_trait]
@@ -306,12 +400,16 @@ impl Harness for CodexHarness {
     }
 
     /// Skills from a short-lived `skills/list` probe (see
-    /// [`Self::discover_commands`]); cached on success.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.commands
-            .get_or_try_init(|| self.discover_commands())
+    /// [`Self::discover_skills`]); cached per probe cwd on success.
+    async fn commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.skills
+            .get_or_try_init(cwd, async || {
+                self.discover_skills(cwd).await.map(|c| c.commands)
+            })
             .await
-            .cloned()
     }
 
     async fn run(
@@ -603,10 +701,10 @@ async fn run_session(session: Session) {
         }
     };
 
-    let turn_params = |text: &str| -> Value {
+    let turn_params = |input: Value| -> Value {
         let mut p = serde_json::Map::new();
         p.insert("threadId".into(), Value::String(thread_id.clone()));
-        p.insert("input".into(), json!([{ "type": "text", "text": text }]));
+        p.insert("input".into(), input);
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert(
             "sandboxPolicy".into(),
@@ -653,7 +751,11 @@ async fn run_session(session: Session) {
     // from `subAgentActivity` items on the parent thread and from a child
     // `thread/started` carrying a spawn source.
     let mut children: HashMap<String, String> = HashMap::new();
-    match start_turn(&client, turn_params(&request.prompt)).await {
+    // This session's `skills/list`, probed on the first prompt that looks like
+    // an invocation (see [`turn_input`]).
+    let mut skills: Option<SkillCatalog> = None;
+    let first_input = turn_input(&client, &mut skills, &request.prompt).await;
+    match start_turn(&client, turn_params(first_input)).await {
         Ok(id) => router.adopt_started(id),
         Err(e) => {
             let _ = event_tx
@@ -677,7 +779,9 @@ async fn run_session(session: Session) {
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
-    let mut queued_steers: VecDeque<String> = VecDeque::new();
+    // Already-translated `input` arrays, so a queued invocation keeps its
+    // native skill item.
+    let mut queued_steers: VecDeque<Value> = VecDeque::new();
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -1004,10 +1108,10 @@ async fn run_session(session: Session) {
                         // Persistent session: a steer that lost the race with
                         // this turn's end becomes the next turn now; otherwise
                         // stay alive for the mailbox — the caller owns teardown.
-                        if let Some(text) = queued_steers.pop_front() {
+                        if let Some(input) = queued_steers.pop_front() {
                             if !steer_as_new_turn(
                                 &client,
-                                turn_params(&text),
+                                turn_params(input),
                                 &mut router,
                                 &event_tx,
                                 &mut assistant_message_id,
@@ -1109,12 +1213,12 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    let text = msg.prompt;
+                    let input = turn_input(&client, &mut skills, &msg.prompt).await;
                     if let Some(expected) = router.active.clone() {
                         let steer_params = json!({
                             "threadId": thread_id,
                             "expectedTurnId": expected,
-                            "input": [{ "type": "text", "text": text }],
+                            "input": input.clone(),
                         });
                         match client.request("turn/steer", steer_params).await {
                             Ok(_) => {
@@ -1145,10 +1249,10 @@ async fn run_session(session: Session) {
                                 if router.active.as_deref() == Some(expected.as_str())
                                     && !router.is_completed(&expected)
                                 {
-                                    queued_steers.push_back(text);
+                                    queued_steers.push_back(input);
                                 } else if !steer_as_new_turn(
                                     &client,
-                                    turn_params(&text),
+                                    turn_params(input),
                                     &mut router,
                                     &event_tx,
                                     &mut assistant_message_id,
@@ -1162,7 +1266,7 @@ async fn run_session(session: Session) {
                         }
                     } else if !steer_as_new_turn(
                         &client,
-                        turn_params(&text),
+                        turn_params(input),
                         &mut router,
                         &event_tx,
                         &mut assistant_message_id,
@@ -1414,7 +1518,11 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                 id: new_message_id(),
                 header: {
                     let h = field(["header", "title", "label"]);
-                    if h.is_empty() { "Codex question".into() } else { h }
+                    if h.is_empty() {
+                        "Codex question".into()
+                    } else {
+                        h
+                    }
                 },
                 question: field(["question", "prompt", "text"]),
                 options: q

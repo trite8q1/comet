@@ -623,28 +623,165 @@ async fn live_real_cli_single_turn() {
 #[tokio::test]
 async fn commands_come_from_the_initialize_control_request() {
     let h = harness();
-    let commands = h.commands().await.expect("discovery succeeds");
-    assert_eq!(commands.len(), 2, "nameless entries are dropped: {commands:?}");
+    let commands = h.commands(None).await.expect("discovery succeeds");
+    assert_eq!(
+        commands.len(),
+        3,
+        "nameless entries are dropped: {commands:?}"
+    );
     assert_eq!(commands[0].name, "review");
     assert_eq!(commands[0].description, "Review a pull request");
     assert_eq!(commands[0].input_hint.as_deref(), Some("[pr number]"));
+    assert!(commands[0].aliases.is_empty(), "no aliases key → none");
     assert_eq!(commands[1].name, "compact");
     assert_eq!(commands[1].input_hint, None, "empty hint reads as None");
+
+    // Plugin skills arrive namespaced with the bare name as an alias, which
+    // is what the CLI's own popup matches on (live 2.1.228).
+    assert_eq!(commands[2].name, "vercel:deploy");
+    assert_eq!(commands[2].aliases, vec!["deploy".to_string()]);
+    assert!(commands[2].matches("vercel:deploy"));
+    assert!(commands[2].matches("deploy"), "aliases invoke too");
+    assert!(!commands[2].matches(""), "blank aliases are dropped");
 
     // Cached: the second call reuses the first probe's result (the fake has
     // exited; a re-probe against a dead binary path would still work here,
     // but object identity of the cached list is the cheap assertion).
-    let again = h.commands().await.expect("cache hit");
+    let again = h.commands(None).await.expect("cache hit");
     assert_eq!(again, commands);
+}
+
+/// §10.4: the catalog is cwd-scoped, so the probe stands in the directory the
+/// run would use — and caches per directory. The fake CLI answers with the
+/// `comet-probe-tag` of its own working directory and records one line per
+/// probe there, which makes both halves observable.
+#[tokio::test]
+async fn commands_probe_runs_in_the_requested_cwd_and_caches_per_cwd() {
+    let alpha = tempfile::tempdir().expect("tempdir");
+    let beta = tempfile::tempdir().expect("tempdir");
+    for (dir, tag) in [(&alpha, "alpha-skill"), (&beta, "beta-skill")] {
+        std::fs::write(dir.path().join("comet-probe-tag"), tag).expect("tag");
+        std::fs::write(dir.path().join("comet-probe-log"), "").expect("log");
+    }
+    let names = |commands: &[comet_proto::SlashCommand]| {
+        commands.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    };
+    let probes = |dir: &tempfile::TempDir| {
+        std::fs::read_to_string(dir.path().join("comet-probe-log"))
+            .expect("probe log")
+            .lines()
+            .count()
+    };
+
+    let h = harness();
+    let first = h.commands(Some(alpha.path())).await.expect("alpha probe");
+    assert_eq!(
+        names(&first),
+        ["review", "compact", "vercel:deploy", "alpha-skill"],
+        "the CLI ran in alpha, so alpha's project skill is in the catalog"
+    );
+
+    // A different cwd is a different catalog on the SAME harness instance —
+    // never the first one's cached answer.
+    let second = h.commands(Some(beta.path())).await.expect("beta probe");
+    assert_eq!(
+        names(&second),
+        ["review", "compact", "vercel:deploy", "beta-skill"]
+    );
+
+    // And no cwd is the CLI's own directory: no project entry at all.
+    let none = h.commands(None).await.expect("cwd-less probe");
+    assert_eq!(names(&none), ["review", "compact", "vercel:deploy"]);
+
+    // Each directory was probed exactly once, and stays cached independently.
+    assert_eq!(h.commands(Some(alpha.path())).await.unwrap(), first);
+    assert_eq!(h.commands(Some(beta.path())).await.unwrap(), second);
+    assert_eq!(probes(&alpha), 1, "alpha re-probed");
+    assert_eq!(probes(&beta), 1, "beta re-probed");
+}
+
+/// §10.5: Claude Code's native user action for a skill or command is typing
+/// `/name args` — the CLI expands it out of ordinary prompt text — so the
+/// adapter translates nothing. The fake CLI logs the raw stdin user lines it
+/// receives; this asserts both the run prompt and a steer arrive verbatim.
+#[tokio::test]
+async fn slash_invocation_is_passed_through_unchanged_parity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, steer, _token) = controls("A");
+    steer
+        .send(SteerMessage {
+            prompt: "/vercel:deploy prod".into(),
+            message_id: None,
+        })
+        .await
+        .expect("steer queued");
+    let mut req = request("/review 42");
+    req.cwd = dir.path().to_string_lossy().into_owned();
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+
+    let log = std::fs::read_to_string(dir.path().join("slash-parity.jsonl"))
+        .expect("the fake CLI logged its stdin");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "run prompt + steer: {log}");
+    for (line, text) in lines.iter().zip(["/review 42", "/vercel:deploy prod"]) {
+        let frame: serde_json::Value = serde_json::from_str(line).expect("stdin frame is json");
+        assert_eq!(frame["type"], "user", "an ordinary user message, {frame}");
+        assert_eq!(frame["message"]["role"], "user");
+        assert_eq!(
+            frame["message"]["content"], text,
+            "the invocation reaches the CLI verbatim — no expansion, no skill frame"
+        );
+    }
 }
 
 /// Live smoke against the real CLI: `cargo test -p comet-harness --test
 /// claude -- --ignored live_commands`. No model turn, no API cost.
+///
+/// Doubles as the §10.4 evidence that the CLI, not comet, decides what is
+/// user-invocable: a project skill in the probe's directory shows up with its
+/// argument hint, while one marked `user-invocable: false` never does.
 #[tokio::test]
 #[ignore]
 async fn live_commands_discovery() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, extra) in [
+        ("comet-live-open", "argument-hint: \"[target]\"\n"),
+        ("comet-live-hidden", "user-invocable: false\n"),
+    ] {
+        let skill = dir.path().join(".claude").join("skills").join(name);
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: comet live discovery probe.\n{extra}---\n\nProbe body.\n"
+            ),
+        )
+        .expect("SKILL.md");
+    }
+
     let h = ClaudeHarness::new();
-    let commands = h.commands().await.expect("live discovery");
+    let commands = h.commands(Some(dir.path())).await.expect("live discovery");
     assert!(!commands.is_empty());
-    eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
+    let open = commands
+        .iter()
+        .find(|c| c.name == "comet-live-open")
+        .unwrap_or_else(|| panic!("project skill missing from the catalog: {commands:#?}"));
+    assert_eq!(open.input_hint.as_deref(), Some("[target]"));
+    assert!(
+        commands.iter().all(|c| c.name != "comet-live-hidden"),
+        "the CLI omits `user-invocable: false` skills; comet must not add them back"
+    );
+    eprintln!(
+        "{} commands, {} with aliases, first: {:?}",
+        commands.len(),
+        commands.iter().filter(|c| !c.aliases.is_empty()).count(),
+        commands.first()
+    );
 }

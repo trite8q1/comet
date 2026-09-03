@@ -19,6 +19,9 @@ struct NewSessionView: View {
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
 
     @State private var draft = ""
+    @State private var selection: TextSelection?
+    /// `/` completion, fed by ListCommands on the picked space's device (§10.2).
+    @State private var slash = SlashCommandsModel()
     @State private var showPicker = false
     @State private var showTraitPicker = false
     @State private var showRefPicker = false
@@ -193,6 +196,9 @@ struct NewSessionView: View {
             guard !items.isEmpty else { return }
             stage(items)
         }
+        .onChange(of: draft) { syncSlashCommands() }
+        .onChange(of: selection) { syncSlashCommands() }
+        .onChange(of: harness) { syncSlashCommands() }
         .onAppear {
             focused = true
             if model.launchAutosend {
@@ -218,6 +224,11 @@ struct NewSessionView: View {
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            SlashCommandPopup(
+                state: slash.popup,
+                accept: { acceptSlash($slash, $0, text: $draft, selection: $selection) },
+                dismiss: { slash.dismiss(in: draft) }
+            )
             ComposerShell(
                 draft: $draft,
                 placeholder: "Do anything…",
@@ -225,6 +236,7 @@ struct NewSessionView: View {
                 showStop: false,
                 busy: busy,
                 alwaysExpanded: true,
+                selection: $selection,
                 onSend: send,
                 attachments: attachments,
                 onAttach: { showPhotoPicker = true },
@@ -244,6 +256,17 @@ struct NewSessionView: View {
                 }
             }
         }
+    }
+
+    /// The catalog is the picked harness on the picked space's device, probed
+    /// in the picked space's folder; until a space resolves there is no key to
+    /// ask with, so the popup stays empty.
+    private func syncSlashCommands() {
+        syncSlash($slash, text: draft, selection: selection,
+                  key: space.map {
+                      SlashCatalogKey(deviceId: $0.deviceId, harness: harness, cwd: $0.path)
+                  },
+                  model: model)
     }
 
     /// Load picked photos into staged attachments (ComposerView.stage's twin —

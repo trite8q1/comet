@@ -89,6 +89,17 @@ struct ListModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ListCommandsParams {
+    harness: HarnessId,
+    /// Directory the run would execute in; the catalog is scoped to it
+    /// (ARCHITECTURE.md §10.4). Absent (an old caller) or empty asks for the
+    /// catalog the CLI would list from the engine's own directory.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetHarnessEnabledParams {
     harness: HarnessId,
     enabled: bool,
@@ -1188,19 +1199,22 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
-                // Same shape as ListModels: forces a lazy resolve, then the
-                // harness's own (cached) discovery — ACP agents advertise
+                // Like ListModels: forces a lazy resolve, then the harness's
+                // own (cached) discovery — ACP agents advertise
                 // availableCommands, claude answers the initialize control
                 // request, codex lists skills; only harnesses whose wire has
-                // no listing (cursor, mock) fall through to the trait's
-                // empty default.
-                let p: ListModelsParams = parse_params(params)?;
+                // no listing (mock) fall through to the trait's empty
+                // default. The catalog is per (harness, cwd): the adapter
+                // probes in that directory, so the project's own skills are
+                // in the answer.
+                let p: ListCommandsParams = parse_params(params)?;
                 let harness = self
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let cwd = p.cwd.as_deref().filter(|c| !c.is_empty());
                 let commands = harness
-                    .commands()
+                    .commands(cwd.map(std::path::Path::new))
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)

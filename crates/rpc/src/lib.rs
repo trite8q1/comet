@@ -38,6 +38,11 @@ pub mod methods {
     /// replies with the device's fresh `ListHarnesses` catalog.
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
+    /// The target harness's invocables — skills, custom commands, built-ins —
+    /// as its own CLI would list them. Params `{harness, cwd?}`: catalogs are
+    /// cwd-scoped (ARCHITECTURE.md §10.4), so `cwd` is the directory the run
+    /// would execute in; omitting it asks for the catalog the CLI would list
+    /// from the engine's own directory.
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued

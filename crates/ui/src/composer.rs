@@ -3297,18 +3297,76 @@ fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
-/// Slash-command completion state: like [`FileMentionState`] but the
-/// candidate list is fetched once per harness (`ListCommands`) and filtered
-/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
+/// Filter-rank a command catalog for the popup query, like
+/// [`crate::popover::filter_indices`] but matching each entry's aliases as
+/// well as its name — the agents' own popups do (`/review` finds
+/// `code-review`, `/deploy` finds `vercel:deploy`). The best rank across a
+/// command's names wins; ties keep catalog order.
+fn filter_commands(query: &str, commands: &[SlashCommand]) -> Vec<usize> {
+    let mut ranked: Vec<(usize, usize)> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, command)| {
+            std::iter::once(&command.name)
+                .chain(&command.aliases)
+                .filter_map(|label| crate::popover::match_rank(query, label))
+                .min()
+                .map(|rank| (rank, ix))
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, ix)| (rank, ix));
+    ranked.into_iter().map(|(_, ix)| ix).collect()
+}
+
+/// One catalog per `(harness, cwd)` — §10.4/§10.6. Discovery is cwd-scoped:
+/// every CLI resolves project-level skills relative to a directory, so the
+/// same harness in two folders is two catalogs, and a folder switch swaps the
+/// list exactly like a harness switch does.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SlashKey {
+    /// The device that owns the agent binary — the chat's host for an
+    /// existing chat, the picked space's device on the new-chat canvas.
+    /// `None` is the local engine (no project, no chat).
+    device: Option<String>,
+    harness: HarnessId,
+    /// The chat's cwd for an existing chat, the picked space's path on the
+    /// new-chat canvas; `None` probes from the engine's own directory.
+    cwd: Option<String>,
+}
+
+/// `ListCommands` params for one key: `cwd` rides only when the surface has
+/// one (§10.4 — an omitted `cwd` is the old caller's engine-directory probe),
+/// `targetDeviceId` only when the key names a device.
+fn list_commands_params(key: &SlashKey) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    params.insert("harness".into(), serde_json::json!(key.harness));
+    if let Some(cwd) = &key.cwd {
+        params.insert("cwd".into(), cwd.clone().into());
+    }
+    if let Some(target) = &key.device {
+        params.insert("targetDeviceId".into(), target.clone().into());
+    }
+    serde_json::Value::Object(params)
+}
+
+/// Slash-command completion state: like [`FileMentionState`] but the candidate
+/// list is fetched per popup open for one `(device, harness, cwd)`
+/// (`ListCommands`) and filtered locally per keystroke — no RPC, debounce, or
+/// skeleton churn while typing.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
     /// Indices into the cached command list, filter-ranked for the query.
     filtered: Vec<usize>,
     active: Option<usize>,
-    /// Harness the popup is showing commands for (cache key).
-    harness: Option<HarnessId>,
+    /// Catalog the popup is showing commands for (cache key).
+    key: Option<SlashKey>,
     request: u64,
+    /// Key of the `ListCommands` in flight, so a reopen while it is pending
+    /// waits for that reply instead of sending a second request.
+    inflight: Option<SlashKey>,
+    /// Fetching with nothing to show yet — the popup's skeleton. A
+    /// revalidation over cached rows renders the rows and never sets this.
     loading: bool,
     error: Option<SharedString>,
     dismissed: Option<(Range<usize>, String)>,
@@ -3362,6 +3420,40 @@ fn slash_error_message(err: &RpcError) -> SharedString {
     }
 }
 
+/// What one [`Composer::update_slash`] pass owes the popup while a `/` token
+/// is live (§10.4 "Freshness").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashPlan {
+    /// A keystroke inside an already-open popup: re-rank the rows the key
+    /// already has. Never an RPC — the catalog is revalidated once per open,
+    /// never once per keystroke.
+    Filter,
+    /// A popup open, or the key changing under an open one: show the key's
+    /// cached rows straight away (`loading` only when it has none) and
+    /// revalidate, unless that key's request is already in flight.
+    Open { loading: bool, fetch: bool },
+}
+
+/// `opened` is a `/` token appearing or the key changing under a live popup,
+/// `cached` is "this key already has rows", and `inflight_same_key` is "a
+/// `ListCommands` for this very key has not answered yet".
+fn slash_plan(opened: bool, cached: bool, inflight_same_key: bool) -> SlashPlan {
+    if !opened {
+        return SlashPlan::Filter;
+    }
+    SlashPlan::Open {
+        loading: !cached,
+        fetch: !inflight_same_key,
+    }
+}
+
+/// A failed discovery reaches the popup only when the key has no rows at all
+/// (§10.4): a revalidation that fails over a cached list keeps the list, and
+/// the failure stays a log line.
+fn slash_failure_error(cached: bool, err: &RpcError) -> Option<SharedString> {
+    (!cached).then(|| slash_error_message(err))
+}
+
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
@@ -3388,9 +3480,10 @@ pub struct Composer {
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
     slash: SlashState,
-    /// Advertised commands per harness (one `ListCommands` per harness per
-    /// composer lifetime; the engine caches discovery on its side too).
-    slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
+    /// Advertised commands per `(device, harness, cwd)`, kept for the
+    /// composer's life: the rows show immediately while each popup open
+    /// revalidates the key with one `ListCommands` (§10.4 "Freshness").
+    slash_cache: HashMap<SlashKey, Vec<SlashCommand>>,
     /// Slash-popup row scroll — the stack overflows into a wheel/keyboard-
     /// scrollable list once it outgrows the card.
     slash_scroll: gpui::ScrollHandle,
@@ -3489,7 +3582,13 @@ impl Composer {
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let pickers_observe = cx.observe(&pickers, |this: &mut Self, _, cx| {
+            // An agent-chip change moves the slash key's harness with no input
+            // edit and no state observer; revalidate an open `/` list before
+            // the repaint, the twin of the folder fix (§10.6).
+            this.revalidate_slash_on_key_change(cx);
+            cx.notify();
+        });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -4178,8 +4277,48 @@ impl Composer {
 
     // ---- slash commands ---------------------------------------------------
 
-    /// Track the `/` token on every edit: open/refresh the popup, fetch the
-    /// harness's command list on first open, filter locally per keystroke.
+    /// The catalog the composer is asking for right now: the resolved harness
+    /// plus the directory a run would execute in — the chat's cwd for an
+    /// existing chat, the picked space's path on the new-chat canvas (§10.4).
+    fn slash_key(&self, cx: &App) -> Option<SlashKey> {
+        let harness = self.pickers.read(cx).resolved(cx).harness?;
+        let state = self.state.read(cx);
+        let (device, cwd) = match state.selected_chat_row() {
+            Some(chat) => (Some(chat.device_id.clone()), chat.cwd.clone()),
+            None => match state.selected_space_row() {
+                Some(space) => (Some(space.device_id.clone()), Some(space.path.clone())),
+                None => (None, None),
+            },
+        };
+        Some(SlashKey {
+            device,
+            harness,
+            cwd,
+        })
+    }
+
+    /// A `/` popup open while its catalog key moved with no input edit to
+    /// drive discovery revalidates here: a project/device pick reaches this
+    /// through the state observer, an agent-chip pick through the pickers
+    /// observer, and both funnel through here so the new key's list replaces
+    /// the previous one at once instead of lingering until the next keystroke
+    /// (§10.6). The guard keeps it inert unless a `/` is open and the key
+    /// truly changed.
+    fn revalidate_slash_on_key_change(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_none()
+            && self.slash.token.is_some()
+            && self.slash_key(cx) != self.slash.key
+        {
+            let (text, cursor) = {
+                let input = self.input.read(cx);
+                (input.text().to_string(), input.cursor_offset())
+            };
+            self.update_slash(&text, cursor, cx);
+        }
+    }
+
+    /// Track the `/` token on every edit: open/refresh the popup, revalidate
+    /// the key's command list once per open, filter locally per keystroke.
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
         let token = slash_token(text, cursor);
         let still_dismissed = token.as_ref().is_some_and(|token| {
@@ -4193,69 +4332,78 @@ impl Composer {
             return;
         }
         self.slash.dismissed = None;
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let harness_changed = self.slash.harness != harness;
-        if token == self.slash.token && !harness_changed {
+        let key = self.slash_key(cx);
+        let key_changed = self.slash.key != key;
+        if token == self.slash.token && !key_changed {
             self.refilter_slash(cx);
             return;
         }
+        // A `/` appearing, or the key changing under a live popup, is an
+        // open (§10.4 "Freshness"); any other token change is a keystroke.
+        let opened = self.slash.token.is_none() || key_changed;
         self.slash.token = token.clone();
-        self.slash.harness = harness;
-        self.slash.error = None;
+        self.slash.key = key.clone();
+        if opened {
+            self.slash.error = None;
+        }
         if token.is_none() {
             self.slash.active = None;
             self.sync_mention_controls(cx);
             return;
         }
         // No resolved harness (catalog still loading): empty popup, no fetch.
-        let Some(harness) = harness else {
+        let Some(key) = key else {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&harness) {
-            self.slash.loading = false;
-            self.refilter_slash(cx);
-            return;
+        match slash_plan(
+            opened,
+            self.slash_cache.contains_key(&key),
+            self.slash.inflight.as_ref() == Some(&key),
+        ) {
+            SlashPlan::Filter => {
+                self.refilter_slash(cx);
+                return;
+            }
+            SlashPlan::Open { loading, fetch } => {
+                self.slash.loading = loading;
+                self.refilter_slash(cx);
+                if !fetch {
+                    return;
+                }
+            }
         }
-        // First open for this harness: one ListCommands, targeted like file
-        // search (the chat/space host device owns the agent binary).
+        // One ListCommands for this open of this (device, harness, cwd),
+        // targeted like file search (the key's device owns the agent binary).
         self.slash.request = self.slash.request.wrapping_add(1);
-        self.slash.loading = true;
-        self.refilter_slash(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.slash.loading = false;
             return;
         };
-        let target = {
-            let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .map(|chat| chat.device_id.clone())
-                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
-        };
+        self.slash.inflight = Some(key.clone());
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
-                object.insert("targetDeviceId".into(), target.clone().into());
-            }
+            let params = list_commands_params(&key);
             let result = engine.client().call(methods::LIST_COMMANDS, params).await;
             this.update(cx, |composer, cx| {
                 if composer.slash.request != request {
                     return;
                 }
+                composer.slash.inflight = None;
                 composer.slash.loading = false;
                 match result {
                     Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
                         Ok(commands) => {
-                            composer.slash_cache.insert(harness, commands);
+                            // The reply replaces the key's rows (§10.4).
+                            composer.slash_cache.insert(key, commands);
                         }
                         Err(err) => tracing::warn!(%err, "slash command decode failed"),
                     },
                     Err(err) => {
                         tracing::debug!(%err, "slash command discovery failed");
-                        composer.slash.error = Some(slash_error_message(&err));
+                        composer.slash.error =
+                            slash_failure_error(composer.slash_cache.contains_key(&key), &err);
                     }
                 }
                 composer.refilter_slash(cx);
@@ -4275,12 +4423,12 @@ impl Composer {
             .unwrap_or_default();
         let commands = self
             .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .key
+            .as_ref()
+            .and_then(|key| self.slash_cache.get(key))
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-        self.slash.filtered = crate::popover::filter_indices(&query, &names);
+        self.slash.filtered = filter_commands(&query, commands);
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
         // A fresh query/reopen restarts the row stack at the top.
         reset_scroll_offset(&self.slash_scroll);
@@ -4321,8 +4469,9 @@ impl Composer {
             .and_then(|active| self.slash.filtered.get(active))
             .and_then(|&ix| {
                 self.slash
-                    .harness
-                    .and_then(|h| self.slash_cache.get(&h))
+                    .key
+                    .as_ref()
+                    .and_then(|key| self.slash_cache.get(key))
                     .and_then(|c| c.get(ix))
             })
             .cloned()
@@ -4343,7 +4492,7 @@ impl Composer {
         self.slash = SlashState {
             request,
             dismissed,
-            harness: self.slash.harness,
+            key: self.slash.key.clone(),
             ..SlashState::default()
         };
         self.sync_mention_controls(cx);
@@ -4358,8 +4507,9 @@ impl Composer {
         self.slash.token.as_ref()?;
         let commands = self
             .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .key
+            .as_ref()
+            .and_then(|key| self.slash_cache.get(key))
             .map(Vec::as_slice)
             .unwrap_or_default();
         // Full pill width at the mention card's height budget — both composer
@@ -4678,6 +4828,11 @@ impl Composer {
                 }
             }
         }
+        // A project/device pick on the new-chat canvas moves the slash key
+        // with no input edit to drive `update_slash`; revalidate an open `/`
+        // list so the new folder's rows replace the previous ones at once
+        // (§10.6). The agent-chip twin rides the pickers observer.
+        self.revalidate_slash_on_key_change(cx);
         cx.notify();
     }
 
@@ -6487,6 +6642,129 @@ mod tests {
         // Bare "/" with cursor at 0 → closed; cursor after it → open-all.
         assert!(slash_token("/", 0).is_none());
         assert_eq!(slash_token("/", 1).map(|t| t.query), Some(String::new()));
+    }
+
+    #[test]
+    fn slash_filter_ranks_names_and_aliases() {
+        fn command(name: &str, aliases: &[&str]) -> SlashCommand {
+            SlashCommand {
+                name: name.into(),
+                description: String::new(),
+                input_hint: None,
+                aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+            }
+        }
+        let commands = [
+            command("predeploy-check", &[]),
+            command("vercel:deploy", &["deploy"]),
+            command("clear", &["reset", "new"]),
+        ];
+
+        // An alias the name doesn't contain still finds the command.
+        assert_eq!(filter_commands("reset", &commands), vec![2]);
+        // The alias's prefix rank beats a substring hit on another name, so
+        // `/deploy` offers the command that alias actually invokes first.
+        assert_eq!(filter_commands("deploy", &commands), vec![1, 0]);
+        // Namespaced names still match on their own.
+        assert_eq!(filter_commands("vercel:", &commands), vec![1]);
+        // Empty query keeps catalog order; a miss matches nothing.
+        assert_eq!(filter_commands("", &commands), vec![0, 1, 2]);
+        assert!(filter_commands("zzz", &commands).is_empty());
+    }
+
+    /// Discovery is cwd-scoped (§10.4): the same harness in two folders is two
+    /// catalogs, so a space switch on the new-chat canvas must miss the cache
+    /// and re-probe instead of re-showing the previous folder's entries.
+    #[test]
+    fn slash_catalog_keys_by_device_harness_and_cwd() {
+        // Off the wire, so the slash path still names no harness variant.
+        let harness: HarnessId = serde_json::from_value(serde_json::json!("mock")).unwrap();
+        let key = |device: Option<&str>, cwd: Option<&str>| SlashKey {
+            device: device.map(str::to_string),
+            harness,
+            cwd: cwd.map(str::to_string),
+        };
+        let repo = key(Some("dev-a"), Some("/work/repo"));
+        let other = key(Some("dev-a"), Some("/work/other"));
+        let engine_dir = key(Some("dev-a"), None);
+        // Same harness, same path, another device: another catalog — a VPS
+        // and a laptop can share `/home/me/repo` without sharing skills.
+        let same_path_other_device = key(Some("dev-b"), Some("/work/repo"));
+        let local_no_project = key(None, None);
+        assert_ne!(repo, other);
+        assert_ne!(repo, engine_dir);
+        assert_ne!(repo, same_path_other_device);
+        assert_ne!(engine_dir, local_no_project);
+
+        let mut cache: HashMap<SlashKey, Vec<SlashCommand>> = HashMap::new();
+        cache.insert(repo.clone(), Vec::new());
+        assert!(cache.contains_key(&repo));
+        assert!(!cache.contains_key(&other));
+        assert!(!cache.contains_key(&engine_dir));
+        assert!(!cache.contains_key(&same_path_other_device));
+
+        // `cwd` and `targetDeviceId` ride the request only when the key has
+        // them; an omitted `cwd` is the engine-directory probe, an omitted
+        // target is the local engine.
+        assert_eq!(
+            list_commands_params(&repo),
+            serde_json::json!({
+                "harness": "mock",
+                "cwd": "/work/repo",
+                "targetDeviceId": "dev-a",
+            })
+        );
+        assert_eq!(
+            list_commands_params(&local_no_project),
+            serde_json::json!({ "harness": "mock" })
+        );
+    }
+
+    /// §10.4 "Freshness": every popup open revalidates its key exactly
+    /// once, and a failed revalidation never blanks a list that was fine a
+    /// moment ago.
+    #[test]
+    fn slash_open_revalidates_once_and_keeps_rows_on_failure() {
+        // First open of a key: nothing to show, so the skeleton, and one
+        // request.
+        assert_eq!(
+            slash_plan(true, false, false),
+            SlashPlan::Open {
+                loading: true,
+                fetch: true
+            }
+        );
+        // Open with the key cached: its rows show at once (no skeleton
+        // flash) and the revalidation still goes out.
+        assert_eq!(
+            slash_plan(true, true, false),
+            SlashPlan::Open {
+                loading: false,
+                fetch: true
+            }
+        );
+        // Reopened while this key's request is still in flight: no second
+        // request — the pending reply already owns the rows. A key change
+        // under the popup is the first case again, since the request in
+        // flight is the old key's.
+        assert_eq!(
+            slash_plan(true, false, true),
+            SlashPlan::Open {
+                loading: true,
+                fetch: false
+            }
+        );
+        // A keystroke inside the open popup only re-ranks the rows.
+        assert_eq!(slash_plan(false, false, false), SlashPlan::Filter);
+        assert_eq!(slash_plan(false, true, true), SlashPlan::Filter);
+
+        // A failed revalidation with rows cached keeps them (a log line
+        // only); with no rows it is the popup's error.
+        assert!(slash_failure_error(true, &RpcError::Closed).is_none());
+        assert_eq!(
+            slash_failure_error(false, &RpcError::Closed),
+            Some(slash_error_message(&RpcError::Closed))
+        );
     }
 
     #[test]

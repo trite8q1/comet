@@ -71,6 +71,21 @@ case "$first" in
   exit 3
   ;;
 
+*'"prompt":"/'*)
+  # Slash parity (ARCHITECTURE.md §10.5): Cursor's own surfaces send a skill
+  # invocation as plain user text — its palette submits `/<skill> <args>` and
+  # its ACP server passes an unmatched `/name` through untouched — so the
+  # adapter must not touch it. Append the raw stdin frames (the run prompt,
+  # then the steer) to a log in the run's cwd; the test compares them.
+  printf '%s\n' "$first" >>slash-parity.jsonl
+  emit '{"ev":"ready","agentId":"agent-slash","model":"auto"}'
+  emit '{"ev":"turn","status":"finished"}'
+  read -r steer || exit 0
+  printf '%s\n' "$steer" >>slash-parity.jsonl
+  emit '{"ev":"turn","status":"finished"}'
+  exit 0
+  ;;
+
 *)
   emit '{"ev":"fatal","message":"unknown scenario"}'
   exit 1

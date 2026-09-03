@@ -82,7 +82,15 @@ pub trait Harness: Send + Sync {
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     /// Slash commands the agent advertises (ACP `availableCommands`); empty
     /// for harnesses without them. May spawn a short-lived discovery process.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    ///
+    /// `cwd` is the directory the run would execute in — every CLI resolves
+    /// its project-level skills and commands against it (ARCHITECTURE.md
+    /// §10.4), so the catalog is scoped to it. `None` asks for the catalog
+    /// the CLI would list started from the engine's own directory.
+    async fn commands(
+        &self,
+        _cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(Vec::new())
     }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
@@ -97,6 +105,7 @@ pub mod acp;
 pub(crate) mod adapter_install;
 pub mod claude;
 pub mod codex;
+pub mod commands;
 pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
