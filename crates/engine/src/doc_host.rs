@@ -3246,13 +3246,31 @@ impl DocHost {
             SessionCommandPayload::RespondPlanExit {
                 request_id,
                 approved,
+                rejected,
                 feedback,
             } => {
-                let decision = comet_proto::PlanDecision {
-                    approved: *approved,
-                    feedback: feedback.clone(),
+                // A REJECT wins over the other two readings of the same
+                // payload: an older peer that cannot express one writes
+                // `approved:false` alone and gets the keep-planning it meant.
+                let decision = match (*approved, *rejected) {
+                    (false, true) => comet_proto::PlanDecision::reject(),
+                    (true, _) => comet_proto::PlanDecision::approve(),
+                    (false, false) => comet_proto::PlanDecision::keep_planning(feedback.clone()),
                 };
+                let rejected = decision.rejected;
                 if sessions.respond_plan_exit(chat_id, request_id, decision)? {
+                    // Reject: the gate is answered on the harness's own wire
+                    // FIRST (the resolver is consumed, so the interrupt's own
+                    // drain finds nothing to auto-decline), then the turn is
+                    // ended — a plain `interrupt`, not a replacement: the user
+                    // DID end this turn, so its Idle edge is theirs to hear.
+                    // Leaving plan mode is the same write the toggle makes;
+                    // the torn-down run will never report a mode itself.
+                    if rejected {
+                        sessions.interrupt(chat_id).await?;
+                        sessions.leave_plan_mode(chat_id);
+                        return Ok((SessionCommandStatus::Applied, None));
+                    }
                     // "Keep planning" feedback is the user's next message,
                     // on every harness (ARCHITECTURE.md §11.2 "Feedback
                     // delivery"): the adapter only rejects its gate, and the

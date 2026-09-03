@@ -500,8 +500,11 @@ changes.
   question; Grok `exit_plan_mode` → `session/request_permission`). Some CLIs have no
   agent-initiated gate (Cursor, Codex): there the user leaves plan mode with the toggle, as
   in the CLI.
-- **Decision** — `PlanDecision { approved, feedback }`: approve, or keep planning with optional
-  feedback.
+- **Decision** — `PlanDecision`: approve, keep planning with optional feedback, or REJECT.
+  A rejection is a denial that also ends the turn and leaves plan mode, so an adapter that
+  only knows `approved` still puts the right thing on its wire — the engine owns the stop.
+  Build one with `PlanDecision::{approve, keep_planning, reject}`; `approved` and `rejected`
+  are exclusive.
 
 ### 11.2 Harness contracts — the CLI is the authority
 
@@ -544,6 +547,18 @@ Idle (`interrupt_for_replacement`), so the Working→Idle edge — the "done" ch
 settled sidebar dot, on every device — never fires for a turn the user did not end. The same
 path covers a live run restarted for a changed run configuration.
 
+**Rejection delivery.** A REJECT is a denial the engine follows with a real stop, so no
+adapter had to learn a new wire: Claude's deny sentence already tells the model to stop and
+wait, OpenCode still answers "No", and the turn ends because the engine interrupts it. Two
+wires do carry a native abort and take it, because letting the agent wind itself down beats
+killing it mid-step: generic ACP answers `outcome: "cancelled"` (the spec's own "called off",
+returned as `stopReason: "cancelled"` ⇒ `DoneStatus::Interrupted`) instead of the reject
+OPTION, which means keep planning. Grok's `ExitPlanModeExtResponse` has an `abandoned` field
+that reads like the third TUI branch, but the NAME is inferred from the binary rather than
+live-verified (`crates/harness/tests/fixtures/grok-plan-mode.json` lists it as unverified), so
+comet keeps sending `abandoned: false` and lets the interrupt do the work. Cursor and Codex
+have no gate to reject at all.
+
 **Question panels never submit on their own.** A pick on the last page stays put; the user
 presses Submit (or Skip, which resolves the request with no answers — the "declined" signal
 every adapter already carries). Auto-advance between pages remains.
@@ -576,7 +591,8 @@ card Approve/Keep planning ──QueueCommand RespondPlanExit──▶ host ─o
 
 - `comet-proto`: `RunRequest.plan_mode: bool`, `ChatConfig.plan_mode: bool` (both serde-default
   false, additive); `AgentEvent::{PlanModeChanged{active}, PlanUpdated{text, path},
-  PlanExitRequested{request_id}, PlanExitResolved{request_id, approved}}`; `PlanDecision`.
+  PlanExitRequested{request_id}, PlanExitResolved{request_id, approved, rejected}}`;
+  `PlanDecision`.
   `HarnessDescriptor.plan_mode: bool` (engine registry) so composers gate the toggle by
   descriptor, never by harness id.
 - `comet-harness`: `Harness::plan_mode() -> bool` (default false). `RunControls` gains
@@ -587,12 +603,17 @@ card Approve/Keep planning ──QueueCommand RespondPlanExit──▶ host ─o
   emit its own copy; §10-era bug class). Plan-file reading lives in the adapter whose CLI
   keeps a plan file; nothing outside `crates/harness` knows a plan path.
 - `comet-doc`: `MessagePart::Plan { id, plan, status, request_id, path }` with `status ∈
-  {drafting, awaitingApproval, approved, revising}`. The body field is `plan` (never `text`)
+  {drafting, awaitingApproval, approved, revising, rejected}`. A peer too old to know a
+  status string decodes it as `drafting` (pinned on both surfaces) — the card can read wrong
+  on that one device during a fleet skew, never unanswerable. The body field is `plan` (never `text`)
   so a pre-plan desktop build renders an invisible part and iOS drops the unknown kind — the
   `Reasoning` precedent. One plan part per segment, fixed id `plan`, refreshed in place by
   every `PlanUpdated` (the `LIVE_PLAN_TOOL_ID` singleton trick). Text capped at 128 KB.
-  Ledger: `SessionCommandPayload::{RespondPlanExit{request_id, approved, feedback},
-  SetPlanMode{active}}`. No new RPC method.
+  Ledger: `SessionCommandPayload::{RespondPlanExit{request_id, approved, rejected, feedback},
+  SetPlanMode{active}}`. No new RPC method. `rejected` is a FIELD, not a new payload kind,
+  deliberately: a phone writes commands straight into the doc, and a host too old to know a
+  new `kind` would drop the whole entry and leave the gate parked forever — an unknown field
+  is ignored instead, and the answer lands as the keep-planning half it can express.
 - `comet-engine`: `RunHandle` carries the `watch::Sender<bool>` and a `pending_plan_exits`
   map mirroring `pending_inputs`; `respond_plan_exit()` mirrors `respond_input()`;
   `set_plan_mode()` pushes into a live run and is a no-op `Applied` when idle (the next Run
@@ -618,8 +639,15 @@ card Approve/Keep planning ──QueueCommand RespondPlanExit──▶ host ─o
    session `AwaitingInput`. The card shows Approve / Keep planning; the composer's placeholder
    invites feedback and its send resolves the gate with `approved:false` + the text.
    `RespondPlanExit` (ledger, host-executed, idempotent by request id) → resolver → the adapter
-   answers the wire → `PlanExitResolved` → part `approved`/`revising`. Approval also yields
-   `PlanModeChanged(false)` from the CLI's own signal, which reconciles the toggle.
+   answers the wire → `PlanExitResolved` → part `approved`/`revising`/`rejected`. Approval also
+   yields `PlanModeChanged(false)` from the CLI's own signal, which reconciles the toggle.
+   REJECT is the third answer: the gate is answered on the harness's own wire FIRST (so the
+   interrupt's own drain finds no resolver to auto-decline), then the turn is ended with a
+   plain `interrupt` — not a replacement, because the user DID end this turn and its Idle edge
+   is theirs to hear — and plan mode is left with the same config write the toggle makes, since
+   a torn-down run can never report a mode itself. Ordering is load-bearing: `PlanExitResolved`
+   rides `engine_tx`, which the run loop's `biased` select drains ahead of the harness stream,
+   so the reject folds before the interrupt's `Done` stamps the part on its way out.
 5. No gate (Cursor, Codex, an ACP agent without one): the plan part stays `drafting` with the
    final text; the user flips the toggle and sends the next message, as in the CLI.
 6. Recovery: a gate still parked when its run ends (Stop, an error, the turn finishing) is
@@ -644,11 +672,21 @@ Comet chip card (radius 9, `hairline(0.07)` border, `ink(0.03)` wash; iOS `white
 - Header: the active harness's brand icon tile (`ChatConfig.harness` → `icons::harness_brand_icon`
   / `BrandMark.forHarness`; never a language/file icon), "Plan" label, the plan's first `#`
   heading (else "Plan"), a right-aligned status pill (Drafting… / Awaiting approval / Approved /
-  Revising), chevron.
+  Revising / Rejected — accent while waiting, danger when rejected, quiet otherwise), chevron.
+- Plan file: `MessagePart::Plan.path` on its own row under the header, ABOVE the fold, so a
+  collapsed card still says where the plan lives. Rendered through the one shared path
+  treatment (`ui::file_path` / the phone's twin), which is also what the diff file header
+  uses: monospace at the file-path tone, `$HOME` shortened to `~`, and the basename pinned so
+  truncation eats the directory and never the filename (a live plan path runs to 239 chars).
+  No row at all when the harness keeps no plan file (Cursor, Codex, generic ACP).
 - Body: the plan markdown through the shared markdown renderer (fenced code blocks styled as
   in the diff card); expanded while drafting or awaiting approval, collapsed once approved,
   toggled with the chip fold tween (`Motion.resize` on iOS); reduced motion honored.
-- Actions (only `awaitingApproval`): **Approve** and **Keep planning** → `RespondPlanExit`.
+- Actions (only `awaitingApproval`): **Reject**, **Keep planning**, **Approve** →
+  `RespondPlanExit`. Weighted by what they cost: Reject is a ghost in the danger tone (quiet —
+  it is the destructive one, but the card lives mid-transcript where a red plate would shout),
+  Keep planning a neutral ghost, Approve the accent. Typing in the composer is always the
+  keep-planning answer; rejecting is a deliberate button press.
 - Composer: a "Plan" toggle chip beside model/traits, shown only when the resolved harness
   descriptor has `plan_mode`. Same behavior on the phone (`ComposerChip`).
 

@@ -679,10 +679,7 @@ impl SessionsEngine {
         // parked question callback — a run stuck on a question would deadlock the stop).
         // A parked plan gate the same way: keep planning, never a silent approval.
         for (_, tx) in lock(&pending_exits).drain() {
-            let _ = tx.send(PlanDecision {
-                approved: false,
-                feedback: None,
-            });
+            let _ = tx.send(PlanDecision::keep_planning(None));
         }
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
@@ -745,13 +742,22 @@ impl SessionsEngine {
         let Some(resolver) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let approved = decision.approved;
+        let (approved, rejected) = (decision.approved, decision.rejected);
         let _ = resolver.send(decision);
         let _ = engine_tx.send(AgentEvent::PlanExitResolved {
             request_id: request_id.to_string(),
             approved,
+            rejected,
         });
         Ok(true)
+    }
+
+    /// Leave plan mode on the chat's own config — what a REJECT does after
+    /// answering the gate (§11.4). The harness's reported mode normally wins,
+    /// but a rejected turn is being torn down and will never report one, so
+    /// Comet writes the requested mode itself, exactly as the toggle does.
+    pub fn leave_plan_mode(&self, chat_id: &str) {
+        self.inner.reconcile_plan_mode(chat_id, false);
     }
 
     /// Whether the chat's live run is parked on the user: an unanswered
@@ -2023,10 +2029,7 @@ async fn drive_run(
                             .get(&chat_id)
                             .and_then(|h| lock(&h.pending_plan_exits).remove(request_id));
                         if let Some(tx) = resolver {
-                            let _ = tx.send(PlanDecision {
-                                approved: false,
-                                feedback: None,
-                            });
+                            let _ = tx.send(PlanDecision::keep_planning(None));
                         }
                         tracing::debug!(chat = %chat_id, "parked session: post-turn plan exit auto-declined");
                         continue;
@@ -2238,10 +2241,7 @@ async fn drive_run(
                 .map(|h| (h.pending_inputs.clone(), h.pending_plan_exits.clone()));
             if let Some((pending, pending_exits)) = pending {
                 for (_, tx) in lock(&pending_exits).drain() {
-                    let _ = tx.send(PlanDecision {
-                        approved: false,
-                        feedback: None,
-                    });
+                    let _ = tx.send(PlanDecision::keep_planning(None));
                 }
                 for (_, tx) in lock(&pending).drain() {
                     let _ = tx.send(Vec::new());

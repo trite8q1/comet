@@ -106,6 +106,29 @@ else
   fail "apps/ios/Comet/Sync/SessionStore.swift lacks the shared answered-gate latch"
 fi
 
+# ONE path treatment per surface (§11.6): the plan card's file row and the
+# diff file header are the same object, so they must not drift apart again.
+if grep -q 'file_path::path_line' crates/ui/src/changes.rs crates/ui/src/transcript.rs; then
+  ok "desktop shares one file-path treatment"
+else
+  fail "the plan card / diff header no longer share ui::file_path::path_line"
+fi
+if grep -rq 'planPathDisplay' apps/ios/Comet; then
+  ok "phone shares one file-path treatment"
+else
+  fail "apps/ios/Comet lacks the shared plan-path helper"
+fi
+
+# The plan file is a STRING the harness handed us: the UI may render it, never
+# interpret it (§11.8). Guarded by the plan-path literal check above; this one
+# keeps the shortener lexical — no cwd math, which would only buy `../../..`
+# for the plan files that live outside the project.
+if grep -nE 'strip_prefix\(&?cwd|relative_to|components\(\)' crates/ui/src/file_path.rs >/dev/null; then
+  fail "crates/ui/src/file_path.rs relativizes paths (must stay lexical)"
+else
+  ok "file-path shortener stays lexical"
+fi
+
 # `/plan` is the one composer-owned slash command (§11.9): one resolver per
 # surface, both harness-agnostic, and no adapter re-implements it.
 if grep -q 'fn composer_builtin' crates/ui/src/composer.rs; then

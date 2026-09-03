@@ -1296,6 +1296,51 @@ mod tests {
         );
     }
 
+    /// Every lifecycle string round-trips, and a status this build does not
+    /// know degrades to `Drafting` instead of dropping the part. That is the
+    /// fleet-skew contract for adding a variant (the phone pins the same
+    /// rule in `PlanModeTests`): the card may read wrong on an older peer,
+    /// it is never unreadable.
+    #[test]
+    fn plan_status_round_trips_and_an_unknown_one_degrades() {
+        for (status, wire) in [
+            (PlanStatus::Drafting, "drafting"),
+            (PlanStatus::AwaitingApproval, "awaitingApproval"),
+            (PlanStatus::Approved, "approved"),
+            (PlanStatus::Revising, "revising"),
+            (PlanStatus::Rejected, "rejected"),
+        ] {
+            let part = MessagePart::Plan {
+                id: "plan".into(),
+                plan: "# P".into(),
+                status,
+                request_id: None,
+                path: None,
+            };
+            let json = to_doc_part(&part).expect("to doc part");
+            assert_eq!(json.plan_status.as_deref(), Some(wire), "{status:?}");
+            assert_eq!(from_doc_part(json), part, "{status:?}");
+        }
+        let future = serde_json::json!({
+            "id": "plan", "kind": "plan", "plan": "# P", "planStatus": "fromTheFuture"
+        });
+        let strict: DocPartJson = serde_json::from_value(future.clone()).expect("decodes");
+        assert!(matches!(
+            from_doc_part(strict),
+            MessagePart::Plan {
+                status: PlanStatus::Drafting,
+                ..
+            }
+        ));
+        assert!(matches!(
+            salvage_part(&future, "e1", 0),
+            Some(MessagePart::Plan {
+                status: PlanStatus::Drafting,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn round_trips_message_entries() {
         let doc = SessionDoc::init("chat-1").unwrap();

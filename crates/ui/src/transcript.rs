@@ -966,8 +966,11 @@ pub enum RowKind {
         /// The plan's first `# ` heading, else "Plan".
         title: SharedString,
         status: PlanStatus,
-        /// The parked exit request the Approve / Keep planning buttons answer.
+        /// The parked exit request the card's three buttons answer.
         request_id: Option<SharedString>,
+        /// Where the harness keeps the plan, when it keeps it in a file.
+        /// `None` for the harnesses that hold the plan on the wire only.
+        path: Option<SharedString>,
     },
 }
 
@@ -1154,6 +1157,7 @@ fn plan_status_label(status: PlanStatus) -> &'static str {
         PlanStatus::AwaitingApproval => "Awaiting approval",
         PlanStatus::Approved => "Approved",
         PlanStatus::Revising => "Revising",
+        PlanStatus::Rejected => "Rejected",
     }
 }
 
@@ -1164,25 +1168,59 @@ fn plan_status_bits(status: PlanStatus) -> u8 {
         PlanStatus::AwaitingApproval => 1,
         PlanStatus::Approved => 2,
         PlanStatus::Revising => 3,
+        PlanStatus::Rejected => 4,
     }
 }
 
-/// The plan row's diff key: CONTENT + lifecycle + the parked request. The
-/// harness refreshes the part in place, so every draft has to move this — and
-/// a redraft can rewrite the plan without changing its length (a reordered
-/// step, a swapped word), so the key hashes the bytes, not `len()`.
-fn plan_version(plan: &str, status: PlanStatus, request_id: Option<&str>) -> u64 {
-    let mut acc = Vec::with_capacity(request_id.map_or(0, str::len) + 17);
+/// The plan row's diff key: CONTENT + lifecycle + the parked request + the
+/// plan file. The harness refreshes the part in place, so every draft has to
+/// move this — and a redraft can rewrite the plan without changing its length
+/// (a reordered step, a swapped word), so the key hashes the bytes, not
+/// `len()`. The path is in here because some adapters deliver it on a LATER
+/// `PlanUpdated` carrying identical text: without it the row would keep the
+/// version it had and the card would never show the file it just learned.
+fn plan_version(
+    plan: &str,
+    status: PlanStatus,
+    request_id: Option<&str>,
+    path: Option<&str>,
+) -> u64 {
+    let mut acc = Vec::with_capacity(request_id.map_or(0, str::len) + 25);
     acc.extend_from_slice(&fnv1a(plan.as_bytes()).to_le_bytes());
     acc.push(plan_status_bits(status));
+    acc.extend_from_slice(&fnv1a(path.unwrap_or_default().as_bytes()).to_le_bytes());
     acc.extend_from_slice(request_id.unwrap_or_default().as_bytes());
     fnv1a(&acc)
 }
 
+/// The card's three answers to the exit gate (ARCHITECTURE.md §11.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanAnswer {
+    /// Leave plan mode and build it.
+    Approve,
+    /// Stay in plan mode and redraft. Typing in the composer sends this one
+    /// with the text as feedback; the button sends it bare.
+    KeepPlanning,
+    /// Deny the gate, end the turn, and leave plan mode.
+    Reject,
+}
+
+impl PlanAnswer {
+    /// `(approved, rejected)` as the ledger payload spells it.
+    fn wire(self) -> (bool, bool) {
+        match self {
+            Self::Approve => (true, false),
+            Self::KeepPlanning => (false, false),
+            Self::Reject => (false, true),
+        }
+    }
+}
+
 /// Whether the card opens by default: a plan still being written (or waiting
-/// on the user) is the point of the turn; an approved one is history.
+/// on the user) is the point of the turn; a decided one — approved OR
+/// rejected — is history and folds away.
 fn plan_opens_by_default(status: PlanStatus) -> bool {
-    !matches!(status, PlanStatus::Approved)
+    !matches!(status, PlanStatus::Approved | PlanStatus::Rejected)
 }
 
 /// Build the block rows of one (already continuation-joined) entry.
@@ -1361,7 +1399,7 @@ pub fn rows_for_entry(
                         plan,
                         status,
                         request_id,
-                        ..
+                        path,
                     } => {
                         // One row per plan part, refreshed IN PLACE: the
                         // harness rewrites the segment's single plan part on
@@ -1371,13 +1409,19 @@ pub fn rows_for_entry(
                         // re-splicing the rows around them.
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
-                            version: plan_version(plan, *status, request_id.as_deref()),
+                            version: plan_version(
+                                plan,
+                                *status,
+                                request_id.as_deref(),
+                                path.as_deref(),
+                            ),
                             turn_start: false,
                             kind: RowKind::PlanCard {
                                 plan: plan.clone().into(),
                                 title: plan_title(plan),
                                 status: *status,
                                 request_id: request_id.clone().map(SharedString::from),
+                                path: path.clone().map(SharedString::from),
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -4460,12 +4504,14 @@ impl Transcript {
                 title,
                 status,
                 request_id,
+                path,
             } => self.render_plan_card(
                 &row.id,
                 plan,
                 title,
                 *status,
                 request_id.as_ref(),
+                path.as_ref(),
                 &theme,
                 window,
                 cx,
@@ -5212,15 +5258,17 @@ impl Transcript {
     /// SHARED latch so both the buttons and the composer's send go quiet
     /// until the doc frame flips the part's status, and un-marked when the
     /// queue call itself fails — the gate must stay answerable.
-    fn answer_plan_gate(&mut self, request_id: String, approved: bool, cx: &mut Context<Self>) {
+    fn answer_plan_gate(&mut self, request_id: String, answer: PlanAnswer, cx: &mut Context<Self>) {
         let (Some(chat_id), Some(engine)) =
             (self.chat_id.clone(), self.state.read(cx).engine().cloned())
         else {
             return;
         };
+        let (approved, rejected) = answer.wire();
         let command = SessionCommandPayload::RespondPlanExit {
             request_id: request_id.clone(),
             approved,
+            rejected,
             feedback: None,
         };
         let Ok(command) = serde_json::to_value(&command) else {
@@ -5266,6 +5314,7 @@ impl Transcript {
         title: &SharedString,
         status: PlanStatus,
         request_id: Option<&SharedString>,
+        path: Option<&SharedString>,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -5315,7 +5364,27 @@ impl Transcript {
             .border_1()
             .border_color(crate::theme::hairline(0.07))
             .bg(crate::theme::ink(0.03))
-            .child(header);
+            .child(header)
+            // The plan FILE, on the header's own 8px rhythm and above the
+            // fold — a collapsed Approved card is exactly when "where does
+            // this plan live?" gets asked, so it must not fold away with the
+            // body. Absent for the harnesses that keep the plan on the wire
+            // only, and then there is no row at all rather than an empty one.
+            .children(path.map(|p| {
+                // A flex row with the line in the flexible slot — the same
+                // shape the diff file header gives it, so the directory has
+                // something to shrink against.
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px(px(8.0))
+                    .pb(px(6.0))
+                    .child(crate::file_path::path_line(p, theme).flex_1())
+            }));
 
         if open || animating {
             // The plan is markdown the harness wrote: same parse cache and
@@ -5486,7 +5555,14 @@ fn plan_header_row(
 /// The lifecycle pill: quiet for every state the user cannot act on, accent
 /// only while the harness is actually waiting on them.
 fn plan_status_pill(status: PlanStatus, theme: &Theme) -> gpui::Div {
-    let waiting = status == PlanStatus::AwaitingApproval;
+    // Three tones, not two: waiting is the accent (the card wants an answer),
+    // rejected is the danger tone (the one ending that is a refusal), and
+    // every other state is quiet history.
+    let (wash, ink) = match status {
+        PlanStatus::AwaitingApproval => (theme.accent.opacity(0.14), theme.accent),
+        PlanStatus::Rejected => (theme.danger.opacity(0.14), theme.danger),
+        _ => (crate::theme::ink(0.06), theme.text_muted.opacity(0.85)),
+    };
     div()
         .flex_none()
         .h(px(18.0))
@@ -5494,23 +5570,18 @@ fn plan_status_pill(status: PlanStatus, theme: &Theme) -> gpui::Div {
         .rounded(px(5.0))
         .flex()
         .items_center()
-        .bg(if waiting {
-            theme.accent.opacity(0.14)
-        } else {
-            crate::theme::ink(0.06)
-        })
+        .bg(wash)
         .text_size(px(11.0))
-        .text_color(if waiting {
-            theme.accent
-        } else {
-            theme.text_muted.opacity(0.85)
-        })
+        .text_color(ink)
         .child(SharedString::from(plan_status_label(status)))
 }
 
-/// The exit gate's two answers, inside the card: approve the plan (accent), or
-/// keep planning. Both go quiet the moment one is pressed and stay quiet until
-/// the doc frame moves the part's status.
+/// The exit gate's three answers, inside the card. Weighted left to right by
+/// how much they cost the user: Reject is a ghost in the danger tone (quiet —
+/// it is the destructive one, but it lives mid-transcript, where a red plate
+/// would shout over the reading), Keep planning is a neutral ghost, Approve
+/// is the accent. All three go quiet the moment one is pressed and stay quiet
+/// until the doc frame moves the part's status.
 fn plan_actions(
     row_id: &SharedString,
     request_id: SharedString,
@@ -5518,6 +5589,7 @@ fn plan_actions(
     theme: &Theme,
     cx: &mut Context<Transcript>,
 ) -> gpui::Div {
+    let reject = request_id.to_string();
     let keep = request_id.to_string();
     let approve = request_id.to_string();
     div()
@@ -5531,12 +5603,22 @@ fn plan_actions(
         .px(px(12.0))
         .pb(px(10.0))
         .child(
+            crate::popover::btn_ghost_danger(theme, "Reject", format!("{row_id}-plan-reject"))
+                .id(SharedString::from(format!("{row_id}-plan-reject")))
+                .when(answered, |el| el.opacity(0.5))
+                .when(!answered, |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.answer_plan_gate(reject.clone(), PlanAnswer::Reject, cx)
+                    }))
+                }),
+        )
+        .child(
             crate::popover::btn_ghost(theme, "Keep planning", format!("{row_id}-plan-keep"))
                 .id(SharedString::from(format!("{row_id}-plan-keep")))
                 .when(answered, |el| el.opacity(0.5))
                 .when(!answered, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
-                        this.answer_plan_gate(keep.clone(), false, cx)
+                        this.answer_plan_gate(keep.clone(), PlanAnswer::KeepPlanning, cx)
                     }))
                 }),
         )
@@ -5548,7 +5630,7 @@ fn plan_actions(
                 .when(answered, |el| el.opacity(0.5))
                 .when(!answered, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
-                        this.answer_plan_gate(approve.clone(), true, cx)
+                        this.answer_plan_gate(approve.clone(), PlanAnswer::Approve, cx)
                     }))
                 }),
         )
@@ -6341,11 +6423,15 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
             plan,
             status,
             request_id,
+            path,
             ..
         } = part
         {
             acc.push(0x20 | plan_status_bits(*status));
             acc.extend_from_slice(&fnv1a(plan.as_bytes()).to_le_bytes());
+            acc.extend_from_slice(
+                &fnv1a(path.as_deref().unwrap_or_default().as_bytes()).to_le_bytes(),
+            );
             acc.extend_from_slice(request_id.as_deref().unwrap_or_default().as_bytes());
         }
     }
@@ -7224,12 +7310,21 @@ mod tests {
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
 
     fn plan_part(plan: &str, status: PlanStatus, request_id: Option<&str>) -> MessagePart {
+        plan_part_at(plan, status, request_id, None)
+    }
+
+    fn plan_part_at(
+        plan: &str,
+        status: PlanStatus,
+        request_id: Option<&str>,
+        path: Option<&str>,
+    ) -> MessagePart {
         MessagePart::Plan {
             id: comet_doc::PLAN_PART_ID.into(),
             plan: plan.into(),
             status,
             request_id: request_id.map(str::to_string),
-            path: None,
+            path: path.map(str::to_string),
         }
     }
 
@@ -7257,6 +7352,7 @@ mod tests {
             status,
             request_id,
             plan,
+            path,
         } = &rows[1].kind
         else {
             panic!("expected a plan card, got a {:?}", rows[1].id);
@@ -7265,6 +7361,7 @@ mod tests {
         assert_eq!(*status, PlanStatus::AwaitingApproval);
         assert_eq!(request_id.as_deref(), Some("req-1"));
         assert!(plan.starts_with("# Veil port plan"), "body kept verbatim");
+        assert_eq!(path.as_deref(), None, "this harness keeps no plan file");
         // A plan the harness never titled still names itself.
         assert_eq!(plan_title("1. do the thing\n"), "Plan");
         assert_eq!(plan_title("## Sub\n# Real\n"), "Real");
@@ -7334,8 +7431,8 @@ mod tests {
         let after = "# Plan\n\n1. scan\n2. write\n";
         assert_eq!(before.len(), after.len(), "the point of the test");
         assert_ne!(
-            plan_version(before, PlanStatus::Drafting, None),
-            plan_version(after, PlanStatus::Drafting, None),
+            plan_version(before, PlanStatus::Drafting, None, None),
+            plan_version(after, PlanStatus::Drafting, None, None),
             "the row version moves",
         );
         let fingerprint = |plan: &str| {
@@ -7353,6 +7450,79 @@ mod tests {
             fingerprint(after),
             "the cached-rows fingerprint moves",
         );
+    }
+
+    /// The plan FILE reaches the card, and it moves the diff key: some
+    /// adapters send the path on a later `PlanUpdated` whose text is
+    /// byte-identical, so a row keyed on text alone would never repaint.
+    #[test]
+    fn a_plan_path_reaches_the_card_and_moves_the_diff_key() {
+        let of = |path: Option<&str>| {
+            rows_for_entry(
+                &assistant(
+                    "m1",
+                    MessageStatus::Streaming,
+                    vec![plan_part_at("# P\n", PlanStatus::Drafting, None, path)],
+                ),
+                false,
+                &mut parse,
+            )
+            .remove(0)
+        };
+        let bare = of(None);
+        let filed = of(Some("/tmp/x/notes/a.md"));
+        let RowKind::PlanCard { path, .. } = &filed.kind else {
+            panic!("expected a plan card");
+        };
+        assert_eq!(path.as_deref(), Some("/tmp/x/notes/a.md"));
+        assert_eq!(bare.id, filed.id, "the path never moves row identity");
+        assert_ne!(
+            bare.version, filed.version,
+            "learning the path has to repaint the card"
+        );
+        assert_ne!(
+            filed.version,
+            of(Some("/tmp/x/notes/b.md")).version,
+            "a different file is a different card"
+        );
+        // Same one level up, or the CACHED rows keep the pathless card.
+        let fingerprint = |path: Option<&str>| {
+            entry_fingerprint(
+                &assistant(
+                    "m1",
+                    MessageStatus::Complete,
+                    vec![plan_part_at("# P\n", PlanStatus::Drafting, None, path)],
+                ),
+                false,
+            )
+        };
+        assert_ne!(fingerprint(None), fingerprint(Some("/tmp/x/notes/a.md")));
+    }
+
+    /// §11.4's three answers map onto the ledger payload's two flags, and
+    /// only one of them can be a rejection.
+    #[test]
+    fn the_three_plan_answers_are_exclusive_on_the_wire() {
+        assert_eq!(PlanAnswer::Approve.wire(), (true, false));
+        assert_eq!(PlanAnswer::KeepPlanning.wire(), (false, false));
+        assert_eq!(PlanAnswer::Reject.wire(), (false, true));
+    }
+
+    /// A rejected plan is a distinct, terminal lifecycle: its own pill word,
+    /// its own hash byte (so the card repaints off a keep-planning), and it
+    /// folds away like an approval rather than staying open like a draft.
+    #[test]
+    fn a_rejected_plan_reads_as_its_own_terminal_state() {
+        assert_eq!(plan_status_label(PlanStatus::Rejected), "Rejected");
+        assert_ne!(
+            plan_status_bits(PlanStatus::Rejected),
+            plan_status_bits(PlanStatus::Revising),
+        );
+        assert_ne!(
+            plan_version("# P", PlanStatus::Rejected, Some("r1"), None),
+            plan_version("# P", PlanStatus::Revising, Some("r1"), None),
+        );
+        assert!(!plan_opens_by_default(PlanStatus::Rejected));
     }
 
     /// A plan being written (or waiting on the user) is the point of the

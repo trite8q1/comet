@@ -5096,9 +5096,12 @@ impl Composer {
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
+        // Typing is always the KEEP-PLANNING answer: rejecting is a deliberate
+        // button press on the card, never something a sent message can mean.
         let command = SessionCommandPayload::RespondPlanExit {
             request_id: request_id.clone(),
             approved: false,
+            rejected: false,
             feedback: Some(text),
         };
         let Ok(command) = serde_json::to_value(&command) else {

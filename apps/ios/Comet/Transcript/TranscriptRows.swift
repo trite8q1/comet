@@ -15,8 +15,10 @@ enum RowKind {
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
     case inputChip(header: String, resolved: Bool)
     /// The harness's plan for this segment (ARCHITECTURE.md §11.6) — the body
-    /// is the plan markdown, parsed like assistant prose.
-    case planCard(blocks: [TopBlock], title: String, status: PlanStatus, requestId: String?)
+    /// is the plan markdown, parsed like assistant prose. `path` is the plan
+    /// file where the CLI keeps one, nil on the harnesses that keep none.
+    case planCard(blocks: [TopBlock], title: String, status: PlanStatus,
+                  requestId: String?, path: String?)
     case errorChip(message: String)
 }
 
@@ -190,7 +192,7 @@ enum TranscriptRowBuilder {
                                           entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
 
-            case .plan(let partId, let plan, let status, let requestId, _):
+            case .plan(let partId, let plan, let status, let requestId, let path):
                 flushTools(lastIx: ix - 1)
                 let key = "\(entry.id)#\(partId)"
                 live.insert(key)
@@ -200,10 +202,11 @@ enum TranscriptRowBuilder {
                                    parsers: &parsers, completed: &completed)
                 rows.append(TranscriptRow(id: key,
                                           version: planVersion(plan: plan, status: status,
-                                                               requestId: requestId),
+                                                               requestId: requestId, path: path),
                                           turnStart: first,
                                           kind: .planCard(blocks: blocks, title: planTitle(plan),
-                                                          status: status, requestId: requestId),
+                                                          status: status, requestId: requestId,
+                                                          path: path),
                                           entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
 
@@ -257,11 +260,16 @@ enum TranscriptRowBuilder {
 
     /// Diff key for a plan part. The part is refreshed IN PLACE by every
     /// `PlanUpdated`, so the row id never moves — the version has to carry
-    /// every visible change: the draft's CONTENT, the status, the parked gate.
-    /// Hashing the length instead would miss a same-length rewrite (a
-    /// reordered step, a swapped word) and keep stale markdown on the card.
-    static func planVersion(plan: String, status: PlanStatus, requestId: String?) -> UInt64 {
-        fnv1a("\(fnv1a(plan))|\(status.rawValue)|\(requestId ?? "")")
+    /// every visible change: the draft's CONTENT, the status, the parked gate,
+    /// the plan file. Hashing the length instead would miss a same-length
+    /// rewrite (a reordered step, a swapped word) and keep stale markdown on
+    /// the card. The path is in here because some adapters learn it a beat
+    /// after the text — Claude's gate injects `planFilePath` on a later
+    /// `PlanUpdated` whose text is byte-identical — and without it that
+    /// update would not repaint the card's path row.
+    static func planVersion(plan: String, status: PlanStatus, requestId: String?,
+                            path: String?) -> UInt64 {
+        fnv1a("\(fnv1a(plan))|\(status.rawValue)|\(requestId ?? "")|\(path ?? "")")
     }
 
     private static func toolFingerprint(_ tools: [ToolItem]) -> UInt64 {
@@ -291,6 +299,43 @@ enum TranscriptRowBuilder {
         }
         return hash << 1
     }
+}
+
+// MARK: - Path display (the phone half of crates/ui/src/file_path.rs)
+
+/// `$HOME/x` → `~/x`, and a path already written with `~` is left alone (the
+/// mock harness emits one, so this has to be idempotent).
+///
+/// Purely LEXICAL, exactly like the desktop's `home_relative`: no
+/// percent-decoding (an encoded segment is the harness's own bookkeeping and
+/// mangling it would misname the file), and no relativizing against the chat's
+/// cwd — most plan files live OUTSIDE the project, where that only buys a
+/// `../../../` prefix.
+///
+/// `home` is injected so the rule is testable. The default is this device's,
+/// which on a phone is its sandbox container: a path minted on the host Mac
+/// simply stays absolute there, which is the honest reading of someone else's
+/// filesystem.
+func planPathDisplay(_ path: String, home: String = NSHomeDirectory()) -> String {
+    if path == "~" || path.hasPrefix("~/") { return path }
+    var home = home
+    while home.hasSuffix("/") { home.removeLast() }
+    guard !home.isEmpty, path.hasPrefix(home) else { return path }
+    let rest = path.dropFirst(home.count)
+    if rest.isEmpty { return "~" }
+    // A sibling that merely shares the prefix (`/Users/nicolas` against
+    // `HOME=/Users/nico`) is not under it.
+    guard rest.hasPrefix("/") else { return path }
+    return "~" + rest
+}
+
+/// Split a display path into `(directory-with-trailing-slash, basename)` so a
+/// view can truncate the directory and pin the name. A bare filename has no
+/// directory half; a trailing slash makes the whole thing the directory, so a
+/// folder still renders as itself.
+func splitDisplayPath(_ path: String) -> (directory: String, name: String) {
+    guard let slash = path.lastIndex(of: "/") else { return ("", path) }
+    return (String(path[...slash]), String(path[path.index(after: slash)...]))
 }
 
 // MARK: - Tool chip content (transcript.rs tool_chip_content_raw)

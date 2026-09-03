@@ -3062,16 +3062,10 @@ impl Changes {
                 cx.notify();
             }))
             .child(chevron)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(12.0))
-                    .text_color(theme.text_dim)
-                    .child(SharedString::from(file.path.clone())),
-            )
+            // The shared path treatment (`file_path::path_line`) — this header
+            // is where it was designed, so it renders through it rather than
+            // keeping a private copy the plan card would drift from.
+            .child(crate::file_path::path_line(&file.path, theme).flex_1())
             .when(file.binary, |el| {
                 el.child(
                     div()

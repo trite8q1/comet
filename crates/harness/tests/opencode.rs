@@ -989,10 +989,7 @@ async fn first_prompt_waits_for_the_live_event_subscription() {
 // ---------------------------------------------------------------------------
 
 fn keep_planning(feedback: Option<&str>) -> PlanDecision {
-    PlanDecision {
-        approved: false,
-        feedback: feedback.map(str::to_owned),
-    }
+    PlanDecision::keep_planning(feedback.map(str::to_owned))
 }
 
 /// The requested mode IS the `agent` field, on every prompt — and opencode
@@ -1271,10 +1268,7 @@ async fn the_plan_exit_question_is_the_exit_gate() {
 #[tokio::test]
 async fn an_approved_plan_gate_answers_yes_and_prompts_nothing() {
     let fake = FakeOpencode::start().await;
-    let decision = PlanDecision {
-        approved: true,
-        feedback: None,
-    };
+    let decision = PlanDecision::approve();
     let (controls, _steer, _mode, gate) = plan_controls(true, decision);
     let mut req = request("plan it");
     req.plan_mode = true;

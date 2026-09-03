@@ -243,6 +243,10 @@ enum PlanStatus: String, Hashable {
     case awaitingApproval
     case approved
     case revising
+    /// The user rejected the plan: the turn ended with it (§11.4). A device
+    /// too old to know this string decodes it as `drafting` — the card reads
+    /// wrong there, never unanswerable.
+    case rejected
 
     /// The card's status pill.
     var label: String {
@@ -251,6 +255,7 @@ enum PlanStatus: String, Hashable {
         case .awaitingApproval: return "Awaiting approval"
         case .approved: return "Approved"
         case .revising: return "Revising"
+        case .rejected: return "Rejected"
         }
     }
 }
@@ -372,9 +377,11 @@ enum SessionCommandPayload {
     case steer(prompt: String, messageId: String?)
     case interrupt
     case respondInput(requestId: String, answers: [UserInputAnswer])
-    /// The card's Approve / Keep planning answer to the harness's plan-exit
-    /// request; host-executed, idempotent by request id like `respondInput`.
-    case respondPlanExit(requestId: String, approved: Bool, feedback: String?)
+    /// The card's Approve / Keep planning / Reject answer to the harness's
+    /// plan-exit request; host-executed, idempotent by request id like
+    /// `respondInput`. `rejected` denies the gate, ends the turn and leaves
+    /// plan mode (§11.4); it is omitted from the wire when false.
+    case respondPlanExit(requestId: String, approved: Bool, rejected: Bool, feedback: String?)
     /// The composer toggle while a run is live — an idle chat applies
     /// nothing (the next run carries `ChatConfig.planMode`).
     case setPlanMode(active: Bool)

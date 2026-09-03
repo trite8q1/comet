@@ -954,10 +954,9 @@ fn handle_plan_exit(
                 return;
             }
         }
-        let decision = (request_exit)().await.unwrap_or(PlanDecision {
-            approved: false,
-            feedback: None,
-        });
+        let decision = (request_exit)()
+            .await
+            .unwrap_or(PlanDecision::keep_planning(None));
         // Keep planning: the CLI's own rejection sentence, never the user's
         // text — the CLI's TUI denies with that sentence and delivers typed
         // feedback as a USER message (`feedbackIsFromUser`); the engine

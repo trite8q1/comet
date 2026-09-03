@@ -21,6 +21,7 @@ pub mod changes;
 pub mod comments;
 pub mod composer;
 pub mod edge_fade;
+pub mod file_path;
 pub mod frost;
 pub mod history;
 pub mod icons;
@@ -48,8 +49,8 @@ use std::path::PathBuf;
 use futures::StreamExt as _;
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
-pub use state::EngineBootConfig;
 pub use comet_proto::HarnessId;
+pub use state::EngineBootConfig;
 
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/comet`, not here).

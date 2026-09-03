@@ -1971,10 +1971,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     };
                     // A dropped sender reads as "keep planning" — never a
                     // silent approval.
-                    let decision = rx.await.unwrap_or(PlanDecision {
-                        approved: false,
-                        feedback: None,
-                    });
+                    let decision = rx.await.unwrap_or(PlanDecision::keep_planning(None));
                     // The answer is the whole of the adapter's job. "Yes":
                     // the server injects its own build message and switches
                     // the agent. "No": the tool is rejected and the model

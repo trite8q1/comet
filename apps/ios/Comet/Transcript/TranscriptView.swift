@@ -421,20 +421,30 @@ struct TranscriptView: View {
             case .inputChip(let header, let resolved):
                 InputChipView(header: header, resolved: resolved)
 
-            case .planCard(let blocks, let title, let status, let requestId):
-                // Open while the plan is still in play, folded once approved.
-                let autoOpen = status != .approved
+            case .planCard(let blocks, let title, let status, let requestId, let path):
+                // Open while the plan is still in play, folded once it is
+                // history — approved OR rejected.
+                let autoOpen = planOpensByDefault(status)
                 PlanCardView(blocks: blocks, title: title, status: status,
-                             requestId: requestId, harness: harness, cacheKey: row.id,
+                             requestId: requestId, path: path, harness: harness,
+                             cacheKey: row.id,
                              open: folds[row.id] ?? autoOpen,
                              toggle: {
                                  withAnimation(reduceMotion ? nil : Motion.resize) {
                                      folds[row.id] = !(folds[row.id] ?? autoOpen)
                                  }
                              },
-                             respond: { approved in
+                             respond: { answer in
                                  guard let requestId else { return }
-                                 store.respondPlanExit(requestId: requestId, approved: approved)
+                                 switch answer {
+                                 case .approve:
+                                     store.respondPlanExit(requestId: requestId, approved: true)
+                                 case .keepPlanning:
+                                     store.respondPlanExit(requestId: requestId, approved: false)
+                                 case .reject:
+                                     store.respondPlanExit(requestId: requestId, approved: false,
+                                                           rejected: true)
+                                 }
                              },
                              answered: requestId.map(store.answeredPlanGates.contains) ?? false)
 

@@ -4,6 +4,7 @@
 // on a parked plan-exit gate rather than a new turn.
 
 import Loro
+import UIKit
 import XCTest
 @testable import Comet
 
@@ -72,7 +73,7 @@ final class PlanModeTests: XCTestCase {
         XCTAssertEqual(rows.count, 1)
         let row = rows[0]
         XCTAssertEqual(row.id, "m1#plan")
-        guard case .planCard(let blocks, let title, let status, let requestId) = row.kind else {
+        guard case .planCard(let blocks, let title, let status, let requestId, _) = row.kind else {
             return XCTFail("expected a plan card row")
         }
         XCTAssertEqual(title, "Harden the deploy path")
@@ -110,8 +111,10 @@ final class PlanModeTests: XCTestCase {
         let after = "# Plan\n\n1. scan\n2. write\n"
         XCTAssertEqual(before.count, after.count, "the point of the test")
         XCTAssertNotEqual(
-            TranscriptRowBuilder.planVersion(plan: before, status: .drafting, requestId: nil),
-            TranscriptRowBuilder.planVersion(plan: after, status: .drafting, requestId: nil))
+            TranscriptRowBuilder.planVersion(plan: before, status: .drafting, requestId: nil,
+                                             path: nil),
+            TranscriptRowBuilder.planVersion(plan: after, status: .drafting, requestId: nil,
+                                             path: nil))
     }
 
     /// The gate on the LAST assistant entry is the one the composer serves
@@ -268,7 +271,7 @@ final class PlanModeTests: XCTestCase {
     }
 
     func testAnAnsweredOrDraftingPlanLeavesTheSendAlone() {
-        for status: PlanStatus in [.drafting, .approved, .revising] {
+        for status: PlanStatus in [.drafting, .approved, .revising, .rejected] {
             let entries = [
                 MessageEntry(id: "m1", role: .assistant, parts: [
                     .plan(id: "plan", plan: "# P", status: status,
@@ -280,14 +283,132 @@ final class PlanModeTests: XCTestCase {
         XCTAssertEqual(composerSendAction(pendingPlanExit: nil, prompt: "hello"), .message)
     }
 
+    // MARK: Reject — the third answer (§11.4)
+
+    /// The fifth status is a doc string like the other four, and the one an
+    /// older device cannot know still degrades to `drafting` rather than
+    /// dropping the part.
+    func testARejectedPlanDecodesAndAnUnknownStatusStillDegrades() throws {
+        XCTAssertEqual(PlanStatus(rawValue: "rejected"), .rejected)
+        XCTAssertEqual(PlanStatus.rejected.rawValue, "rejected")
+        XCTAssertEqual(PlanStatus.rejected.label, "Rejected")
+
+        let doc = LoroDoc()
+        try doc.getList(id: "messages").push(v: LoroValue.fromJSON([
+            "id": "m1", "role": "assistant", "createdAt": 1, "deviceId": "d",
+            "parts": [["id": "plan", "kind": "plan", "plan": "# P",
+                       "planStatus": "rejected", "requestId": "req-7"]],
+        ]))
+        doc.commit()
+        let parts = try XCTUnwrap(SessionStore.decodeEntries(from: doc)?.first?.parts)
+        guard case .plan(_, _, let status, _, _) = try XCTUnwrap(parts.first) else {
+            return XCTFail("expected a plan part")
+        }
+        XCTAssertEqual(status, .rejected)
+    }
+
+    /// A rejected plan is history, exactly like an approved one: the card
+    /// folds by default and the fold is the only thing the view owns.
+    func testARejectedPlanCardCollapsesByDefault() {
+        XCTAssertTrue(planOpensByDefault(.drafting))
+        XCTAssertTrue(planOpensByDefault(.awaitingApproval))
+        XCTAssertTrue(planOpensByDefault(.revising))
+        XCTAssertFalse(planOpensByDefault(.approved))
+        XCTAssertFalse(planOpensByDefault(.rejected))
+    }
+
+    /// Approve / Keep planning / Reject stay on ONE row on the narrowest
+    /// phone comet ships to (375pt), inside the transcript's 16pt gutters and
+    /// the card's 10pt body padding. If a label or the padding grows, this is
+    /// the test that says so before the row wraps on a device.
+    func testTheThreePlanAnswersFitOneRowOnA375ptPhone() {
+        let font = Theme.sansUI(13, weight: .medium)
+        let padding = PlanCardView.answerHPadding
+        let buttons = ["Approve", "Keep planning", "Reject"].reduce(CGFloat(0)) {
+            $0 + ceil($1.size(withAttributes: [.font: font]).width) + 2 * padding
+        }
+        let available = CGFloat(375) - 2 * 16 - 2 * 10
+        XCTAssertLessThanOrEqual(buttons + 2 * 8, available, "the answers would wrap")
+    }
+
+    // MARK: The plan file on the card (§11.6)
+
+    /// Claude learns the plan file from its own gate: the path lands on a
+    /// LATER `PlanUpdated` whose text is byte-identical to the one before it.
+    /// Without the path in the version the card would keep a stale (empty)
+    /// path row through that update.
+    func testPlanVersionMovesWhenOnlyThePathChanges() {
+        let plan = "# Plan\n\n1. step\n"
+        let before = TranscriptRowBuilder.planVersion(plan: plan, status: .awaitingApproval,
+                                                     requestId: "req-7", path: nil)
+        let landed = TranscriptRowBuilder.planVersion(plan: plan, status: .awaitingApproval,
+                                                     requestId: "req-7", path: "/tmp/x/notes/a.md")
+        let moved = TranscriptRowBuilder.planVersion(plan: plan, status: .awaitingApproval,
+                                                     requestId: "req-7", path: "/tmp/x/notes/b.md")
+        XCTAssertNotEqual(before, landed)
+        XCTAssertNotEqual(landed, moved)
+        // And it reaches the row the card reads.
+        let row = rowsFor(plan: plan, status: .awaitingApproval, requestId: "req-7",
+                          path: "/tmp/x/notes/a.md")[0]
+        guard case .planCard(_, _, _, _, let path) = row.kind else {
+            return XCTFail("expected a plan card row")
+        }
+        XCTAssertEqual(path, "/tmp/x/notes/a.md")
+    }
+
+    /// The card's path line, semantics for semantics with the desktop's
+    /// `file_path::home_relative` (its unit tests pin the same cases).
+    func testThePlanPathIsShownHomeRelative() {
+        let home = "/Users/nico"
+        XCTAssertEqual(planPathDisplay("/Users/nico/notes/a.md", home: home), "~/notes/a.md")
+        XCTAssertEqual(planPathDisplay("/Users/nico", home: home), "~")
+        // Idempotent: an already-shortened path is handed straight back.
+        XCTAssertEqual(planPathDisplay("~/notes/a.md", home: home), "~/notes/a.md")
+        XCTAssertEqual(planPathDisplay("~", home: home), "~")
+        // Outside HOME, and a sibling that only shares the prefix.
+        XCTAssertEqual(planPathDisplay("/tmp/x/a.md", home: home), "/tmp/x/a.md")
+        XCTAssertEqual(planPathDisplay("/Users/nicolas/a.md", home: home), "/Users/nicolas/a.md")
+        // A trailing-slash HOME must not leave a doubled separator.
+        XCTAssertEqual(planPathDisplay("/Users/nico/notes/a.md", home: "/Users/nico/"),
+                       "~/notes/a.md")
+        // No home to speak of shortens nothing.
+        XCTAssertEqual(planPathDisplay("/Users/nico/a.md", home: ""), "/Users/nico/a.md")
+        // Nothing is percent-decoded: the encoded segment IS the name on disk.
+        XCTAssertEqual(planPathDisplay("/Users/nico/.state/%2FUsers%2Fnico%2Frepo/a.md",
+                                       home: home),
+                       "~/.state/%2FUsers%2Fnico%2Frepo/a.md")
+    }
+
+    /// Truncation may eat the directory; it may never eat the filename, so the
+    /// two halves are split before they reach the view.
+    func testThePlanPathSplitKeepsTheBasenameWhole() {
+        var split = splitDisplayPath("/tmp/x/notes/a.md")
+        XCTAssertEqual(split.directory, "/tmp/x/notes/")
+        XCTAssertEqual(split.name, "a.md")
+        // A bare filename has no directory half.
+        split = splitDisplayPath("plan.md")
+        XCTAssertEqual(split.directory, "")
+        XCTAssertEqual(split.name, "plan.md")
+        // A trailing slash is all directory — a folder renders as itself.
+        split = splitDisplayPath("/tmp/x/")
+        XCTAssertEqual(split.directory, "/tmp/x/")
+        XCTAssertEqual(split.name, "")
+        // The shape that motivates the whole helper: everything identifying
+        // the file is at the END of a 200-plus-character path.
+        split = splitDisplayPath("/var/sessions/\(String(repeating: "e", count: 200))/notes.md")
+        XCTAssertEqual(split.name, "notes.md")
+        XCTAssertGreaterThan(split.directory.count, 200)
+    }
+
     // MARK: Helpers
 
-    private func rowsFor(plan: String, status: PlanStatus, requestId: String?) -> [TranscriptRow] {
+    private func rowsFor(plan: String, status: PlanStatus, requestId: String?,
+                         path: String? = nil) -> [TranscriptRow] {
         var parsers: [String: IncrementalMarkdownParser] = [:]
         var completed: [String: CompletedParse] = [:]
         let entries = [
             MessageEntry(id: "m1", role: .assistant, parts: [
-                .plan(id: "plan", plan: plan, status: status, requestId: requestId, path: nil),
+                .plan(id: "plan", plan: plan, status: status, requestId: requestId, path: path),
             ], createdAt: 1, deviceId: "dev-mac", status: .complete, continuationOf: nil),
         ]
         return TranscriptRowBuilder.rows(entries: entries, pendingSends: [],

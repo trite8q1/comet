@@ -610,6 +610,16 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:plan-reject*)
+  # A REJECT on the generic permission shape: the spec's own "called off"
+  # outcome, not the reject OPTION (which means keep planning).
+  emit "{\"id\":73,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"x1\",\"title\":\"exit_plan_mode\",\"kind\":\"other\"},\"options\":[{\"optionId\":\"yes\",\"name\":\"Approve\",\"kind\":\"allow_once\"},{\"optionId\":\"keep\",\"name\":\"Keep planning\",\"kind\":\"reject_once\"}]}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":73' && has "$ans" '"cancelled"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"cancelled\"}}"
+  ;;
+
 *scenario:plan-gate-unreported*)
   # The same generic exit gate, but the agent NEVER reports its mode (no
   # `current_mode_update`). The tool name alone has to stop the auto-approve —

@@ -58,12 +58,20 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
-    /// The card's Approve / Keep planning answer to `PlanExitRequested`;
-    /// host-executed, idempotent by request id like `RespondInput`.
+    /// The card's Approve / Keep planning / Reject answer to
+    /// `PlanExitRequested`; host-executed, idempotent by request id like
+    /// `RespondInput`.
     #[serde(rename_all = "camelCase")]
     RespondPlanExit {
         request_id: String,
         approved: bool,
+        /// Reject: deny the gate, end the turn, leave plan mode (§11.4).
+        /// A FIELD, not a new payload kind, deliberately — a phone writes
+        /// this straight into the doc, and a host too old to know a new
+        /// `kind` would drop the whole entry and leave the gate parked.
+        /// Ignored by such a host, which then does the keep-planning half.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        rejected: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         feedback: Option<String>,
     },
@@ -248,6 +256,7 @@ mod tests {
         let answer = SessionCommandPayload::RespondPlanExit {
             request_id: "r1".into(),
             approved: false,
+            rejected: false,
             feedback: Some("shorter".into()),
         };
         assert_eq!(answer.kind(), SessionCommandKind::RespondPlanExit);

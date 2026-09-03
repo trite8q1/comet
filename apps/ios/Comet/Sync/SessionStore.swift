@@ -646,12 +646,20 @@ final class SessionStore {
     /// Answer the harness's plan-exit gate (commands.rs RespondPlanExit).
     /// `feedback` rides the "keep planning" answer wherever the CLI's gate has
     /// a message channel; an empty one is omitted, like the host's shape.
-    func respondPlanExit(requestId: String, approved: Bool, feedback: String? = nil) {
+    /// `rejected` is the third answer: deny the gate, end the turn, leave plan
+    /// mode. It is written only when true, mirroring the payload's
+    /// `skip_serializing_if` — the two older answers stay byte-identical on
+    /// the wire, so a host too old to know the field still reads them.
+    func respondPlanExit(requestId: String, approved: Bool, rejected: Bool = false,
+                         feedback: String? = nil) {
         var payload: [String: Any] = [
             "kind": "respondPlanExit",
             "requestId": requestId,
             "approved": approved,
         ]
+        if rejected {
+            payload["rejected"] = true
+        }
         if let feedback, !feedback.isEmpty {
             payload["feedback"] = feedback
         }

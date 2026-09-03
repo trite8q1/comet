@@ -828,10 +828,7 @@ async fn plan_mode_launches_in_plan_reports_the_plan_and_approves_the_exit_gate(
         mode: _mode,
         interrupt: _interrupt,
         exits,
-    } = plan_rig(PlanDecision {
-        approved: true,
-        feedback: None,
-    });
+    } = plan_rig(PlanDecision::approve());
     let events = run_to_end(&harness(), req, controls).await;
 
     // The CLI is LAUNCHED in plan mode, and plan wins over auto_approve's
@@ -924,10 +921,7 @@ async fn plan_mode_keep_planning_denies_the_gate_with_the_cli_sentence() {
         mode: _mode,
         interrupt: _interrupt,
         exits,
-    } = plan_rig(PlanDecision {
-        approved: false,
-        feedback: Some("tighten step 2".into()),
-    });
+    } = plan_rig(PlanDecision::keep_planning(Some("tighten step 2".into())));
     let events = run_to_end(&harness(), plan_request(dir.path(), "# Draft\n"), controls).await;
 
     assert_eq!(exits.load(Ordering::SeqCst), 1);
@@ -952,10 +946,7 @@ async fn plan_mode_keep_planning_denies_the_gate_with_the_cli_sentence() {
         mode: _mode,
         interrupt: _interrupt,
         ..
-    } = plan_rig(PlanDecision {
-        approved: false,
-        feedback: None,
-    });
+    } = plan_rig(PlanDecision::keep_planning(None));
     run_to_end(&harness(), plan_request(dir.path(), "# Draft\n"), controls).await;
     assert_eq!(
         gate_frame(dir.path())["response"]["response"]["message"],
@@ -973,10 +964,7 @@ async fn plan_mode_is_reported_when_enter_plan_mode_succeeds() {
         mode: _mode,
         interrupt: _interrupt,
         ..
-    } = plan_rig(PlanDecision {
-        approved: false,
-        feedback: None,
-    });
+    } = plan_rig(PlanDecision::keep_planning(None));
     let events = run_to_end(&harness(), request("scenario:enterplan"), controls).await;
     // init reports `default`; the successful `EnterPlanMode` flips it; the
     // FAILED one reports nothing.
@@ -992,10 +980,7 @@ async fn plan_mode_toggle_switches_the_live_session_and_reports_the_ack() {
         mode,
         interrupt: _interrupt,
         ..
-    } = plan_rig(PlanDecision {
-        approved: false,
-        feedback: None,
-    });
+    } = plan_rig(PlanDecision::keep_planning(None));
     let mut req = request("scenario:switchplan");
     req.cwd = dir.path().to_string_lossy().into_owned();
     let mut stream = harness().run(req, controls).await.expect("run starts");
@@ -1057,10 +1042,9 @@ async fn live_plan_exit_gate_against_the_real_cli() {
         mode: _mode,
         interrupt,
         exits,
-    } = plan_rig(PlanDecision {
-        approved: false,
-        feedback: Some("Stop here — this is an automated smoke test.".into()),
-    });
+    } = plan_rig(PlanDecision::keep_planning(Some(
+        "Stop here — this is an automated smoke test.".into(),
+    )));
     let mut stream = harness.run(req, controls).await.expect("run starts");
 
     let (events, plans) = tokio::time::timeout(Duration::from_secs(300), async {

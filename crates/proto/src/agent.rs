@@ -334,15 +334,55 @@ pub struct UserInputAnswer {
 }
 
 /// The user's answer to a harness's plan-exit request (ARCHITECTURE.md
-/// §11.1): approve, or keep planning with optional feedback. How the
+/// §11.1): approve, keep planning with optional feedback, or reject. How the
 /// feedback reaches the agent is the adapter's business (Claude's deny
 /// message; a follow-up prompt where the wire has no message channel).
+///
+/// A REJECT is a denial that also ends the turn, so an adapter that only
+/// knows `approved` still puts the right thing on the wire — the engine owns
+/// the stop. Build one of the three with [`Self::approve`],
+/// [`Self::keep_planning`] or [`Self::reject`]; the fields are public to
+/// match on, never to combine (`approved` and `rejected` are exclusive).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanDecision {
     pub approved: bool,
+    /// The plan was rejected outright: deny the gate AND end the turn.
+    /// Additive and defaulted, so an older peer's answer decodes as the
+    /// keep-planning it meant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rejected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
+}
+
+impl PlanDecision {
+    /// Leave plan mode and build the plan.
+    pub fn approve() -> Self {
+        Self {
+            approved: true,
+            rejected: false,
+            feedback: None,
+        }
+    }
+
+    /// Stay in plan mode and redraft, optionally on the user's own words.
+    pub fn keep_planning(feedback: Option<String>) -> Self {
+        Self {
+            approved: false,
+            rejected: false,
+            feedback,
+        }
+    }
+
+    /// Deny the gate and end the turn (§11.4).
+    pub fn reject() -> Self {
+        Self {
+            approved: false,
+            rejected: true,
+            feedback: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,6 +519,11 @@ pub enum AgentEvent {
     PlanExitResolved {
         request_id: String,
         approved: bool,
+        /// The answer was a REJECT, not a keep-planning: the card settles
+        /// `rejected` and the turn is ending. Additive and defaulted — an
+        /// older journal line replays as the keep-planning it recorded.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        rejected: bool,
     },
     /// An event belonging to a SUBAGENT's nested transcript, attributed to
     /// the spawning tool call (`parent_tool_use_id` = the parent-feed
@@ -641,6 +686,12 @@ mod tests {
             AgentEvent::PlanExitResolved {
                 request_id: "r1".into(),
                 approved: false,
+                rejected: false,
+            },
+            AgentEvent::PlanExitResolved {
+                request_id: "r1".into(),
+                approved: false,
+                rejected: true,
             },
         ] {
             let json = serde_json::to_string(&ev).unwrap();
@@ -652,20 +703,33 @@ mod tests {
         .unwrap();
         assert_eq!(json["type"], "planExitRequested");
         assert_eq!(json["requestId"], "r1");
-        let decision = PlanDecision {
-            approved: false,
-            feedback: Some("tighter".into()),
-        };
+        let decision = PlanDecision::keep_planning(Some("tighter".into()));
         let round: PlanDecision =
             serde_json::from_value(serde_json::to_value(&decision).unwrap()).unwrap();
         assert_eq!(round, decision);
-        // A bare approval carries no feedback key.
-        let json = serde_json::to_value(&PlanDecision {
-            approved: true,
-            feedback: None,
-        })
-        .unwrap();
+        // A bare approval carries neither optional key — the two older
+        // answers stay byte-identical on the wire now that `rejected` exists.
+        let json = serde_json::to_value(PlanDecision::approve()).unwrap();
         assert!(json.get("feedback").is_none());
+        assert!(json.get("rejected").is_none());
+        assert!(
+            serde_json::to_value(PlanDecision::keep_planning(None))
+                .unwrap()
+                .get("rejected")
+                .is_none()
+        );
+        // The three answers are exclusive, and a reject round-trips.
+        let reject = PlanDecision::reject();
+        assert!(!reject.approved && reject.rejected);
+        assert_eq!(
+            serde_json::from_value::<PlanDecision>(serde_json::to_value(&reject).unwrap()).unwrap(),
+            reject
+        );
+        // An older peer's answer (no `rejected` key) is the keep-planning it
+        // meant, never a reject.
+        let legacy: PlanDecision =
+            serde_json::from_str(r#"{"approved":false,"feedback":"tighter"}"#).unwrap();
+        assert_eq!(legacy, PlanDecision::keep_planning(Some("tighter".into())));
     }
 
     #[test]

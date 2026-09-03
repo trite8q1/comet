@@ -121,10 +121,9 @@ impl Harness for PlanHarness {
                 text: "# v2".into(),
                 path: None,
             });
-            let decision = request_exit().await.unwrap_or(PlanDecision {
-                approved: false,
-                feedback: None,
-            });
+            let decision = request_exit()
+                .await
+                .unwrap_or(PlanDecision::keep_planning(None));
             decisions.lock().unwrap().push(decision.clone());
             if decision.approved {
                 let _ = tx.send(AgentEvent::PlanModeChanged { active: false });
@@ -302,6 +301,73 @@ fn turn_boundary_harness() -> Arc<PlanHarness> {
     })
 }
 
+/// §11.4 the third answer: REJECT. The gate is answered on the harness's own
+/// wire (never a silent approval, and distinct from keep-planning), the turn
+/// ends, the card settles `rejected`, and plan mode is left — the torn-down
+/// run can never report a mode itself, so Comet writes the toggle.
+///
+/// Also pins the ordering that makes it work: `PlanExitResolved` rides
+/// `engine_tx`, which the run loop's `biased` select drains ahead of the
+/// harness stream, so the reject folds BEFORE the interrupt's `Done` — which
+/// would otherwise stamp the part `revising` on its way out.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejecting_a_plan_ends_the_turn_and_leaves_plan_mode() {
+    let h = turn_boundary_harness();
+    let (_tmp, core) = assemble(h.clone()).await;
+    core.doc_host
+        .queue_command(CHAT, run_payload("m-1", true))
+        .expect("queue run");
+    wait_for(
+        || {
+            matches!(
+                plan_status(&core),
+                Some((PlanStatus::AwaitingApproval, Some(_), _))
+            )
+        },
+        "gate",
+    )
+    .await;
+    assert!(
+        core.workspace.chat_config(CHAT).unwrap().plan_mode,
+        "the run is a planning run"
+    );
+    let (_, request_id, _) = plan_status(&core).unwrap();
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::RespondPlanExit {
+                request_id: request_id.unwrap(),
+                approved: false,
+                rejected: true,
+
+                feedback: None,
+            },
+        )
+        .expect("queue reject");
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "the turn ends",
+    )
+    .await;
+    assert_eq!(
+        h.decisions.lock().unwrap().clone(),
+        vec![PlanDecision::reject()],
+        "the harness is told reject, not keep-planning",
+    );
+    let (status, _, _) = plan_status(&core).expect("the card survives as history");
+    assert_eq!(status, PlanStatus::Rejected);
+    assert!(
+        !core.workspace.chat_config(CHAT).unwrap().plan_mode,
+        "a reject leaves plan mode",
+    );
+    // One turn only: a reject never re-dispatches (that is feedback's job).
+    assert_eq!(h.requests.lock().unwrap().len(), 1);
+}
+
 /// Stop with the gate still parked: the drain answers the harness "keep
 /// planning" (never a silent approval), and the CARD has to settle with it.
 /// Left `AwaitingApproval` the plan part would outlive its run — buttons live
@@ -342,10 +408,7 @@ async fn interrupting_a_parked_gate_settles_the_card() {
     );
     assert_eq!(
         h.decisions.lock().unwrap().clone(),
-        vec![PlanDecision {
-            approved: false,
-            feedback: None
-        }],
+        vec![PlanDecision::keep_planning(None)],
         "the drain must never silently approve",
     );
 }
@@ -426,6 +489,8 @@ async fn turn_boundary_feedback_cancels_the_turn_and_prompts_the_resumed_session
             SessionCommandPayload::RespondPlanExit {
                 request_id: request_id.unwrap(),
                 approved: false,
+                rejected: false,
+
                 feedback: Some("smaller steps".into()),
             },
         )
@@ -475,6 +540,8 @@ async fn turn_boundary_feedback_cancels_the_turn_and_prompts_the_resumed_session
             SessionCommandPayload::RespondPlanExit {
                 request_id: request_id.unwrap(),
                 approved: true,
+                rejected: false,
+
                 feedback: None,
             },
         )
@@ -536,14 +603,7 @@ async fn exit_gate_round_trips_through_the_ledger_and_reconciles_config() {
     assert!(
         !core
             .sessions
-            .respond_plan_exit(
-                CHAT,
-                "nope",
-                PlanDecision {
-                    approved: true,
-                    feedback: None
-                }
-            )
+            .respond_plan_exit(CHAT, "nope", PlanDecision::approve())
             .unwrap()
     );
 
@@ -553,6 +613,8 @@ async fn exit_gate_round_trips_through_the_ledger_and_reconciles_config() {
             SessionCommandPayload::RespondPlanExit {
                 request_id: request_id.clone().unwrap(),
                 approved: true,
+                rejected: false,
+
                 feedback: None,
             },
         )
@@ -573,10 +635,7 @@ async fn exit_gate_round_trips_through_the_ledger_and_reconciles_config() {
     .await;
     assert_eq!(
         h.decisions.lock().unwrap().as_slice(),
-        &[PlanDecision {
-            approved: true,
-            feedback: None
-        }]
+        &[PlanDecision::approve()]
     );
     // The harness reported mode off after approval: the requested mode
     // followed it (ARCHITECTURE.md §11.1).
@@ -596,6 +655,8 @@ async fn exit_gate_round_trips_through_the_ledger_and_reconciles_config() {
             SessionCommandPayload::RespondPlanExit {
                 request_id: request_id.unwrap(),
                 approved: false,
+                rejected: false,
+
                 feedback: None,
             },
         )
@@ -630,6 +691,8 @@ async fn keep_planning_carries_feedback_and_stays_in_plan_mode() {
             SessionCommandPayload::RespondPlanExit {
                 request_id: request_id.unwrap(),
                 approved: false,
+                rejected: false,
+
                 feedback: Some("smaller steps".into()),
             },
         )

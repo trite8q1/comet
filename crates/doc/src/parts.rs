@@ -126,11 +126,15 @@ pub enum PlanStatus {
     /// The harness is still writing the plan.
     Drafting,
     /// The harness asked to leave plan mode with this plan; the card's
-    /// Approve / Keep planning answer the parked `request_id`.
+    /// Approve / Keep planning / Reject answer the parked `request_id`.
     AwaitingApproval,
     Approved,
     /// The user chose to keep planning; the harness continues in plan mode.
     Revising,
+    /// The user rejected the plan: the turn ended with it (§11.4). A peer
+    /// too old to know this string decodes it as `Drafting` — the card reads
+    /// wrong for that one device, never unanswerable.
+    Rejected,
 }
 
 /// The fixed id of a segment's single plan part: every `PlanUpdated` refreshes
@@ -434,7 +438,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     *slot = path.clone();
                 }
                 // A rewrite after a decision is a new draft of the same plan.
-                if matches!(status, PlanStatus::Approved | PlanStatus::Revising) {
+                if matches!(
+                    status,
+                    PlanStatus::Approved | PlanStatus::Revising | PlanStatus::Rejected
+                ) {
                     *status = PlanStatus::Drafting;
                 }
             } else {
@@ -475,6 +482,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         AgentEvent::PlanExitResolved {
             request_id,
             approved,
+            rejected,
         } => {
             for p in out.iter_mut() {
                 if let MessagePart::Plan {
@@ -484,10 +492,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 } = p
                     && rid.as_deref() == Some(request_id.as_str())
                 {
-                    *status = if *approved {
-                        PlanStatus::Approved
-                    } else {
-                        PlanStatus::Revising
+                    *status = match (*approved, *rejected) {
+                        (true, _) => PlanStatus::Approved,
+                        (false, true) => PlanStatus::Rejected,
+                        (false, false) => PlanStatus::Revising,
                     };
                 }
             }
@@ -1165,6 +1173,7 @@ mod tests {
             &AgentEvent::PlanExitResolved {
                 request_id: "other".into(),
                 approved: true,
+                rejected: false,
             },
         );
         assert!(matches!(
@@ -1179,6 +1188,7 @@ mod tests {
             &AgentEvent::PlanExitResolved {
                 request_id: "req-1".into(),
                 approved: false,
+                rejected: false,
             },
         );
         assert!(matches!(
@@ -1201,6 +1211,58 @@ mod tests {
             MessagePart::Plan { status: PlanStatus::Drafting, plan, .. } if plan == "# v3"
         ));
         assert_eq!(parts.len(), 2);
+    }
+
+    /// §11.4: a REJECT settles the card `rejected` — distinct from the
+    /// keep-planning `revising`, because the turn ended with it. A later
+    /// draft in the same segment is still a fresh draft of the same part.
+    #[test]
+    fn fold_plan_reject_settles_the_part_and_redrafts() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanUpdated {
+                text: "# v1".into(),
+                path: None,
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitRequested {
+                request_id: "req-9".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitResolved {
+                request_id: "req-9".into(),
+                approved: false,
+                rejected: true,
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Plan {
+                status: PlanStatus::Rejected,
+                ..
+            }
+        ));
+        // An approval still wins over the reject flag (exclusive states).
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitResolved {
+                request_id: "req-9".into(),
+                approved: true,
+                rejected: true,
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Plan {
+                status: PlanStatus::Approved,
+                ..
+            }
+        ));
     }
 
     /// A gate that arrives before any plan text still yields a card to

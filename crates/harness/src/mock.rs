@@ -209,15 +209,19 @@ impl Harness for MockHarness {
                     });
                 }
                 tokio::time::sleep(pause).await;
-                let decision = request_exit().await.unwrap_or(comet_proto::PlanDecision {
-                    approved: false,
-                    feedback: None,
-                });
+                let decision = request_exit()
+                    .await
+                    .unwrap_or(comet_proto::PlanDecision::keep_planning(None));
                 tokio::time::sleep(pause).await;
                 if decision.approved {
                     let _ = tx.send(AgentEvent::PlanModeChanged { active: false });
                     let _ = tx.send(AgentEvent::TextDelta {
                         text: "Plan approved — porting the veil now.".into(),
+                    });
+                } else if decision.rejected {
+                    // The engine ends the turn; the demo just says so.
+                    let _ = tx.send(AgentEvent::TextDelta {
+                        text: "Plan rejected — stopping here.".into(),
                     });
                 } else {
                     let _ = tx.send(AgentEvent::TextDelta {

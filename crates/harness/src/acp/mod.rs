@@ -2023,13 +2023,20 @@ fn spawn_ask_user_question(
 /// bridge's discipline); the gate counts as an open question so the quiet
 /// settle can't read the blocked turn as finished.
 ///
-/// `options` present = the gate arrived as a `session/request_permission`
-/// (answer with the allow/reject option). Absent = the agent's own extension
-/// request, answered with grok's `ExitPlanModeExtResponse`: `{approved,
-/// abandoned}` — verified live against 1.0.13, where `approved:false` yields
-/// the tool result "The user wants to revise the plan…" and leaves plan mode
-/// active. `abandoned` is always false: comet's decision is approve or keep
-/// planning; abandoning the plan is the toggle's job.
+/// `options` present = the gate arrived as a `session/request_permission`.
+/// Approve takes the allow option, keep-planning the reject option, and a
+/// REJECT takes `outcome: "cancelled"` — the spec's own "the user called this
+/// off", which the agent answers with `stopReason: "cancelled"` (mapped to
+/// `DoneStatus::Interrupted`). The engine ends the turn either way; taking
+/// the cancel outcome just lets the agent wind down on its own wire first.
+///
+/// Absent = the agent's own extension request, answered with grok's
+/// `ExitPlanModeExtResponse`: `{approved, abandoned}` — verified live against
+/// 1.0.13, where `approved:false` yields the tool result "The user wants to
+/// revise the plan…" and leaves plan mode active. `abandoned` stays false
+/// even for a reject: the field name is inferred from the binary's TUI
+/// branches and NOT live-verified (tests/fixtures/grok-plan-mode.json), so
+/// the engine's interrupt is the one mechanism that ends the turn here.
 ///
 /// `PlanDecision::feedback` is IGNORED here on purpose: the engine delivers
 /// it as the user's next message through the ordinary steer path, on every
@@ -2048,16 +2055,15 @@ fn spawn_plan_exit(
     tokio::spawn(async move {
         // A dropped resolver (the engine went away) reads as "keep
         // planning" — the PlanControls contract.
-        let decision = (request_exit)().await.unwrap_or(comet_proto::PlanDecision {
-            approved: false,
-            feedback: None,
-        });
+        let decision = (request_exit)()
+            .await
+            .unwrap_or(comet_proto::PlanDecision::keep_planning(None));
         match options {
             Some(options) => {
-                let picked = if decision.approved {
-                    preferred_allow_option(&options)
-                } else {
-                    preferred_reject_option(&options)
+                let picked = match (decision.approved, decision.rejected) {
+                    (_, true) => None,
+                    (true, _) => preferred_allow_option(&options),
+                    (false, _) => preferred_reject_option(&options),
                 };
                 match picked {
                     Some(option_id) => client.respond(

@@ -1061,10 +1061,7 @@ fn plan_controls(
 /// The decision an unanswered gate degrades to, and the default this file's
 /// mode-only tests use.
 fn keep_planning() -> PlanDecision {
-    PlanDecision {
-        approved: false,
-        feedback: None,
-    }
+    PlanDecision::keep_planning(None)
 }
 
 fn plan_request(prompt: &str, cwd: &str, plan_mode: bool) -> RunRequest {
@@ -1225,10 +1222,7 @@ async fn toggling_plan_mode_mid_run_sets_the_agents_non_plan_mode() {
 async fn plan_exit_gate_rejects_without_sending_the_feedback_itself() {
     let (controls, steer, _mode, calls) = plan_controls(
         true,
-        PlanDecision {
-            approved: false,
-            feedback: Some("Add a rollback step.".into()),
-        },
+        PlanDecision::keep_planning(Some("Add a rollback step.".into())),
     );
     // No steer sender: the loop may end the run the moment the turn settles,
     // UNLESS something queued a follow-up — which is exactly the regression
@@ -1270,13 +1264,7 @@ async fn plan_exit_gate_rejects_without_sending_the_feedback_itself() {
 /// `current_mode_update` then flips the reported mode off.
 #[tokio::test]
 async fn approving_the_plan_exit_gate_leaves_plan_mode() {
-    let (controls, _steer, _mode, calls) = plan_controls(
-        true,
-        PlanDecision {
-            approved: true,
-            feedback: None,
-        },
-    );
+    let (controls, _steer, _mode, calls) = plan_controls(true, PlanDecision::approve());
     let events = run_to_end(
         &harness(),
         plan_request("scenario:plan-approve", "/tmp", true),
@@ -1295,13 +1283,7 @@ async fn approving_the_plan_exit_gate_leaves_plan_mode() {
 /// own `rawOutput` (`ExitPlanModeOutput::PlanReady`).
 #[tokio::test]
 async fn plan_exit_permission_is_the_only_one_that_stops_auto_approving() {
-    let (controls, _steer, _mode, calls) = plan_controls(
-        false,
-        PlanDecision {
-            approved: false,
-            feedback: None,
-        },
-    );
+    let (controls, _steer, _mode, calls) = plan_controls(false, PlanDecision::keep_planning(None));
     let events = run_to_end(
         &harness(),
         plan_request("scenario:plan-permission", "/tmp", false),
@@ -1320,19 +1302,41 @@ async fn plan_exit_permission_is_the_only_one_that_stops_auto_approving() {
     );
 }
 
+/// §11.4 the third answer on a generic ACP wire: a REJECT is not the reject
+/// OPTION (that one means "keep planning") — it is the spec's own
+/// `outcome: "cancelled"`, which the agent winds down with
+/// `stopReason: "cancelled"` ⇒ `DoneStatus::Interrupted`. The adapter still
+/// sends no follow-up prompt of its own; ending the turn is the engine's job.
+#[tokio::test]
+async fn rejecting_the_plan_takes_the_acp_cancel_outcome() {
+    let (controls, _steer, _mode, calls) = plan_controls(false, PlanDecision::reject());
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-reject", "/tmp", false),
+        controls,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{events:?}");
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert_eq!(texts(&events), "", "a rejected plan builds nothing");
+}
+
 /// The gate is the TOOL NAME, not the reported mode bit: an agent that never
 /// sends `current_mode_update` (or sends it after the request) must still stop
 /// the auto-approve, or §11.2's one non-auto-approving permission silently
 /// approves the exit and the agent starts executing the plan.
 #[tokio::test]
 async fn an_unreported_plan_mode_still_stops_the_exit_auto_approve() {
-    let (controls, _steer, _mode, calls) = plan_controls(
-        false,
-        PlanDecision {
-            approved: false,
-            feedback: None,
-        },
-    );
+    let (controls, _steer, _mode, calls) = plan_controls(false, PlanDecision::keep_planning(None));
     let events = run_to_end(
         &harness(),
         plan_request("scenario:plan-gate-unreported", "/tmp", false),
@@ -1567,13 +1571,7 @@ async fn live_plan_grok_exit_gate() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("README.md"), "# Probe\n\nHello.\n").unwrap();
 
-    let (controls, _steer, _mode, calls) = plan_controls(
-        true,
-        PlanDecision {
-            approved: false,
-            feedback: None,
-        },
-    );
+    let (controls, _steer, _mode, calls) = plan_controls(true, PlanDecision::keep_planning(None));
     let request = plan_request(
         "Plan mode is already active. Write a two-line plan to rename \
          README.md to README2.md, then call exit_plan_mode.",

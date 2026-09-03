@@ -8,6 +8,21 @@
 
 import SwiftUI
 
+/// The three answers the card can give a parked gate (§11.4), mirroring
+/// `PlanDecision`'s three constructors: approve, keep planning, reject.
+enum PlanAnswer {
+    case approve
+    case keepPlanning
+    case reject
+}
+
+/// Whether the card opens by default (`transcript.rs plan_opens_by_default`):
+/// a plan still being written, or waiting on the user, is the point of the
+/// turn; an approved one is history — and so is a rejected one.
+func planOpensByDefault(_ status: PlanStatus) -> Bool {
+    status != .approved && status != .rejected
+}
+
 struct PlanCardView: View {
     /// The plan markdown, parsed like assistant prose (fenced code included).
     let blocks: [TopBlock]
@@ -16,14 +31,17 @@ struct PlanCardView: View {
     let status: PlanStatus
     /// The parked gate, present only while `awaitingApproval`.
     let requestId: String?
+    /// The harness's plan file, where its CLI keeps one — nil on the three
+    /// harnesses that never write the plan to disk (§11.2).
+    let path: String?
     /// `ChatConfig.harness` — the mark in the header tile.
     let harness: String?
     /// Row id; seeds the markdown highlight cache.
     let cacheKey: String
     let open: Bool
     let toggle: () -> Void
-    /// Approve (true) / Keep planning (false) — resolves `requestId`.
-    let respond: (Bool) -> Void
+    /// Approve / Keep planning / Reject — resolves `requestId`.
+    let respond: (PlanAnswer) -> Void
     /// The store's answered-gate latch: the buttons go quiet the moment this
     /// gate is answered from this device — by these buttons OR by a composer
     /// send — and stay quiet until the doc flips the status.
@@ -32,6 +50,9 @@ struct PlanCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            if let path, !path.isEmpty {
+                pathRow(path)
+            }
             if open {
                 VStack(alignment: .leading, spacing: MD.blockGap) {
                     ForEach(Array(blocks.enumerated()), id: \.offset) { ix, top in
@@ -97,27 +118,48 @@ struct PlanCardView: View {
         case .drafting, .revising: return Theme.textMuted
         case .awaitingApproval: return Theme.accent
         case .approved: return Theme.statusCompleted
+        case .rejected: return Theme.danger
         }
     }
 
+    /// The pill padding all three answers share. A constant because the third
+    /// button has to earn its place on one row: at 375pt the three labels plus
+    /// this padding come to 278 of the 323pt the card's body has, and
+    /// `PlanModeTests` pins that arithmetic so a longer label cannot wrap the
+    /// row onto two lines unnoticed.
+    static let answerHPadding: CGFloat = 14
+
+    /// Approve is the primary (accent plate), Keep planning the quiet
+    /// neutral, Reject the quietest of the three: danger-tinted TEXT on the
+    /// faintest wash, never a red plate. Ending the turn is a real answer,
+    /// not the one the card pushes you toward.
     private var actions: some View {
         HStack(spacing: 8) {
-            Button { answer(true) } label: {
+            Button { answer(.approve) } label: {
                 Text("Approve")
                     .font(Theme.sans(13, weight: .medium))
                     .foregroundStyle(Theme.bg)
-                    .padding(.horizontal, 14)
+                    .padding(.horizontal, Self.answerHPadding)
                     .frame(height: 30)
                     .background(Theme.accent, in: Capsule())
             }
             .buttonStyle(ChipPressButtonStyle())
-            Button { answer(false) } label: {
+            Button { answer(.keepPlanning) } label: {
                 Text("Keep planning")
                     .font(Theme.sans(13, weight: .medium))
                     .foregroundStyle(Theme.textMuted)
-                    .padding(.horizontal, 14)
+                    .padding(.horizontal, Self.answerHPadding)
                     .frame(height: 30)
                     .background(whiteAlpha(0.06), in: Capsule())
+            }
+            .buttonStyle(ChipPressButtonStyle())
+            Button { answer(.reject) } label: {
+                Text("Reject")
+                    .font(Theme.sans(13, weight: .medium))
+                    .foregroundStyle(Theme.danger.opacity(0.9))
+                    .padding(.horizontal, Self.answerHPadding)
+                    .frame(height: 30)
+                    .background(whiteAlpha(0.03), in: Capsule())
             }
             .buttonStyle(ChipPressButtonStyle())
             Spacer(minLength: 0)
@@ -126,8 +168,35 @@ struct PlanCardView: View {
         .disabled(answered)
     }
 
-    private func answer(_ approved: Bool) {
+    /// The plan file, on its own row between the header and the fold so it
+    /// reads whether the card is open or closed — the desktop's `path_line`,
+    /// at the header's 8pt gutter because the line belongs to the header
+    /// block, not to the plan text. Mono 11, one notch under the header's 12pt
+    /// title: the path is what the card is ABOUT, never a second heading. No
+    /// file icon (§11.6: the card's one tile is the harness brand).
+    private func pathRow(_ path: String) -> some View {
+        let (directory, name) = splitDisplayPath(planPathDisplay(path))
+        return HStack(spacing: 0) {
+            // The directory yields first and truncates from its HEAD; the
+            // basename is the only useful part of a 239-char plan path, so it
+            // keeps its ideal width no matter how narrow the card gets.
+            Text(directory)
+                .lineLimit(1)
+                .truncationMode(.head)
+                .layoutPriority(0)
+            Text(name)
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
+            Spacer(minLength: 0)
+        }
+        .font(Theme.mono(11))
+        .foregroundStyle(Theme.textMuted)
+        .padding(.horizontal, 8)
+        .padding(.bottom, 6)
+    }
+
+    private func answer(_ answer: PlanAnswer) {
         guard !answered else { return }
-        respond(approved)
+        respond(answer)
     }
 }

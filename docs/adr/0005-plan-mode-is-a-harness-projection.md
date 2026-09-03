@@ -1,6 +1,8 @@
 # ADR 0005: Plan mode is a projection of the harness's own plan mode
 
-- Status: Accepted
+- Status: Accepted (amended 2026-09-03: the gate gained a third answer,
+  Reject, which comet completes with its own interrupt where the CLI's wire
+  has no abort — see the Decision bullet)
 - Date: 2026-09-02
 
 ## Context
@@ -23,6 +25,15 @@ the CLI, from the desktop and the phone, with the plan visible while it changes.
   user question (`request_plan_exit` mirrors `request_input`; `RespondPlanExit`
   mirrors `RespondInput`). Where the CLI has no agent-initiated gate the user
   leaves plan mode with the toggle, as in that CLI.
+- The gate has THREE answers: approve, keep planning, reject. The first two are
+  the CLI's own; the third is a denial the ENGINE completes with an interrupt
+  and a plan-mode write. This is the one place comet adds behavior the wire may
+  not offer, and it is deliberate: rejecting is otherwise two gestures (deny,
+  then Stop), and denying without stopping leaves a turn running on a plan the
+  user just refused. It stays a projection rather than an invention because no
+  adapter synthesizes anything — a reject is the SAME denial on the wire, and
+  the stop is the interrupt comet already owns. Where a wire does carry a
+  native abort (generic ACP's `outcome: "cancelled"`) the adapter takes it.
 - A harness whose wire has no plan-mode entry point (Codex app-server 0.151–0.152)
   reports `plan_mode() == false` and carries a tripwire test that fails the moment
   the wire grows one.
