@@ -3582,7 +3582,13 @@ impl Composer {
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let pickers_observe = cx.observe(&pickers, |this: &mut Self, _, cx| {
+            // An agent-chip change moves the slash key's harness with no input
+            // edit and no state observer; revalidate an open `/` list before
+            // the repaint, the twin of the folder fix (§10.6).
+            this.revalidate_slash_on_key_change(cx);
+            cx.notify();
+        });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -4291,6 +4297,26 @@ impl Composer {
         })
     }
 
+    /// A `/` popup open while its catalog key moved with no input edit to
+    /// drive discovery revalidates here: a project/device pick reaches this
+    /// through the state observer, an agent-chip pick through the pickers
+    /// observer, and both funnel through here so the new key's list replaces
+    /// the previous one at once instead of lingering until the next keystroke
+    /// (§10.6). The guard keeps it inert unless a `/` is open and the key
+    /// truly changed.
+    fn revalidate_slash_on_key_change(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_none()
+            && self.slash.token.is_some()
+            && self.slash_key(cx) != self.slash.key
+        {
+            let (text, cursor) = {
+                let input = self.input.read(cx);
+                (input.text().to_string(), input.cursor_offset())
+            };
+            self.update_slash(&text, cursor, cx);
+        }
+    }
+
     /// Track the `/` token on every edit: open/refresh the popup, revalidate
     /// the key's command list once per open, filter locally per keystroke.
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
@@ -4802,21 +4828,11 @@ impl Composer {
                 }
             }
         }
-        // Picking a different project/device on the new-chat canvas moves the
-        // slash key with no input edit to drive `update_slash` (§10.6): with a
-        // `/` popup already open, re-run discovery so the new folder's list
-        // replaces the previous one at once, never lingering until the next
-        // keystroke.
-        if self.wizard.is_none()
-            && self.slash.token.is_some()
-            && self.slash_key(cx) != self.slash.key
-        {
-            let (text, cursor) = {
-                let input = self.input.read(cx);
-                (input.text().to_string(), input.cursor_offset())
-            };
-            self.update_slash(&text, cursor, cx);
-        }
+        // A project/device pick on the new-chat canvas moves the slash key
+        // with no input edit to drive `update_slash`; revalidate an open `/`
+        // list so the new folder's rows replace the previous ones at once
+        // (§10.6). The agent-chip twin rides the pickers observer.
+        self.revalidate_slash_on_key_change(cx);
         cx.notify();
     }
 
