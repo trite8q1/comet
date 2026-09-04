@@ -21,7 +21,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use comet_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionDoc, SessionMessageEntry,
+    MessagePart, MessageRole, MessageStatus, PlanStatus, SessionCommandPayload, SessionDoc,
+    SessionMessageEntry,
 };
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::{Harness, HarnessError, RunControls};
@@ -423,6 +424,110 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
         requests.lock().unwrap()[0].resume.as_deref(),
         Some("hs-crash"),
         "journal-recovered session id must ride the next dispatch"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn kill_crash_settles_an_open_plan_gate() {
+    // The live fold turns an `awaitingApproval` plan into `revising` when a run
+    // ends with the gate open (a Done{interrupted}). A kill -9 leaves no fold
+    // to run that, so boot recovery must settle the plan part itself, or the
+    // card stays actionable on a dead request id and the next send is swallowed
+    // as feedback on a plan nobody is waiting for.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+
+    // Manufacture the on-disk state a kill -9 mid-plan-gate leaves behind: a
+    // still-`streaming` assistant entry whose plan part is parked
+    // `awaitingApproval`, and a journal whose last event is the plan-exit
+    // request (not `Done`). `created_at` is ancient so recovery does NOT also
+    // auto-resume, so the assertion stays on the settle, with no follow-up turn.
+    {
+        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-user-1".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "plan it".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-assistant-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Plan {
+                id: "plan".into(),
+                plan: "# The plan".into(),
+                status: PlanStatus::AwaitingApproval,
+                request_id: Some("req-crash".into()),
+                path: None,
+            }],
+            created_at: 2,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+
+        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-crash".into(),
+                    assistant_message_id: "msg-assistant-1".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::PlanExitRequested {
+                    request_id: "req-crash".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-after-crash".into(),
+            fail_starts: Default::default(),
+        },
+    );
+
+    // Boot recovery stamped the entry `aborted` AND settled the plan gate to
+    // `revising`, so the card is no longer awaiting approval.
+    let entries = entries_now(&core);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1].status, Some(MessageStatus::Aborted));
+    let plan_status = entries[1].parts.iter().find_map(|p| match p {
+        MessagePart::Plan { status, .. } => Some(*status),
+        _ => None,
+    });
+    assert_eq!(
+        plan_status,
+        Some(PlanStatus::Revising),
+        "an open plan gate must not survive crash recovery as awaitingApproval",
     );
     core.shutdown().await;
 }

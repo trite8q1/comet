@@ -575,6 +575,61 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// Settle a parked plan gate on the entry `message_id`: a `Plan` part still
+    /// `awaitingApproval` is moved to `revising`, the same place the live fold
+    /// sends it when a run ends with the gate open (a `Done{interrupted}` in
+    /// sessions.rs, never an approval). A crashed run has no fold to run that
+    /// settle, so recovery calls this directly; left `awaitingApproval` the
+    /// card stays actionable on a dead request id and the next composer send is
+    /// swallowed as feedback on a plan nobody is waiting for. The request id is
+    /// left as-is, matching the live fold. Idempotent (a gate already settled
+    /// is a no-op) since recovery may re-run on a crash loop. Returns `false`
+    /// when the entry has no plan part awaiting approval.
+    pub fn settle_plan_gate(&self, message_id: &str) -> Result<bool, DocError> {
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                entry.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == message_id
+            );
+            if !id_matches {
+                continue;
+            }
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                return Ok(false);
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let is_plan = matches!(
+                    part.get("kind"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "plan"
+                );
+                let awaiting = matches!(
+                    part.get("planStatus"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "awaitingApproval"
+                );
+                if is_plan && awaiting {
+                    part.insert("planStatus", "revising")?;
+                    self.doc.commit();
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        Ok(false)
+    }
+
     /// Update a subagent SPAWN CHIP (a tool part) in place, wherever it
     /// lives: `resolved`-style stamping for the eager-done world, where the
     /// chip's entry is usually already finished by the time the background
@@ -1339,6 +1394,48 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A plan gate a crashed run left `awaitingApproval` settles to `revising`
+    /// (the live fold's target), keyed on the crashed entry, with the request
+    /// id left intact. The write is idempotent (recovery may re-run on a crash
+    /// loop), and an entry with no open gate is a no-op.
+    #[test]
+    fn settle_plan_gate_settles_awaiting_approval_and_is_idempotent() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "assistant-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Plan {
+                id: "plan".into(),
+                plan: "# Do it".into(),
+                status: PlanStatus::AwaitingApproval,
+                request_id: Some("req-1".into()),
+                path: None,
+            }],
+            created_at: 2,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+
+        assert!(doc.settle_plan_gate("assistant-1").unwrap());
+        match &doc.read_entries().unwrap()[0].parts[0] {
+            MessagePart::Plan {
+                status,
+                request_id,
+                ..
+            } => {
+                assert_eq!(*status, PlanStatus::Revising);
+                assert_eq!(request_id.as_deref(), Some("req-1"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Already settled, and an unknown entry: both no-op.
+        assert!(!doc.settle_plan_gate("assistant-1").unwrap());
+        assert!(!doc.settle_plan_gate("nope").unwrap());
     }
 
     #[test]
