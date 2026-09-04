@@ -594,12 +594,14 @@ final class WorkspaceStore {
     /// custom commands, built-ins; ARCHITECTURE.md §10.2). The harness is an
     /// input, never derived here, and the reply is that harness's catalog only.
     /// `cwd` scopes discovery to the directory the run would execute in (§10.4).
-    /// The failure text feeds the composer's error row.
+    /// The failure text feeds the composer's error row. The 15s deadline
+    /// outlasts the engine's own 10s discovery cap plus the CLI spawn.
     func listCommands(deviceId: String, harness: String, cwd: String?) async -> SlashCatalog {
         do {
             let commands: [SlashCommand] = try await relay(for: deviceId)
                 .call(method: "ListCommands",
-                      params: slashListCommandsParams(harness: harness, cwd: cwd))
+                      params: slashListCommandsParams(harness: harness, cwd: cwd),
+                      timeoutSeconds: 15)
             return .commands(commands)
         } catch {
             lastRelayError = error.localizedDescription

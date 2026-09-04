@@ -298,15 +298,19 @@ struct SlashCommandsModel {
     var popup: SlashPopup {
         guard let token else { return .hidden }
         // The composer's own rows merge in before anything else reads them, so
-        // prefix filtering, ranking and accept treat `/plan` like any row —
-        // and a key carrying one is never "no rows at all", so a loading or
-        // failed probe shows it instead of a spinner or an error line.
+        // prefix filtering, ranking and accept treat `/plan` like any row. The
+        // desktop's two gates read different things and so do these: the
+        // skeleton yields to ANY row including `/plan`
+        // (`self.slash.loading && commands.is_empty()`), while a failure is
+        // latched on the key having no CACHED CATALOG
+        // (`slash_failure_error`'s `slash_cache.contains_key`), so its message
+        // always shows — `/plan` alone is never an answer to a failed probe.
         let commands = slashRowsWithBuiltins(catalog: key.flatMap { catalogs[$0] } ?? [],
                                              planOffered: planOffered)
         if let key, inFlight.contains(key), commands.isEmpty { return .loading }
         // A failed revalidation never blanks a list that was fine a moment ago
-        // (§10.4): the error shows only when the key has no rows at all.
-        if let key, let message = errors[key], commands.isEmpty { return .failed(message) }
+        // (§10.4): the error shows only when the key has no catalog at all.
+        if let key, let message = errors[key], catalogs[key] == nil { return .failed(message) }
         let filtered = slashFilterIndices(query: token.query, commands: commands)
         if filtered.isEmpty { return commands.isEmpty ? .noCommands : .noMatches }
         return .commands(filtered.map { commands[$0] })

@@ -124,7 +124,9 @@ so the mention work does not erode them:
 - Filter: `match_rank` (0 prefix, 1 substring, case-insensitive, empty query matches all
   at rank 1) over name and aliases, best rank wins, catalog order breaks ties.
 - States in order: hidden → loading (only when the key has no rows) → failed (only when
-  the key has no rows) → no commands → no matches → rows.
+  the key has no cached catalog) → no commands → no matches → rows.
+- A composer-owned row (`/plan`, §11.9) counts as a row for the loading state only, so it
+  replaces the skeleton while the probe is out but never stands in for the error message.
 - Accept inserts `/name` + separator (§2.2). The prompt is sent as plain text through the
   durable command queue; the harness owns translation.
 
