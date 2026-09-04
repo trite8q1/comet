@@ -421,12 +421,12 @@ struct TranscriptView: View {
             case .inputChip(let header, let resolved):
                 InputChipView(header: header, resolved: resolved)
 
-            case .planCard(let blocks, let title, let status, let requestId, let path):
+            case .planCard(let blocks, let title, let status, let requestId, _):
                 // Open while the plan is still in play, folded once it is
                 // history — approved OR rejected.
                 let autoOpen = planOpensByDefault(status)
                 PlanCardView(blocks: blocks, title: title, status: status,
-                             requestId: requestId, path: path, harness: harness,
+                             requestId: requestId, harness: harness,
                              cacheKey: row.id,
                              open: folds[row.id] ?? autoOpen,
                              toggle: {

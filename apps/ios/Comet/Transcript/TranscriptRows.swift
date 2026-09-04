@@ -363,43 +363,6 @@ func stripGenusPrefix(_ text: String, genus: [String]) -> String {
     return trimmed
 }
 
-// MARK: - Path display (the phone half of crates/ui/src/file_path.rs)
-
-/// `$HOME/x` → `~/x`, and a path already written with `~` is left alone (the
-/// mock harness emits one, so this has to be idempotent).
-///
-/// Purely LEXICAL, exactly like the desktop's `home_relative`: no
-/// percent-decoding (an encoded segment is the harness's own bookkeeping and
-/// mangling it would misname the file), and no relativizing against the chat's
-/// cwd — most plan files live OUTSIDE the project, where that only buys a
-/// `../../../` prefix.
-///
-/// `home` is injected so the rule is testable. The default is this device's,
-/// which on a phone is its sandbox container: a path minted on the host Mac
-/// simply stays absolute there, which is the honest reading of someone else's
-/// filesystem.
-func planPathDisplay(_ path: String, home: String = NSHomeDirectory()) -> String {
-    if path == "~" || path.hasPrefix("~/") { return path }
-    var home = home
-    while home.hasSuffix("/") { home.removeLast() }
-    guard !home.isEmpty, path.hasPrefix(home) else { return path }
-    let rest = path.dropFirst(home.count)
-    if rest.isEmpty { return "~" }
-    // A sibling that merely shares the prefix (`/Users/nicolas` against
-    // `HOME=/Users/nico`) is not under it.
-    guard rest.hasPrefix("/") else { return path }
-    return "~" + rest
-}
-
-/// Split a display path into `(directory-with-trailing-slash, basename)` so a
-/// view can truncate the directory and pin the name. A bare filename has no
-/// directory half; a trailing slash makes the whole thing the directory, so a
-/// folder still renders as itself.
-func splitDisplayPath(_ path: String) -> (directory: String, name: String) {
-    guard let slash = path.lastIndex(of: "/") else { return ("", path) }
-    return (String(path[...slash]), String(path[path.index(after: slash)...]))
-}
-
 // MARK: - Tool chip content (transcript.rs tool_chip_content_raw)
 
 extension RenderToolCall {
