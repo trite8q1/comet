@@ -245,6 +245,34 @@ final class FileMentionsTests: XCTestCase {
         XCTAssertEqual(model.popup, .noFiles)
     }
 
+    /// The search root moving under a live token re-issues the same query so
+    /// the rows track the picked worktree — slash's key-revalidate twin (§4.1).
+    /// The new-session checkout / space `onChange`s ride on this.
+    func testAScopeChangeReissuesUnderALiveToken() throws {
+        let here = MentionSearchScope(deviceId: "d", scope: .space(spaceId: "s", path: "/here"))
+        let there = MentionSearchScope(deviceId: "d", scope: .space(spaceId: "s", path: "/there"))
+        var model = FileMentionsModel()
+        let open = try XCTUnwrap(model.update(text: "@src", cursor: 4, scope: here))
+        model.received([hit("here/src.rs")], generation: open.generation)
+
+        // Same token text, moved checkout: a fresh request goes out (same
+        // query, newer generation), and the prior rows stay up until it lands.
+        let moved = try XCTUnwrap(model.update(text: "@src", cursor: 4, scope: there))
+        XCTAssertEqual(moved.query, "src")
+        XCTAssertNotEqual(moved.generation, open.generation)
+        XCTAssertEqual(model.popup, .matches([hit("here/src.rs")]))
+        model.received([hit("there/src.rs")], generation: moved.generation)
+        XCTAssertEqual(model.popup, .matches([hit("there/src.rs")]))
+
+        // Same token AND same scope: still a no-op, so keystroke-free redraws
+        // do not re-probe.
+        XCTAssertNil(model.update(text: "@src", cursor: 4, scope: there))
+
+        // The scope falling away under a live token still re-issues, so the
+        // surface can drop to the no-files path.
+        XCTAssertNotNil(model.update(text: "@src", cursor: 4, scope: nil))
+    }
+
     func testDismissHidesUntilTheTokenChanges() throws {
         var model = FileMentionsModel()
         let open = try XCTUnwrap(model.update(text: "Fix @src", cursor: 8))

@@ -301,6 +301,15 @@ struct MentionSearchRequest: Equatable {
     let query: String
 }
 
+/// The device + checkout a search runs against. When it moves under a live `@`
+/// token (the new-session composer switching worktree / checkout / space) the
+/// popup must re-issue against the new root — slash's `SlashCatalogKey` twin
+/// (§4.1: the search root follows the checkout plan).
+struct MentionSearchScope: Equatable {
+    let deviceId: String
+    let scope: FileSearchScope
+}
+
 /// The composer's mention state: the live token, the last result set, and the
 /// request generation that decides which replies still count (`FileMentionState`
 /// + `mention_response_is_current`).
@@ -315,17 +324,26 @@ struct FileMentionsModel {
     private(set) var generation: UInt64 = 0
     /// Token text hidden by an explicit dismiss — until the token changes.
     private var dismissed: String?
+    /// The search root the live token was last issued against; a move under an
+    /// open token re-issues, the way slash re-probes on a key change (§4.1).
+    private var scope: MentionSearchScope?
 
-    /// Track the token on every edit / caret move. Returns the search to send
-    /// after the debounce, or nil when nothing must be (re)issued.
-    mutating func update(text: String, cursor: Int) -> MentionSearchRequest? {
+    /// Track the token on every edit / caret move / checkout switch. Returns the
+    /// search to send after the debounce, or nil when nothing must be (re)issued.
+    mutating func update(text: String, cursor: Int,
+                         scope: MentionSearchScope? = nil) -> MentionSearchRequest? {
         let token = mentionToken(text, cursor: cursor)
+        // The search root can move while the popup is open (the new-session
+        // checkout / space switching): re-issue the same query then, so the
+        // rows track the picked worktree. A dismissed or absent token never does.
+        let scopeMoved = token != nil && scope != self.scope
+        self.scope = scope
         if let token, let dismissed, mentionTokenText(text, token) == dismissed {
             self.token = nil
             return nil
         }
         dismissed = nil
-        if token == self.token { return nil }
+        if token == self.token, !scopeMoved { return nil }
         // Every token change bumps the generation, so a reply already queued
         // for the previous one is dropped on arrival.
         generation &+= 1

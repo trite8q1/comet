@@ -556,7 +556,9 @@ func acceptSlash(_ slash: Binding<SlashCommandsModel>, _ command: SlashCommand,
 func syncMentionSearch(_ mentions: Binding<FileMentionsModel>, task: Binding<Task<Void, Never>?>,
                        text: String, cursor: Int,
                        search: (deviceId: String, scope: FileSearchScope)?, model: AppModel) {
-    guard let request = mentions.wrappedValue.update(text: text, cursor: cursor) else { return }
+    let scope = search.map { MentionSearchScope(deviceId: $0.deviceId, scope: $0.scope) }
+    guard let request = mentions.wrappedValue.update(text: text, cursor: cursor, scope: scope)
+    else { return }
     task.wrappedValue?.cancel()
     guard let search else {
         mentions.wrappedValue.searchUnavailable()
