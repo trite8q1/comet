@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use comet_harness::{CancellationToken, CursorHarness, Harness, RunControls, SteerMessage};
 use comet_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall};
@@ -37,6 +37,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -54,6 +55,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        plan: comet_harness::PlanControls::off(),
     };
     (controls, steer_tx, token)
 }
@@ -215,6 +217,144 @@ async fn steer_after_done_becomes_the_next_turn() {
             .count(),
         2
     );
+}
+
+/// The plan the fake shim's `createPlan` call carries.
+const CURSOR_PLAN: &str = "# Port the veil\n\n1. Move the fade into the row painter.\n";
+
+/// Controls whose plan-mode watch the test drives, exactly as the engine's
+/// `SetPlanMode` push does mid-run.
+fn plan_controls(active: bool) -> (RunControls, mpsc::Sender<SteerMessage>, watch::Sender<bool>) {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let (mode_tx, mode_rx) = watch::channel(active);
+    let controls = RunControls {
+        request_input: Box::new(move |_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+        plan: comet_harness::PlanControls {
+            mode: mode_rx,
+            request_exit: Box::new(|| oneshot::channel().1),
+        },
+    };
+    (controls, steer_tx, mode_tx)
+}
+
+/// The stdin frames the fake shim logged in the plan scenario.
+fn plan_frames(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(dir.join("plan-mode.jsonl"))
+        .expect("the fake shim logged its stdin")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stdin frame is json"))
+        .collect()
+}
+
+/// Plan mode, Cursor's shape (ARCHITECTURE.md §11.2): the SDK's `mode` rides
+/// the run frame, the adapter echoes it back as the reported mode (the SDK
+/// reports none of its own), and `createPlan` becomes the plan — not a chip.
+#[tokio::test]
+async fn plan_mode_run_stamps_the_mode_and_maps_create_plan() {
+    let dir = tempfile::tempdir().expect("cwd");
+    let harness = harness();
+    assert!(harness.plan_mode(), "the composer toggle is gated on this");
+    let mut req = request("scenario:plan");
+    req.plan_mode = true;
+    req.cwd = dir.path().display().to_string();
+    let (controls, _steer, _mode) = plan_controls(true);
+    let events = run_to_first_done(&harness, req, controls).await;
+
+    assert!(
+        events.contains(&AgentEvent::PlanModeChanged { active: true }),
+        "{events:?}"
+    );
+    assert!(
+        events.contains(&AgentEvent::PlanUpdated {
+            text: CURSOR_PLAN.into(),
+            path: None,
+        }),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { id, .. } if id == "p1")),
+        "the plan is a plan part, never a tool chip: {events:?}"
+    );
+
+    let frames = plan_frames(dir.path());
+    assert_eq!(frames[0]["op"], "run");
+    assert_eq!(frames[0]["mode"], "plan", "{:?}", frames[0]);
+}
+
+/// The toggle flipped mid-session: the engine pushes the watch, and the mode
+/// the adapter stamps on the NEXT send changes with it — the only place
+/// Cursor's mode can change, and the echo is the report.
+#[tokio::test]
+async fn plan_mode_toggled_off_restamps_the_next_send() {
+    let dir = tempfile::tempdir().expect("cwd");
+    let harness = harness();
+    let mut req = request("scenario:plan");
+    req.plan_mode = true;
+    req.cwd = dir.path().display().to_string();
+    let (controls, steer, mode) = plan_controls(true);
+    let mut stream = harness.run(req, controls).await.expect("run starts");
+
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        let mut dones = 0;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::Done { .. }) {
+                dones += 1;
+                if dones == 1 {
+                    mode.send(false).expect("plan mode pushed");
+                    steer
+                        .send(SteerMessage {
+                            prompt: "build it".into(),
+                            message_id: None,
+                        })
+                        .await
+                        .expect("steer sent");
+                }
+            }
+            let done = dones >= 2;
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .expect("both turns finished in time");
+
+    assert!(
+        events.contains(&AgentEvent::PlanModeChanged { active: false }),
+        "{events:?}"
+    );
+    let frames = plan_frames(dir.path());
+    assert_eq!(frames.len(), 2, "run + steer: {frames:?}");
+    assert_eq!(frames[1]["op"], "user");
+    assert_eq!(frames[1]["mode"], "agent", "{:?}", frames[1]);
+}
+
+/// A run the user did not ask to plan opens the SDK agent in "agent" mode.
+#[tokio::test]
+async fn run_without_plan_mode_sends_agent_mode() {
+    let dir = tempfile::tempdir().expect("cwd");
+    let mut req = request("scenario:plan");
+    req.cwd = dir.path().display().to_string();
+    let (controls, _steer, _mode) = plan_controls(false);
+    let events = run_to_first_done(&harness(), req, controls).await;
+    assert!(
+        events.contains(&AgentEvent::PlanModeChanged { active: false }),
+        "{events:?}"
+    );
+    let frames = plan_frames(dir.path());
+    assert_eq!(frames[0]["mode"], "agent", "{:?}", frames[0]);
 }
 
 #[tokio::test]

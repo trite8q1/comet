@@ -58,6 +58,11 @@ struct ChatConfig: Hashable, Codable {
     /// rewrites the whole `config` field under per-field LWW.
     var modelOptions: [String: JSONValue] = [:]
     var sandbox: String?
+    /// The plan mode the user asked for (ARCHITECTURE.md §11.1 "requested
+    /// mode"), carried exactly like `model`. The host writes it back to the
+    /// harness's reported mode, so an agent that leaves plan mode itself
+    /// flips the toggle everywhere. Absent on old rows ⇒ false.
+    var planMode: Bool = false
 }
 
 struct Chat: Identifiable, Hashable {
@@ -231,15 +236,43 @@ struct RenderToolCall: Hashable {
     var string: (String) -> String? { { key in self.fields[key] as? String } }
 }
 
+/// parts.rs PlanStatus — the harness's plan lifecycle within one segment
+/// (ARCHITECTURE.md §11.4). Raw values are the doc's `planStatus` strings.
+enum PlanStatus: String, Hashable {
+    case drafting
+    case awaitingApproval
+    case approved
+    case revising
+    /// The user rejected the plan: the turn ended with it (§11.4). A device
+    /// too old to know this string decodes it as `drafting` — the card reads
+    /// wrong there, never unanswerable.
+    case rejected
+
+    /// The card's status pill.
+    var label: String {
+        switch self {
+        case .drafting: return "Drafting…"
+        case .awaitingApproval: return "Awaiting approval"
+        case .approved: return "Approved"
+        case .revising: return "Revising"
+        case .rejected: return "Rejected"
+        }
+    }
+}
+
 enum MessagePart: Hashable, Identifiable {
     case text(id: String, text: String)
     case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool)
     case input(id: String, requestId: String, questions: [UserInputQuestion], resolved: Bool)
+    /// The harness's current plan (parts.rs `MessagePart::Plan`). The body
+    /// rides `plan`, never `text` — one part per segment, refreshed in place.
+    case plan(id: String, plan: String, status: PlanStatus, requestId: String?, path: String?)
     case error(id: String, message: String)
 
     var id: String {
         switch self {
-        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
+        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _),
+             .plan(let id, _, _, _, _), .error(let id, _):
             return id
         }
     }
@@ -334,6 +367,9 @@ struct RunRequest: Codable {
     /// Worktree for the host to materialize at drain time (PR #159). Omitted
     /// from the JSON when nil, so old hosts see the legacy shape.
     var worktree: WorktreeSpec?
+    /// The chat's requested plan mode, riding every run (ARCHITECTURE.md
+    /// §11.1). Additive: an old host's serde default reads it as false.
+    var planMode: Bool = false
 }
 
 enum SessionCommandPayload {
@@ -341,6 +377,14 @@ enum SessionCommandPayload {
     case steer(prompt: String, messageId: String?)
     case interrupt
     case respondInput(requestId: String, answers: [UserInputAnswer])
+    /// The card's Approve / Keep planning / Reject answer to the harness's
+    /// plan-exit request; host-executed, idempotent by request id like
+    /// `respondInput`. `rejected` denies the gate, ends the turn and leaves
+    /// plan mode (§11.4); it is omitted from the wire when false.
+    case respondPlanExit(requestId: String, approved: Bool, rejected: Bool, feedback: String?)
+    /// The composer toggle while a run is live — an idle chat applies
+    /// nothing (the next run carries `ChatConfig.planMode`).
+    case setPlanMode(active: Bool)
 
     var kind: String {
         switch self {
@@ -348,6 +392,8 @@ enum SessionCommandPayload {
         case .steer: return "steer"
         case .interrupt: return "interrupt"
         case .respondInput: return "respondInput"
+        case .respondPlanExit: return "respondPlanExit"
+        case .setPlanMode: return "setPlanMode"
         }
     }
 }

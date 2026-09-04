@@ -30,8 +30,8 @@ use comet_doc::{
 };
 use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, PlanDecision, RunRequest, Session, SessionStatus,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -56,6 +56,8 @@ pub enum SteerOutcome {
 }
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+/// Parked plan-exit resolvers, the input bridge's twin (ARCHITECTURE.md §11.3).
+type PendingPlanExits = Arc<Mutex<HashMap<String, oneshot::Sender<PlanDecision>>>>;
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -105,15 +107,28 @@ impl RuntimeConfig {
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    /// Where the harness consumes a steer: inside the turn (step boundary)
+    /// or after it. Decides how plan-gate feedback is delivered (§11.2).
+    steering_mode: comet_proto::SteeringMode,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
+    /// Set by [`SessionsEngine::interrupt_for_replacement`]: a fresh dispatch
+    /// follows this run's end at once, so its terminal Idle is never
+    /// written — observers (chimes, dots, other devices) must not see a
+    /// turn "finish" that the user did not end.
+    replacing: Arc<std::sync::atomic::AtomicBool>,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
     /// ignores its token can never strand the run.
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+    pending_plan_exits: PendingPlanExits,
+    /// The requested plan mode, live: the adapter watches it and applies
+    /// the CLI's own switch. Excluded from `RuntimeConfig` on purpose — a
+    /// mode change never replaces the process.
+    plan_mode_tx: watch::Sender<bool>,
     /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
     /// event — the at-least-once ledger. A run can die with accepted steers
     /// still in its mailbox (idle reaper vs. a routed send; a mid-turn error
@@ -341,13 +356,21 @@ impl SessionsEngine {
                 h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
+                h.plan_mode_tx.clone(),
             )
         });
-        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
+        if let Some((run_id, steerable, same_runtime, steer_tx, ledger, plan_mode_tx)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
             };
+            // The requested mode rides ahead of the prompt so the adapter's
+            // live switch lands before the turn it applies to.
+            if steerable && same_runtime {
+                plan_mode_tx.send_if_modified(|m| {
+                    std::mem::replace(m, request.plan_mode) != request.plan_mode
+                });
+            }
             if steerable && same_runtime && steer_tx.try_send(message).is_ok() {
                 // The run can vanish between the send and here (the idle
                 // reaper, a parked child death): the ledger entry below is
@@ -366,7 +389,12 @@ impl SessionsEngine {
                     // impossible for an observer to hold [new message, old status]
                     // — that gap read as unseen-with-no-live-run = a phantom
                     // "completed" flash on every remote send (2026-07-31).
-                    self.set_status(chat_id, SessionStatus::Working, false);
+                    // Unless the run is parked on the user (an open question or
+                    // plan gate): the message is queued behind that, and
+                    // Working would be a spinner over nothing (2026-09-03).
+                    if !self.blocked_on_user(chat_id) {
+                        self.set_status(chat_id, SessionStatus::Working, false);
+                    }
                     self.inner.note_message(chat_id, &request.prompt);
                     return Ok(run_id);
                 }
@@ -396,13 +424,30 @@ impl SessionsEngine {
             // Mailbox closed (runtime mid-teardown / non-steering harness) or
             // the routed run died with the message reclaimed, or configuration
             // changed beyond what the text-only mailbox can carry: replace it.
-            self.interrupt(chat_id).await?;
+            self.interrupt_for_replacement(chat_id).await?;
         }
 
-        let harness = self.inner.registry.resolve(harness_id)?;
-        let handle = self.doc_handle(chat_id)?;
+        // Past this point a replaced run's Idle was suppressed: any early
+        // failure hands the session back to Idle explicitly.
+        let harness = match self.inner.registry.resolve(harness_id) {
+            Ok(harness) => harness,
+            Err(e) => {
+                self.abandon_replacement(chat_id);
+                return Err(e.into());
+            }
+        };
+        let handle = match self.doc_handle(chat_id) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.abandon_replacement(chat_id);
+                return Err(e);
+            }
+        };
         let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        if let Err(e) = handle.write_user_message(&user_id, &request.prompt, now_ms()) {
+            self.abandon_replacement(chat_id);
+            return Err(e.into());
+        }
 
         // Engine-owned resume (comet sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -440,11 +485,31 @@ impl SessionsEngine {
                 rx
             })
         };
+        // Plan-exit bridge: same contract as the input bridge — the engine
+        // mints the id, parks the resolver for `respond_plan_exit`, and is
+        // the sole emitter of `PlanExitRequested`/`PlanExitResolved`.
+        let pending_plan_exits: PendingPlanExits = Arc::new(Mutex::new(HashMap::new()));
+        let request_plan_exit = {
+            let pending = pending_plan_exits.clone();
+            let engine_tx = engine_tx.clone();
+            Box::new(move || {
+                let (tx, rx) = oneshot::channel();
+                let request_id = new_id();
+                lock(&pending).insert(request_id.clone(), tx);
+                let _ = engine_tx.send(AgentEvent::PlanExitRequested { request_id });
+                rx
+            })
+        };
+        let (plan_mode_tx, plan_mode_rx) = watch::channel(request.plan_mode);
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            plan: comet_harness::PlanControls {
+                mode: plan_mode_rx,
+                request_exit: request_plan_exit,
+            },
         };
 
         lock(&self.inner.runs).insert(
@@ -452,12 +517,16 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                steering_mode: harness.steering_mode(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 interrupt_token,
+                replacing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
+                pending_plan_exits,
+                plan_mode_tx,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             },
         );
@@ -540,7 +609,10 @@ impl SessionsEngine {
             self.note_turn_start(chat_id, &request.cwd);
         }
         if self.is_live(chat_id, &run_id) {
-            self.set_status(chat_id, SessionStatus::Working, false);
+            // See dispatch: a run parked on the user keeps AwaitingInput.
+            if !self.blocked_on_user(chat_id) {
+                self.set_status(chat_id, SessionStatus::Working, false);
+            }
             self.inner.note_message(chat_id, prompt);
             return Ok(SteerOutcome::Accepted);
         }
@@ -565,19 +637,50 @@ impl SessionsEngine {
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        self.interrupt_inner(chat_id, false).await
+    }
+
+    /// Interrupt a run that a fresh dispatch replaces at once (a changed run
+    /// configuration, plan feedback cancelling a turn-boundary agent's
+    /// blocked turn): the run's terminal Idle is suppressed, so no observer
+    /// hears a turn "finish". The caller MUST follow with a dispatch, or call
+    /// [`Self::abandon_replacement`] when that fails.
+    pub async fn interrupt_for_replacement(&self, chat_id: &str) -> Result<bool, EngineError> {
+        self.interrupt_inner(chat_id, true).await
+    }
+
+    /// A replacement dispatch did not happen: hand the session back to Idle
+    /// unless a run is live after all.
+    pub fn abandon_replacement(&self, chat_id: &str) {
+        if lock(&self.inner.runs).contains_key(chat_id) {
+            return;
+        }
+        self.set_status(chat_id, SessionStatus::Idle, false);
+    }
+
+    async fn interrupt_inner(&self, chat_id: &str, replace: bool) -> Result<bool, EngineError> {
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
                 h.interrupt_token.clone(),
                 h.cancel.clone(),
                 h.pending_inputs.clone(),
+                h.pending_plan_exits.clone(),
+                h.replacing.clone(),
             )
         });
-        let Some((run_id, token, cancel, pending)) = target else {
+        let Some((run_id, token, cancel, pending, pending_exits, replacing)) = target else {
             return Ok(false);
         };
+        if replace {
+            replacing.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         // Unpark any blocked question FIRST (mirrors comet: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
+        // A parked plan gate the same way: keep planning, never a silent approval.
+        for (_, tx) in lock(&pending_exits).drain() {
+            let _ = tx.send(PlanDecision::keep_planning(None));
+        }
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
@@ -619,6 +722,70 @@ impl SessionsEngine {
             request_id: request_id.to_string(),
         });
         Ok(true)
+    }
+
+    /// Resolve a pending plan-exit request (`RespondPlanExit`). Returns
+    /// `false` when no such request is pending (unknown id, or the run
+    /// already settled) — the executor's orphan fallback owns that case.
+    pub fn respond_plan_exit(
+        &self,
+        chat_id: &str,
+        request_id: &str,
+        decision: PlanDecision,
+    ) -> Result<bool, EngineError> {
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| (h.pending_plan_exits.clone(), h.engine_tx.clone()));
+        let Some((pending, engine_tx)) = target else {
+            return Ok(false);
+        };
+        let Some(resolver) = lock(&pending).remove(request_id) else {
+            return Ok(false);
+        };
+        let (approved, rejected) = (decision.approved, decision.rejected);
+        let _ = resolver.send(decision);
+        let _ = engine_tx.send(AgentEvent::PlanExitResolved {
+            request_id: request_id.to_string(),
+            approved,
+            rejected,
+        });
+        Ok(true)
+    }
+
+    /// Leave plan mode on the chat's own config — what a REJECT does after
+    /// answering the gate (§11.4). The harness's reported mode normally wins,
+    /// but a rejected turn is being torn down and will never report one, so
+    /// Comet writes the requested mode itself, exactly as the toggle does.
+    pub fn leave_plan_mode(&self, chat_id: &str) {
+        self.inner.reconcile_plan_mode(chat_id, false);
+    }
+
+    /// Whether the chat's live run is parked on the user: an unanswered
+    /// question or plan-exit gate. A message sent meanwhile is queued behind
+    /// it, so the session must not read as Working.
+    fn blocked_on_user(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).get(chat_id).is_some_and(|h| {
+            !lock(&h.pending_inputs).is_empty() || !lock(&h.pending_plan_exits).is_empty()
+        })
+    }
+
+    /// The live run's steering mode, if a run is live.
+    pub fn steering_mode(&self, chat_id: &str) -> Option<comet_proto::SteeringMode> {
+        lock(&self.inner.runs).get(chat_id).map(|h| h.steering_mode)
+    }
+
+    /// Push the requested plan mode into the chat's live run (`SetPlanMode`).
+    /// Returns `false` when no run is live — nothing to switch; the next Run
+    /// carries the chat's requested mode.
+    pub fn set_plan_mode(&self, chat_id: &str, active: bool) -> bool {
+        let tx = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| h.plan_mode_tx.clone());
+        let Some(tx) = tx else {
+            return false;
+        };
+        tx.send_if_modified(|m| std::mem::replace(m, active) != active);
+        true
     }
 
     /// Boot recovery: for every journal whose last event is not `Done` (a run died
@@ -720,6 +887,7 @@ impl SessionsEngine {
                             cwd,
                             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
+                            plan_mode: false,
                             attachments: Vec::new(),
                             resume: None,
                             worktree: None,
@@ -897,6 +1065,25 @@ impl Inner {
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
     /// engine restart (comet sessions.ts:1039).
+    /// Write the harness's REPORTED plan mode back to the chat's requested
+    /// mode (ARCHITECTURE.md §11.1), so an agent leaving plan mode itself
+    /// flips the toggle on every device. LWW config write, idempotent.
+    fn reconcile_plan_mode(&self, chat_id: &str, active: bool) {
+        let Some(ws) = self.workspace() else {
+            return;
+        };
+        let Some(mut config) = ws.chat_config(chat_id) else {
+            return;
+        };
+        if config.plan_mode == active {
+            return;
+        }
+        config.plan_mode = active;
+        if let Err(err) = ws.set_chat_config(chat_id, &config) {
+            tracing::warn!(chat = %chat_id, error = %err, "plan-mode reconcile failed");
+        }
+    }
+
     fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         if session_id.is_empty() {
             return;
@@ -1527,6 +1714,7 @@ async fn drive_run(
                         id != comet_proto::LIVE_PLAN_TOOL_ID
                     }
                     MessagePart::Input { resolved: false, .. } => true,
+                    MessagePart::Plan { status: comet_doc::PlanStatus::AwaitingApproval, .. } => true,
                     _ => false,
                 }) =>
             {
@@ -1744,6 +1932,22 @@ async fn drive_run(
                 continue;
             }
         }
+        // Same contract for the plan-exit bridge.
+        if let AgentEvent::PlanExitRequested { request_id } = &event {
+            let pending = lock(&inner.runs)
+                .get(&chat_id)
+                .map(|h| h.pending_plan_exits.clone());
+            let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
+            if !known {
+                tracing::warn!(
+                    chat = %chat_id,
+                    request = %request_id,
+                    "dropping harness-emitted PlanExitRequested (unknown id; \
+                     the engine plan-exit bridge owns this lifecycle)"
+                );
+                continue;
+            }
+        }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
         // keeps forwarding `session/update` frames after a turn completes,
@@ -1818,6 +2022,19 @@ async fn drive_run(
                     // A stale answer settling after its turn already closed:
                     // nothing is running — stay parked.
                     AgentEvent::InputResolved { .. } => continue,
+                    // A plan-exit gate with no turn behind it: keep planning
+                    // (never a silent approval), stay parked.
+                    AgentEvent::PlanExitRequested { request_id } => {
+                        let resolver = lock(&inner.runs)
+                            .get(&chat_id)
+                            .and_then(|h| lock(&h.pending_plan_exits).remove(request_id));
+                        if let Some(tx) = resolver {
+                            let _ = tx.send(PlanDecision::keep_planning(None));
+                        }
+                        tracing::debug!(chat = %chat_id, "parked session: post-turn plan exit auto-declined");
+                        continue;
+                    }
+                    AgentEvent::PlanExitResolved { .. } => continue,
                     _ => continue,
                 }
             }
@@ -1980,6 +2197,19 @@ async fn drive_run(
             AgentEvent::InputResolved { .. } => {
                 inner.set_status(&chat_id, SessionStatus::Working, false);
             }
+            // The exit gate is a question in every sense the sidebar cares
+            // about: the dot, the reaper, the staleness gate.
+            AgentEvent::PlanExitRequested { .. } => {
+                inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
+            }
+            AgentEvent::PlanExitResolved { .. } => {
+                inner.set_status(&chat_id, SessionStatus::Working, false);
+            }
+            // Reported mode wins over requested mode (ARCHITECTURE.md §11.1):
+            // the toggle on every device follows the harness.
+            AgentEvent::PlanModeChanged { active } => {
+                inner.reconcile_plan_mode(&chat_id, *active);
+            }
             _ => {}
         }
 
@@ -2008,8 +2238,11 @@ async fn drive_run(
             let pending = lock(&inner.runs)
                 .get(&chat_id)
                 .filter(|h| h.run_id == run_id)
-                .map(|h| h.pending_inputs.clone());
-            if let Some(pending) = pending {
+                .map(|h| (h.pending_inputs.clone(), h.pending_plan_exits.clone()));
+            if let Some((pending, pending_exits)) = pending {
+                for (_, tx) in lock(&pending_exits).drain() {
+                    let _ = tx.send(PlanDecision::keep_planning(None));
+                }
                 for (_, tx) in lock(&pending).drain() {
                     let _ = tx.send(Vec::new());
                 }
@@ -2022,9 +2255,20 @@ async fn drive_run(
             // errored, interrupted) terminally resolves its input parts — an
             // unresolved question must not outlive the run that asked it
             // (its resolver died with the run; an answer could never land).
+            // A parked PLAN GATE settles the same way, and to the same place
+            // the drain above just told the harness: `Revising`, never an
+            // approval. Left `AwaitingApproval` the card would stay actionable
+            // on a dead request id, and the composer's send would keep being
+            // taken as feedback on a plan nobody is waiting for.
             for part in folded.iter_mut() {
-                if let MessagePart::Input { resolved, .. } = part {
-                    *resolved = true;
+                match part {
+                    MessagePart::Input { resolved, .. } => *resolved = true,
+                    MessagePart::Plan { status, .. }
+                        if *status == comet_doc::PlanStatus::AwaitingApproval =>
+                    {
+                        *status = comet_doc::PlanStatus::Revising;
+                    }
+                    _ => {}
                 }
             }
             // A Done landing on a PARKED session with nothing streamed (the
@@ -2112,8 +2356,16 @@ async fn drive_run(
         .filter(|h| h.run_id == run_id)
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
+    // A replaced run keeps its last live status: the dispatch that replaces
+    // it writes Working next, and nobody hears a phantom "done".
+    let replaced = lock(&inner.runs)
+        .get(&chat_id)
+        .filter(|h| h.run_id == run_id)
+        .is_some_and(|h| h.replacing.load(std::sync::atomic::Ordering::SeqCst));
     inner.remove_run(&chat_id, &run_id);
-    inner.set_status(&chat_id, final_status, false);
+    if !(replaced && final_status == SessionStatus::Idle) {
+        inner.set_status(&chat_id, final_status, false);
+    }
     if !interrupted && !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding
@@ -2175,6 +2427,7 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
+            plan_mode: false,
             resume: None,
             attachments: Vec::new(),
             worktree: None,

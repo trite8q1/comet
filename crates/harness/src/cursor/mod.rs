@@ -33,6 +33,15 @@
 //!   login); the shim surfaces the exact fix as an error chip otherwise.
 //! - Steering: turn-boundary — steers queue and become the next turn on the
 //!   parked session (parity with the previous ACP behavior).
+//! - Plan mode (ARCHITECTURE.md §11.2, Cursor row): `mode: "plan"|"agent"`
+//!   rides the shim's `run` frame (the SDK's `Agent({mode})`) and every
+//!   `user` frame (`send(prompt, {mode})`). The SDK reports no mode of its
+//!   own and has no agent-initiated exit gate — the mode is CLIENT-owned, so
+//!   the mode this adapter sends IS the reported mode it echoes back as
+//!   [`AgentEvent::PlanModeChanged`], and the user leaves plan mode with the
+//!   toggle, as in Cursor itself. The plan is the `createPlan` tool call's
+//!   `plan` argument, surfaced as [`AgentEvent::PlanUpdated`] instead of a
+//!   tool chip.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -44,7 +53,7 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
@@ -221,6 +230,11 @@ impl Harness for CursorHarness {
     fn deterministic_turn_end(&self) -> bool {
         true
     }
+    /// The SDK's own `AgentModeOption` — `mode: "plan"` on the agent and on
+    /// every send (verified against 1.0.28's `options.d.ts` / `agent.d.ts`).
+    fn plan_mode(&self) -> bool {
+        true
+    }
 
     /// Live catalog via the shim's models mode (`Cursor.models.list()` —
     /// public, no auth; verified live on 1.0.28). Falls back to a minimal
@@ -315,6 +329,8 @@ impl Harness for CursorHarness {
             // shim folds them into the SDK's ModelSelection params.
             "modelOptions": request.model_options,
             "resume": request.resume,
+            // Plan mode is client-owned here: the mode the run opens in.
+            "mode": mode_name(request.plan_mode),
         });
         let _ = stdin_tx.send(first.to_string());
 
@@ -327,6 +343,7 @@ impl Harness for CursorHarness {
             controls,
             request_cwd: request.cwd,
             request_model: request.model.unwrap_or_default(),
+            request_plan_mode: request.plan_mode,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
@@ -459,6 +476,38 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Str
     let _ = stdin.shutdown().await;
 }
 
+/// The SDK's `AgentModeOption` for comet's one plan bit.
+fn mode_name(plan_mode: bool) -> &'static str {
+    if plan_mode { "plan" } else { "agent" }
+}
+
+/// Send the next user turn, stamped with the plan mode the user is asking
+/// for right now, and report a change. Cursor reports no mode itself, so this
+/// echo IS the reported mode the host reconciles the chat's toggle to.
+/// Returns false when the event receiver is gone.
+async fn send_user_turn(
+    prompt: String,
+    mode: &watch::Receiver<bool>,
+    applied: &mut bool,
+    stdin_tx: &mpsc::UnboundedSender<String>,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) -> bool {
+    let active = *mode.borrow();
+    if active != *applied {
+        *applied = active;
+        if event_tx
+            .send(Ok(AgentEvent::PlanModeChanged { active }))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let _ = stdin_tx
+        .send(json!({ "op": "user", "prompt": prompt, "mode": mode_name(active) }).to_string());
+    true
+}
+
 struct Session {
     child: Child,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
@@ -467,6 +516,7 @@ struct Session {
     controls: RunControls,
     request_cwd: String,
     request_model: String,
+    request_plan_mode: bool,
     interrupt_grace: Duration,
     kill_grace: Duration,
     stderr_tail: crate::StderrTail,
@@ -485,6 +535,7 @@ async fn run_session(session: Session) {
         controls,
         request_cwd,
         request_model,
+        request_plan_mode,
         interrupt_grace,
         kill_grace,
         stderr_tail,
@@ -493,6 +544,7 @@ async fn run_session(session: Session) {
         request_input: _request_input,
         mut steering,
         interrupt,
+        plan,
     } = controls;
 
     let mut assistant_message_id = new_message_id();
@@ -507,10 +559,22 @@ async fn run_session(session: Session) {
     let mut queued_steers: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Cursor's plan mode is CLIENT-owned (§11.2): the SDK reports no mode,
+    // so the mode stamped on the frame we just sent IS the reported mode.
+    // The run frame carried the request's; echo it, then restamp every send
+    // from the live watch.
+    let mut plan_applied = request_plan_mode;
+
     let send = |ev: AgentEvent| {
         let tx = event_tx.clone();
         async move { tx.send(Ok(ev)).await.is_ok() }
     };
+
+    // A closed receiver ends the run through the loop's own `closed()` arm.
+    let _ = send(AgentEvent::PlanModeChanged {
+        active: plan_applied,
+    })
+    .await;
 
     'main: loop {
         tokio::select! {
@@ -587,9 +651,17 @@ async fn run_session(session: Session) {
                                         {
                                             break 'main;
                                         }
-                                        let _ = stdin_tx.send(
-                                            json!({ "op": "user", "prompt": text }).to_string(),
-                                        );
+                                        if !send_user_turn(
+                                            text,
+                                            &plan.mode,
+                                            &mut plan_applied,
+                                            &stdin_tx,
+                                            &event_tx,
+                                        )
+                                        .await
+                                        {
+                                            break 'main;
+                                        }
                                     } else if !steering_open {
                                         break 'main;
                                     } else {
@@ -620,8 +692,17 @@ async fn run_session(session: Session) {
                         {
                             break 'main;
                         }
-                        let _ = stdin_tx
-                            .send(json!({ "op": "user", "prompt": msg.prompt }).to_string());
+                        if !send_user_turn(
+                            msg.prompt,
+                            &plan.mode,
+                            &mut plan_applied,
+                            &stdin_tx,
+                            &event_tx,
+                        )
+                        .await
+                        {
+                            break 'main;
+                        }
                     } else {
                         // Turn-boundary steering: queue for the next boundary.
                         queued_steers.push_back(msg.prompt);
@@ -815,6 +896,19 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                 .to_owned();
             let name = frame.get("name").and_then(Value::as_str).unwrap_or("tool");
             let args = frame.get("args").cloned().unwrap_or(Value::Null);
+            // Cursor's plan IS this call's argument (§11.2): it becomes the
+            // segment's plan part, never a tool chip — the ACP `plan`
+            // precedent. Both phases carry the full text; the fold refreshes
+            // the one part in place.
+            if name == "createPlan" {
+                return match args.get("plan").and_then(Value::as_str) {
+                    Some(plan) if !plan.is_empty() => vec![tag(AgentEvent::PlanUpdated {
+                        text: plan.to_owned(),
+                        path: None,
+                    })],
+                    _ => Vec::new(),
+                };
+            }
             match frame.get("phase").and_then(Value::as_str) {
                 Some("start") => {
                     let mut events = vec![tag(AgentEvent::ToolCall {

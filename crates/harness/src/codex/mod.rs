@@ -38,6 +38,13 @@
 //!   false` entries dropped, and a leading `/name` that the session's own
 //!   catalog lists is translated into the TUI's own frame — the text with the
 //!   native `$name` mention, then a `skill` input item carrying `SKILL.md`.
+//! - Plan mode (ARCHITECTURE.md §11.2): the app server has NO client-settable
+//!   collaboration mode — `thread/start`/`turn/start` take none — so
+//!   [`Harness::plan_mode`] stays false and the composer hides the toggle. The
+//!   READ-ONLY half is decoded, so a thread the user put in plan mode still
+//!   renders: `thread/settings/updated.collaborationMode` → `PlanModeChanged`,
+//!   `item/plan/delta` + the completed `plan` item → `PlanUpdated`. The
+//!   `live_plan_schema_tripwire` test fails the day the wire grows a setter.
 
 pub(crate) mod catalog;
 mod normalize;
@@ -67,7 +74,8 @@ use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
+    plan_mode_event, route_child_notification, turn_error_message, turn_id, usage_event,
+    user_message_text,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -594,6 +602,11 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        // Unused: `thread/start`/`turn/start` take no collaboration mode
+        // (0.151/0.152), so `plan_mode()` stays false and nothing can be
+        // applied here (ARCHITECTURE.md §11.2). The mode codex REPORTS and the
+        // plan item are still decoded below.
+        plan: _plan,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -775,6 +788,9 @@ async fn run_session(session: Session) {
     // Deltas seen per agent-message item, so a model that never streams
     // (item/completed only) still emits its text exactly once.
     let mut streamed_text: HashSet<String> = HashSet::new();
+    // Plan text accumulated per plan item from `item/plan/delta`, until the
+    // completed item's authoritative text replaces it.
+    let mut plan_text: HashMap<String, String> = HashMap::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
@@ -907,6 +923,13 @@ async fn run_session(session: Session) {
                                             } else {
                                                 Vec::new()
                                             }
+                                        } else if item_type(&item) == "plan" {
+                                            // A subagent's plan has no consumer
+                                            // on this wire, like its
+                                            // `item/plan/delta` (see
+                                            // `route_child_notification`): only
+                                            // the parent thread's plan renders.
+                                            Vec::new()
                                         } else {
                                             map_item(phase, &item)
                                         }
@@ -958,6 +981,34 @@ async fn run_session(session: Session) {
                     "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
                         if let Some(text) = delta_text(&params)
                             && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
+                        {
+                            break 'main;
+                        }
+                    }
+
+                    // The plan a thread already in codex's plan collaboration
+                    // mode is writing (ARCHITECTURE.md §11.2). EXPERIMENTAL:
+                    // the deltas are a live approximation, so each one reports
+                    // the accumulation so far and the completed item
+                    // overwrites it with the authoritative text.
+                    "item/plan/delta" => {
+                        if let Some(delta) = delta_text(&params) {
+                            let text = plan_text.entry(item_id(&params)).or_default();
+                            text.push_str(&delta);
+                            let text = text.clone();
+                            if !send(&event_tx, AgentEvent::PlanUpdated { text, path: None }).await
+                            {
+                                break 'main;
+                            }
+                        }
+                    }
+
+                    // The REPORTED collaboration mode: read-only on this wire
+                    // (there is no way to ask for it), but a thread the user
+                    // put in plan mode still says so.
+                    "thread/settings/updated" => {
+                        if let Some(ev) = plan_mode_event(&params)
+                            && !send(&event_tx, ev).await
                         {
                             break 'main;
                         }
@@ -1068,6 +1119,7 @@ async fn run_session(session: Session) {
                         // Item ids never span turns; without this the set grew
                         // one entry per message for a persistent session's life.
                         streamed_text.clear();
+                        plan_text.clear();
                         if let Some(usage) = pending_usage.take()
                             && !send(&event_tx, usage).await
                         {

@@ -14,6 +14,11 @@ enum RowKind {
     case markdown(block: MDBlock, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
     case inputChip(header: String, resolved: Bool)
+    /// The harness's plan for this segment (ARCHITECTURE.md §11.6) — the body
+    /// is the plan markdown, parsed like assistant prose. `path` is the plan
+    /// file where the CLI keeps one, nil on the harnesses that keep none.
+    case planCard(blocks: [TopBlock], title: String, status: PlanStatus,
+                  requestId: String?, path: String?)
     case errorChip(message: String)
 }
 
@@ -179,11 +184,32 @@ enum TranscriptRowBuilder {
 
             case .input(let partId, _, let questions, let resolved):
                 flushTools(lastIx: ix - 1)
-                let header = questions.first?.header ?? "Question"
+                // The chip's own label already says "Question"; a header that
+                // says it again ("Question: which port?") adds nothing, and
+                // the bare genus adds less than nothing.
+                let header = stripGenusPrefix(questions.first?.header ?? "", genus: ["question"])
                 rows.append(TranscriptRow(id: "\(entry.id)#\(partId)",
                                           version: fnv1a(header) | (resolved ? 1 : 0),
                                           turnStart: first,
                                           kind: .inputChip(header: header, resolved: resolved),
+                                          entryId: entry.id, timestamp: nil, partKey: nil))
+                first = false
+
+            case .plan(let partId, let plan, let status, let requestId, let path):
+                flushTools(lastIx: ix - 1)
+                let key = "\(entry.id)#\(partId)"
+                live.insert(key)
+                // A draft is a whole rewrite, never an append, so the memo
+                // (keyed by content) carries it — not the incremental parser.
+                let blocks = parse(text: plan, key: key, streaming: false,
+                                   parsers: &parsers, completed: &completed)
+                rows.append(TranscriptRow(id: key,
+                                          version: planVersion(plan: plan, status: status,
+                                                               requestId: requestId, path: path),
+                                          turnStart: first,
+                                          kind: .planCard(blocks: blocks, title: planTitle(plan),
+                                                          status: status, requestId: requestId,
+                                                          path: path),
                                           entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
 
@@ -224,6 +250,53 @@ enum TranscriptRowBuilder {
         return blocks
     }
 
+    /// Max chars the plan card's title keeps: the header's title slot
+    /// truncates visually, but the derived title also rides the row version.
+    private static let planTitleMax = 80
+
+    /// The plan's own title: its first `# ` heading, minus a "Plan" genus the
+    /// heading repeats. Comet never writes a plan, so the card's name is
+    /// whatever the harness titled it — and harnesses title them `# Plan`,
+    /// `# Plan: port the veil` and `# Port the veil` in roughly equal measure.
+    /// The header already says "Plan" in its own slot, so the first two would
+    /// render the word twice.
+    ///
+    /// EMPTY when the heading adds nothing over the genus (`# Plan`, or no
+    /// heading at all): the header renders the label alone rather than "Plan
+    /// Plan".
+    static func planTitle(_ plan: String) -> String {
+        for line in plan.split(separator: "\n", omittingEmptySubsequences: false) {
+            let heading = line.drop(while: { $0.isWhitespace })
+            guard heading.hasPrefix("# ") else { continue }
+            // The FIRST `# ` line IS the title, even when it strips to
+            // nothing — the desktop commits to it rather than searching on,
+            // and a later heading is a section, not a second name.
+            return capped(stripGenusPrefix(String(heading.dropFirst(2)), genus: ["plan"]),
+                          max: planTitleMax)
+        }
+        return ""
+    }
+
+    /// `title_line`'s cap: the derived title rides the row version, so it is
+    /// bounded at the source rather than only by the view's truncation.
+    private static func capped(_ text: String, max: Int) -> String {
+        text.count > max ? String(text.prefix(max)) + "\u{2026}" : text
+    }
+
+    /// Diff key for a plan part. The part is refreshed IN PLACE by every
+    /// `PlanUpdated`, so the row id never moves — the version has to carry
+    /// every visible change: the draft's CONTENT, the status, the parked gate,
+    /// the plan file. Hashing the length instead would miss a same-length
+    /// rewrite (a reordered step, a swapped word) and keep stale markdown on
+    /// the card. The path is in here because some adapters learn it a beat
+    /// after the text — Claude's gate injects `planFilePath` on a later
+    /// `PlanUpdated` whose text is byte-identical — and without it that
+    /// update would not repaint the card's path row.
+    static func planVersion(plan: String, status: PlanStatus, requestId: String?,
+                            path: String?) -> UInt64 {
+        fnv1a("\(fnv1a(plan))|\(status.rawValue)|\(requestId ?? "")|\(path ?? "")")
+    }
+
     private static func toolFingerprint(_ tools: [ToolItem]) -> UInt64 {
         var hash: UInt64 = 0xcbf29ce484222325
         for tool in tools {
@@ -253,6 +326,80 @@ enum TranscriptRowBuilder {
     }
 }
 
+// MARK: - Genus stripping (transcript.rs strip_genus_prefix)
+
+/// Separators an agent writes between a genus and the real title: `Plan: x`,
+/// `Agent - x`, `Plan — x`. NOT a bare space — "Plan for the veil port" is a
+/// title that happens to start with the word, and stripping there would leave
+/// "for the veil port".
+private let genusSeparators: Set<Character> = [":", "-", "\u{2013}", "\u{2014}"]
+
+/// Drop a leading genus word from a title that is about to be rendered NEXT
+/// to that same genus as a label — `Plan   Plan: port the veil` is one word
+/// doing nothing twice, and `Plan   Plan` is worse.
+///
+/// Returns `""` when the title IS the bare genus: there is no name here, only
+/// the category, and the label beside it already says that.
+///
+/// Only a real word boundary strips, so "Taskmaster" and "Planning: x" keep
+/// their names, and only punctuation counts as a separator (see
+/// `genusSeparators`). Case-insensitive, because the genus is ours and the
+/// title is the harness's.
+///
+/// TITLES only. A tool chip's detail is CONTENT — stripping `Search  search
+/// in crates/ui` down to `in crates/ui` would destroy the pattern.
+func stripGenusPrefix(_ text: String, genus: [String]) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    for prefix in genus {
+        guard trimmed.count >= prefix.count,
+              trimmed.prefix(prefix.count).lowercased() == prefix.lowercased() else { continue }
+        let rest = trimmed.dropFirst(prefix.count)
+        if rest.isEmpty { return "" }
+        // Exactly one separator, then whatever spacing followed it.
+        let afterSpace = rest.drop(while: { $0.isWhitespace })
+        guard let separator = afterSpace.first, genusSeparators.contains(separator) else { continue }
+        return afterSpace.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return trimmed
+}
+
+// MARK: - Path display (the phone half of crates/ui/src/file_path.rs)
+
+/// `$HOME/x` → `~/x`, and a path already written with `~` is left alone (the
+/// mock harness emits one, so this has to be idempotent).
+///
+/// Purely LEXICAL, exactly like the desktop's `home_relative`: no
+/// percent-decoding (an encoded segment is the harness's own bookkeeping and
+/// mangling it would misname the file), and no relativizing against the chat's
+/// cwd — most plan files live OUTSIDE the project, where that only buys a
+/// `../../../` prefix.
+///
+/// `home` is injected so the rule is testable. The default is this device's,
+/// which on a phone is its sandbox container: a path minted on the host Mac
+/// simply stays absolute there, which is the honest reading of someone else's
+/// filesystem.
+func planPathDisplay(_ path: String, home: String = NSHomeDirectory()) -> String {
+    if path == "~" || path.hasPrefix("~/") { return path }
+    var home = home
+    while home.hasSuffix("/") { home.removeLast() }
+    guard !home.isEmpty, path.hasPrefix(home) else { return path }
+    let rest = path.dropFirst(home.count)
+    if rest.isEmpty { return "~" }
+    // A sibling that merely shares the prefix (`/Users/nicolas` against
+    // `HOME=/Users/nico`) is not under it.
+    guard rest.hasPrefix("/") else { return path }
+    return "~" + rest
+}
+
+/// Split a display path into `(directory-with-trailing-slash, basename)` so a
+/// view can truncate the directory and pin the name. A bare filename has no
+/// directory half; a trailing slash makes the whole thing the directory, so a
+/// folder still renders as itself.
+func splitDisplayPath(_ path: String) -> (directory: String, name: String) {
+    guard let slash = path.lastIndex(of: "/") else { return ("", path) }
+    return (String(path[...slash]), String(path[path.index(after: slash)...]))
+}
+
 // MARK: - Tool chip content (transcript.rs tool_chip_content_raw)
 
 extension RenderToolCall {
@@ -269,7 +416,7 @@ extension RenderToolCall {
         case "webSearch": return "Web"
         case "todo": return "Todo"
         case "mcp": return "MCP"
-        default: return "Tool"
+        default: return unknownContent.label
         }
     }
 
@@ -289,8 +436,20 @@ extension RenderToolCall {
         case "mcp":
             let server = string("server").map { "\($0) · " } ?? ""
             return server + (string("tool") ?? "")
-        default: return string("name") ?? ""
+        default: return unknownContent.detail
         }
+    }
+
+    /// Subagent spawns decode as an unknown call named "Agent[: <description>]"
+    /// (every native driver's convention): label them "Agent" with the
+    /// description as the detail — "Tool  Agent: scan repo" read as two labels
+    /// fighting. Split here and not in `stripGenusPrefix` because the exact
+    /// name is the wire's, not a title a model wrote.
+    private var unknownContent: (label: String, detail: String) {
+        let name = string("name") ?? ""
+        if name.hasPrefix("Agent: ") { return ("Agent", String(name.dropFirst("Agent: ".count))) }
+        if name == "Agent" { return ("Agent", "") }
+        return ("Tool", name)
     }
 
     var chipSymbol: String {

@@ -16,6 +16,7 @@
 
 use std::borrow::Cow;
 
+use comet_proto::HarnessId;
 use gpui::{AssetSource, Hsla, Result, SharedString, Styled as _, Svg, svg};
 
 macro_rules! icon_assets {
@@ -175,6 +176,28 @@ pub fn claude_brand() -> Hsla {
     gpui::rgb(0xD97757).into()
 }
 
+/// The brand mark of a harness: `(asset path, brand tint)`, where a `None`
+/// tint means "wear the surface's own colour" (the monochrome marks).
+///
+/// Every surface that shows which agent something belongs to — the composer
+/// chips, the model picker rows, the session strip, the transcript's plan
+/// card — resolves the mark here, so none of them has to know the harness
+/// roster itself.
+pub fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<Hsla>) {
+    match harness {
+        HarnessId::ClaudeCode | HarnessId::Mock => (CLAUDE_MARK, Some(claude_brand())),
+        HarnessId::Codex => (OPENAI_MARK, None),
+        HarnessId::Cursor => (CURSOR_MARK, None),
+        // Monochrome mark, tinted by the surface like OpenAI's.
+        HarnessId::Grok => (GROK_MARK, None),
+        // Nous Research's mark (the Hermes product icon), monochrome.
+        HarnessId::Hermes => (HERMES_MARK, None),
+        HarnessId::Pi => (PI_MARK, None),
+        // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
+        HarnessId::Opencode => (OPENCODE_MARK, None),
+    }
+}
+
 /// An icon element for an embedded asset path. Size and colour are set by the
 /// caller (`.size(..)`, `.text_color(..)`), matching the web app's
 /// `[&_svg]:size-4` idiom.
@@ -197,6 +220,26 @@ mod tests {
             let text = std::str::from_utf8(&bytes).expect("icon svg is utf-8");
             assert!(text.contains("<svg"), "{path} is not an svg");
             assert!(text.contains("viewBox"), "{path} lacks a viewBox");
+        }
+    }
+
+    #[test]
+    fn every_harness_wears_a_registered_brand_mark() {
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Pi,
+            HarnessId::Opencode,
+            HarnessId::Mock,
+        ] {
+            let (path, _) = harness_brand_icon(harness);
+            assert!(
+                Assets.load(path).unwrap().is_some(),
+                "{harness:?} names a missing asset {path}"
+            );
         }
     }
 

@@ -12,10 +12,10 @@
 //! spawn on the first parent round); against a real provider, ask for one
 //! `task` explicitly.
 
-use futures::StreamExt;
-use tokio::sync::{mpsc, oneshot};
 use comet_harness::{CancellationToken, Harness, OpencodeHarness, RunControls};
 use comet_proto::{AgentEvent, RunRequest, SandboxLevel, UserInputAnswer};
+use futures::StreamExt;
+use tokio::sync::{mpsc, oneshot};
 
 #[tokio::main]
 async fn main() {
@@ -25,6 +25,7 @@ async fn main() {
     std::fs::create_dir_all(&cwd).unwrap();
     let (_steer_tx, steering) = mpsc::channel(8);
     let controls = RunControls {
+        plan: comet_harness::PlanControls::off(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -57,6 +58,7 @@ async fn main() {
         cwd,
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         resume: None,
         worktree: None,

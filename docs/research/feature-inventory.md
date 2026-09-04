@@ -70,7 +70,7 @@ display EXCLUDED. File paths refer to the reference repo.
   AttachmentStrip, preview dialog.
 - Notices: amber (offline device) / red (send failure).
 - QuestionPanel replaces composer while run awaits input: paged 1-at-a-time "1/3", single-select
-  auto-advances after 220ms, multi/typed explicit, number keys, free-text override, wizard state
+  never self-advances (Next/Submit only, inert until answered), number keys, free-text override, wizard state
   cached per requestId, latched across blips.
 - Pickers: HarnessModelPicker (harness rail + models, harness locked once chat exists),
   TraitsPicker (reasoning + advertised model options; trigger shows non-defaults "High · 1M · Fast"),

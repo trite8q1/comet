@@ -30,6 +30,11 @@ pub struct HarnessDescriptor {
     /// field never read as uninstallable.
     #[serde(default = "default_installed")]
     pub installed: bool,
+    /// Whether the agent's own wire has a plan mode comet drives natively
+    /// (ARCHITECTURE.md §11.2); gates the composer toggle. Defaults false so
+    /// catalogs from older engines never offer a toggle they cannot honor.
+    #[serde(default)]
+    pub plan_mode: bool,
     /// Whether the listing device offers this harness (Settings → Agents).
     /// `None` — the catalog came from an engine predating the setting — means
     /// "unknown": consumers fall back to detection (see [`descriptor_enabled`]).
@@ -67,6 +72,7 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         reasoning_levels: harness.reasoning_levels().to_vec(),
         installed: harness.installed(),
         enabled: None,
+        plan_mode: harness.plan_mode(),
     }
 }
 
@@ -307,6 +313,7 @@ impl HarnessRegistry {
                         installed,
                         ..
                     }) => HarnessDescriptor {
+                        plan_mode: false,
                         installed: installed(),
                         ..descriptor.clone()
                     },
@@ -373,6 +380,7 @@ pub fn default_registry() -> HarnessRegistry {
     }));
     registry.register_lazy(
         HarnessDescriptor {
+            plan_mode: false,
             id: HarnessId::ClaudeCode,
             name: "Claude Code".into(),
             supports_steering: true,
@@ -400,6 +408,7 @@ pub fn default_registry() -> HarnessRegistry {
     // run/model call actually resolves the slot.
     registry.register_lazy(
         HarnessDescriptor {
+            plan_mode: false,
             id: HarnessId::Codex,
             name: "Codex".into(),
             supports_steering: true,
@@ -424,6 +433,7 @@ pub fn default_registry() -> HarnessRegistry {
     // CursorHarness exactly. Turn-boundary steering; no effort ladder.
     registry.register_lazy(
         HarnessDescriptor {
+            plan_mode: false,
             id: HarnessId::Cursor,
             name: "Cursor".into(),
             supports_steering: true,
@@ -441,6 +451,7 @@ pub fn default_registry() -> HarnessRegistry {
     // session via the `thought_level` config option.
     registry.register_lazy(
         HarnessDescriptor {
+            plan_mode: false,
             id: HarnessId::Grok,
             name: "Grok".into(),
             supports_steering: true,
@@ -462,6 +473,7 @@ pub fn default_registry() -> HarnessRegistry {
     // config over ACP today (hybrid reasoning is model-internal).
     registry.register_lazy(
         HarnessDescriptor {
+            plan_mode: false,
             id: HarnessId::Hermes,
             name: "Hermes".into(),
             supports_steering: true,
@@ -478,6 +490,7 @@ pub fn default_registry() -> HarnessRegistry {
     // pi's thinking ladder minus its "off" tier.
     registry.register_lazy(
         HarnessDescriptor {
+            plan_mode: false,
             id: HarnessId::Pi,
             name: "Pi".into(),
             supports_steering: true,
@@ -503,6 +516,7 @@ pub fn default_registry() -> HarnessRegistry {
     // run sends the first advertised variant id for the picked level).
     registry.register_lazy(
         HarnessDescriptor {
+            plan_mode: false,
             id: HarnessId::Opencode,
             name: "OpenCode".into(),
             supports_steering: true,
@@ -535,6 +549,7 @@ mod tests {
         let counted = calls.clone();
         registry.register_lazy(
             HarnessDescriptor {
+                plan_mode: false,
                 id: HarnessId::Mock,
                 name: "Lazy Mock".into(),
                 supports_steering: true,
@@ -677,6 +692,7 @@ mod tests {
     fn test_slot(registry: &HarnessRegistry, id: HarnessId, installed: bool) {
         registry.register_lazy(
             HarnessDescriptor {
+                plan_mode: false,
                 id,
                 name: format!("{id:?}"),
                 supports_steering: true,
@@ -759,6 +775,7 @@ mod tests {
         let probe = Arc::clone(&found);
         registry.register_lazy(
             HarnessDescriptor {
+                plan_mode: false,
                 id: HarnessId::Grok,
                 name: "Grok".into(),
                 supports_steering: true,

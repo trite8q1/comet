@@ -314,6 +314,23 @@ final class DemoDataset {
                 ], createdAt: now - 86_500_000, deviceId: "ios-demo", status: .complete, continuationOf: nil),
                 MessageEntry(id: "m2", role: .assistant, parts: [
                     .text(id: "t0", text: "Flush timer now only arms while dirty; ping/pong uses the auto-response path so the DO never wakes for keepalives."),
+                    // The harness's own plan, parked at its exit gate (§11.6).
+                    .plan(id: "plan", plan: """
+                    # Harden the deploy path
+
+                    Three changes, smallest first — each one ships on its own.
+
+                    1. **Arm the flush timer only while dirty.** A clean DO stays asleep.
+                    2. **Answer ping with the auto-response path**, so keepalives never wake it.
+                    3. **Fail the deploy** when `wrangler.toml` and the secret set disagree.
+
+                    ```toml
+                    [durable_objects]
+                    bindings = [{ name = "ROOMS", class_name = "Room" }]
+                    ```
+
+                    Rollback is one `wrangler rollback` — no state migration in any step.
+                    """, status: .awaitingApproval, requestId: "plan-req-1", path: nil),
                 ], createdAt: now - 86_400_000, deviceId: "dev-vps", status: .complete, continuationOf: nil),
             ]
         default:

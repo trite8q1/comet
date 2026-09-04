@@ -170,6 +170,7 @@ impl TitleGenerator {
                 cwd: cwd.to_string(),
                 sandbox: SandboxLevel::ReadOnly,
                 auto_approve: true,
+                plan_mode: false,
                 attachments: Vec::new(),
                 resume: None,
                 worktree: None,
@@ -236,6 +237,7 @@ async fn collect_text(
         }),
         steering: steer_rx,
         interrupt: CancellationToken::new(),
+        plan: comet_harness::PlanControls::off(),
     };
     let mut stream = harness.run(request, controls).await?;
     let mut text = String::new();

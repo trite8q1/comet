@@ -16,12 +16,12 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, HarnessId, Model, PlanDecision, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,35 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+    /// Native plan mode (ARCHITECTURE.md §11.3).
+    pub plan: PlanControls,
+}
+
+/// The plan-mode half of [`RunControls`]: the requested mode as a live watch,
+/// and the exit-gate bridge. Both mirror the input bridge — the ENGINE mints
+/// the request id and emits `PlanExitRequested`/`PlanExitResolved`; an
+/// adapter only awaits the decision and answers its own wire.
+pub struct PlanControls {
+    /// The requested plan mode; `changed()` fires when the user toggles it
+    /// mid-run and the adapter applies the CLI's own live switch.
+    pub mode: watch::Receiver<bool>,
+    /// The harness asked to leave plan mode with the current plan: blocks
+    /// until the user decides. A dropped sender (caller gone) reads as
+    /// "keep planning" — never a silent approval.
+    pub request_exit: Box<dyn Fn() -> oneshot::Receiver<PlanDecision> + Send + Sync>,
+}
+
+impl PlanControls {
+    /// Plan mode off and never toggled; an exit request is answered "keep
+    /// planning" (dropped sender). For runs that carry no plan controls
+    /// (titling, tests).
+    pub fn off() -> Self {
+        let (_tx, rx) = watch::channel(false);
+        Self {
+            mode: rx,
+            request_exit: Box::new(|| oneshot::channel().1),
+        }
+    }
 }
 
 #[async_trait]
@@ -77,6 +106,13 @@ pub trait Harness: Send + Sync {
     /// directly return true, and the engine retires its quiesce watchdogs
     /// for them; adapter-mediated ACP agents keep the watchdog backstop.
     fn deterministic_turn_end(&self) -> bool {
+        false
+    }
+    /// Whether this agent's OWN wire has a plan mode comet can enter and
+    /// leave (ARCHITECTURE.md §11.2). Gates the composer toggle by
+    /// descriptor, never by harness id. Defaults to false; an adapter turns
+    /// it on only once it drives the CLI's native mode end to end.
+    fn plan_mode(&self) -> bool {
         false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;

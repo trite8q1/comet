@@ -35,6 +35,7 @@ fn run_request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -646,9 +647,9 @@ async fn retry_reissues_a_swallowed_send() {
     .await;
     wait_for(
         || {
-            entries_now(&core)
-                .iter()
-                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "re-issued send runs to completion",
     )
@@ -1749,6 +1750,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         cwd: cwd.to_string_lossy().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
+        plan_mode: false,
         attachments: vec![path],
         resume: None,
         worktree: None,

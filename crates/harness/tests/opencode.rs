@@ -13,12 +13,13 @@ use comet_harness::{
     CancellationToken, Harness, HarnessError, OpencodeHarness, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DoneStatus, ReasoningLevel, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
+    AgentEvent, DoneStatus, PlanDecision, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
+    UserInputAnswer,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 // ---------------------------------------------------------------------------
 // Fake server
@@ -285,6 +286,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         resume: None,
         worktree: None,
@@ -296,6 +298,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steering) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        plan: comet_harness::PlanControls::off(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -312,6 +315,38 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         interrupt: token.clone(),
     };
     (controls, steer_tx, token)
+}
+
+/// Controls with live plan wiring (§11.3): the requested-mode watch a test
+/// toggles mid-run, and a prepared exit decision whose call is counted — the
+/// engine's half of the bridge, scripted.
+#[allow(clippy::type_complexity)]
+fn plan_controls(
+    mode: bool,
+    decision: PlanDecision,
+) -> (
+    RunControls,
+    mpsc::Sender<SteerMessage>,
+    watch::Sender<bool>,
+    Arc<Mutex<usize>>,
+) {
+    let (controls, steer, _token) = controls();
+    let (mode_tx, mode_rx) = watch::channel(mode);
+    let gate_calls = Arc::new(Mutex::new(0usize));
+    let calls = gate_calls.clone();
+    let controls = RunControls {
+        plan: comet_harness::PlanControls {
+            mode: mode_rx,
+            request_exit: Box::new(move || {
+                *calls.lock().unwrap() += 1;
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(decision.clone());
+                rx
+            }),
+        },
+        ..controls
+    };
+    (controls, steer, mode_tx, gate_calls)
 }
 
 fn harness(fake: &FakeOpencode) -> OpencodeHarness {
@@ -395,6 +430,7 @@ async fn thinking_streams_and_the_turn_settles_only_on_idle() {
         &started,
         AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_test"
     ));
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     assistant_message(&fake, "ses_test", "msg_1");
     // Reasoning part: open snapshot → deltas → closing snapshot (full text,
@@ -467,6 +503,7 @@ async fn foreign_session_idle_never_settles_our_turn() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     assistant_message(&fake, "ses_test", "msg_1");
     idle(&fake, "ses_OTHER");
@@ -500,6 +537,7 @@ async fn model_and_advertised_variant_ride_the_prompt() {
     req.reasoning = Some(ReasoningLevel::XHigh);
     let mut stream = harness(&fake).run(req, controls).await.expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
     assert_eq!(prompts[0]["model"]["providerID"], "anthropic");
@@ -522,6 +560,7 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     assistant_message(&fake, "ses_test", "msg_1");
     fake.emit(json!({
@@ -575,6 +614,7 @@ async fn interrupt_aborts_and_settles_interrupted() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     assistant_message(&fake, "ses_test", "msg_1");
     token.cancel();
@@ -599,6 +639,7 @@ async fn provider_retries_surface_and_cap_out() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     let retry = |attempt: u64| {
         json!({
@@ -650,6 +691,7 @@ async fn session_error_with_no_content_settles_errored() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     fake.emit(json!({
         "type": "session.error",
@@ -699,6 +741,7 @@ async fn subagent_task_streams_tagged_and_settles_from_the_task_part() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     assistant_message(&fake, "ses_test", "msg_1");
     // The task tool part registers the chip and binds by metadata.
@@ -817,6 +860,7 @@ async fn resume_reuses_the_durable_session() {
         &started,
         AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_resume"
     ));
+    let _ = next_event(&mut stream).await; // PlanModeChanged
     wait_posts(&fake, "/session/ses_resume/prompt_async", 1).await;
 
     assistant_message(&fake, "ses_resume", "msg_1");
@@ -833,6 +877,7 @@ async fn slash_command_routes_through_the_command_endpoint() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     let commands = wait_posts(&fake, "/session/ses_test/command", 1).await;
     assert_eq!(commands[0]["command"], "init");
@@ -856,6 +901,7 @@ async fn skill_invocation_routes_through_the_command_endpoint() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     let commands = wait_posts(&fake, "/session/ses_test/command", 1).await;
     assert_eq!(commands[0]["command"], "cometalpha");
@@ -878,6 +924,7 @@ async fn unknown_invocation_stays_prompt_text() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
 
     let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
     let text = prompts[0]["parts"][0]["text"]
@@ -904,6 +951,7 @@ async fn first_prompt_waits_for_the_live_event_subscription() {
         .await
         .expect("run starts");
     let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
     wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
     assert_eq!(
         *fake.first_prompt_had_subscriber.lock().unwrap(),
@@ -934,6 +982,335 @@ async fn first_prompt_waits_for_the_live_event_subscription() {
             ..
         }) if e.contains("Model not found")
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Native plan mode (ARCHITECTURE.md §11.2, OpenCode row)
+// ---------------------------------------------------------------------------
+
+fn keep_planning(feedback: Option<&str>) -> PlanDecision {
+    PlanDecision::keep_planning(feedback.map(str::to_owned))
+}
+
+/// The requested mode IS the `agent` field, on every prompt — and opencode
+/// has no other switch, so a toggle mid-run lands on the next one.
+#[tokio::test]
+async fn plan_mode_rides_the_agent_and_a_toggle_lands_on_the_next_prompt() {
+    let fake = FakeOpencode::start().await;
+    assert!(
+        harness(&fake).plan_mode(),
+        "the composer toggle is gated on this"
+    );
+    let (controls, steer, mode, _gate) = plan_controls(true, keep_planning(None));
+    let mut req = request("plan it");
+    req.plan_mode = true;
+    let mut stream = harness(&fake).run(req, controls).await.expect("run starts");
+    let _ = next_event(&mut stream).await; // SessionStarted
+    let ev = next_event(&mut stream).await;
+    assert!(
+        matches!(&ev, AgentEvent::PlanModeChanged { active: true }),
+        "the run reports the agent it sent, got {ev:?}"
+    );
+
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
+    assert_eq!(prompts[0]["agent"], "plan");
+
+    // Toggled off mid-turn: the queued steer carries the new agent.
+    mode.send(false).expect("toggle");
+    assistant_message(&fake, "ses_test", "msg_1");
+    steer
+        .send(SteerMessage {
+            prompt: "now build it".into(),
+            message_id: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    idle(&fake, "ses_test");
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(&ev, AgentEvent::Steered { .. }), "got {ev:?}");
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 2).await;
+    assert_eq!(prompts[1]["parts"][0]["text"], "now build it");
+    assert_eq!(prompts[1]["agent"], "build");
+
+    assistant_message(&fake, "ses_test", "msg_2");
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+#[tokio::test]
+async fn a_run_outside_plan_mode_prompts_as_the_build_agent() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await; // SessionStarted
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(&ev, AgentEvent::PlanModeChanged { active: false }));
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
+    assert_eq!(prompts[0]["agent"], "build");
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+/// The plan is the file the plan agent writes (it may write nowhere else):
+/// each completed edit/write on it is re-read from disk, once.
+#[tokio::test]
+async fn a_completed_plan_file_edit_streams_the_plan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plans = dir.path().join(".opencode").join("plans");
+    std::fs::create_dir_all(&plans).expect("plans dir");
+    let plan = plans.join("1-veil-port.md");
+    std::fs::write(&plan, "# Veil port\n\n1. Port the veil.\n").expect("plan file");
+
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _mode, _gate) = plan_controls(true, keep_planning(None));
+    let mut req = request("plan it");
+    req.plan_mode = true;
+    let mut stream = harness(&fake).run(req, controls).await.expect("run starts");
+    let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    let part = json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_w", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "tool", "tool": "edit", "callID": "call_edit",
+            "state": {
+                "status": "completed",
+                "input": { "filePath": plan.to_str().unwrap(), "oldString": "", "newString": "x" },
+                "output": "written",
+            },
+        }},
+    });
+    fake.emit(part.clone());
+    let _ = next_event(&mut stream).await; // ToolCall
+    let _ = next_event(&mut stream).await; // ToolResult
+    let ev = next_event(&mut stream).await;
+    assert!(
+        matches!(
+            &ev,
+            AgentEvent::PlanUpdated { text, path }
+                if text == "# Veil port\n\n1. Port the veil.\n"
+                    && path.as_deref() == plan.to_str()
+        ),
+        "got {ev:?}"
+    );
+
+    // The same snapshot re-delivered must not repeat the plan.
+    fake.emit(part);
+    let quiet = tokio::time::timeout(Duration::from_millis(400), stream.next()).await;
+    assert!(quiet.is_err(), "a re-delivered snapshot repeated the plan");
+
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+/// The reported mode is what the opencode TUI itself listens for: a
+/// completed `plan_enter` / `plan_exit` tool part. The plan card already
+/// represents the gate, so those parts carry the signal and NO tool chip —
+/// a rejected `plan_exit` must not render as a failed tool.
+#[tokio::test]
+async fn plan_gate_parts_signal_the_mode_without_a_chip() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _mode, _gate) = plan_controls(false, keep_planning(None));
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged { false }
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    let tool_part = |part_id: &str, tool: &str, call: &str, state: serde_json::Value| {
+        json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "id": part_id, "messageID": "msg_1", "sessionID": "ses_test",
+                "type": "tool", "tool": tool, "callID": call,
+                "state": state,
+            }},
+        })
+    };
+    let completed = || json!({ "status": "completed", "input": {}, "output": "ok" });
+
+    fake.emit(tool_part("prt_e", "plan_enter", "call_enter", completed()));
+    let ev = next_event(&mut stream).await;
+    assert!(
+        matches!(&ev, AgentEvent::PlanModeChanged { active: true }),
+        "the gate part must yield the signal and no chip, got {ev:?}"
+    );
+
+    fake.emit(tool_part("prt_x", "plan_exit", "call_exit", completed()));
+    let ev = next_event(&mut stream).await;
+    assert!(
+        matches!(&ev, AgentEvent::PlanModeChanged { active: false }),
+        "got {ev:?}"
+    );
+
+    // A rejected ("No") plan_exit: neither a chip nor a mode change.
+    fake.emit(tool_part(
+        "prt_r",
+        "plan_exit",
+        "call_reject",
+        json!({ "status": "error", "input": {}, "error": "rejected" }),
+    ));
+    let quiet = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+    assert!(
+        quiet.is_err(),
+        "a rejected plan_exit emitted {quiet:?} instead of nothing"
+    );
+
+    // An ordinary tool still chips as before.
+    fake.emit(tool_part("prt_b", "bash", "call_bash", completed()));
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(&ev, AgentEvent::ToolCall { .. }), "got {ev:?}");
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(&ev, AgentEvent::ToolResult { .. }), "got {ev:?}");
+
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+/// The gate: `plan_exit` asks its "Build Agent" question bound to its own
+/// tool call. That question is the plan decision, not an ordinary ask.
+/// Answering it is the WHOLE of the adapter's job: "keep planning" feedback
+/// is delivered by the engine as the user's next message on the ordinary
+/// steer path, so the adapter posts no prompt of its own.
+#[tokio::test]
+async fn the_plan_exit_question_is_the_exit_gate() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _mode, gate) = plan_controls(true, keep_planning(Some("shorter")));
+    let mut req = request("plan it");
+    req.plan_mode = true;
+    let mut stream = harness(&fake).run(req, controls).await.expect("run starts");
+    let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    // The running plan_exit part binds the callID the question names.
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_x", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "tool", "tool": "plan_exit", "callID": "call_exit",
+            "state": { "status": "running", "input": {} },
+        }},
+    }));
+    fake.emit(json!({
+        "type": "question.asked",
+        "properties": {
+            "id": "que_gate",
+            "sessionID": "ses_test",
+            "questions": [{
+                "question": "Plan at .opencode/plans/1-veil-port.md is complete. \
+                             Would you like to switch to the build agent and start implementing?",
+                "header": "Build Agent",
+                "options": [
+                    {"label": "Yes", "description": "Switch to build agent and start implementing the plan"},
+                    {"label": "No", "description": "Stay with plan agent to continue refining the plan"},
+                ],
+            }],
+            "tool": { "messageID": "msg_1", "callID": "call_exit" },
+        },
+    }));
+
+    let replies = wait_posts(&fake, "/question/que_gate/reply", 1).await;
+    assert_eq!(replies[0]["answers"][0][0], "No");
+    assert_eq!(
+        *gate.lock().unwrap(),
+        1,
+        "the plan bridge answered the gate"
+    );
+    // The feedback is the ENGINE's to deliver: no follow-up prompt here.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fake.posts_to("/session/ses_test/prompt_async").len(),
+        1,
+        "the adapter posted the feedback itself"
+    );
+
+    // An unrelated question is still an ordinary ask.
+    fake.emit(json!({
+        "type": "question.asked",
+        "properties": {
+            "id": "que_plain",
+            "sessionID": "ses_test",
+            "questions": [{
+                "question": "Which color?",
+                "header": "Color",
+                "options": [{"label": "Red", "description": "warm"}],
+            }],
+        },
+    }));
+    let ev = next_event(&mut stream).await;
+    assert!(
+        matches!(
+            &ev,
+            AgentEvent::InputRequested { request_id, .. } if request_id == "que_plain"
+        ),
+        "the gate must not swallow ordinary questions, got {ev:?}"
+    );
+    let replies = wait_posts(&fake, "/question/que_plain/reply", 1).await;
+    assert_eq!(replies[0]["answers"][0][0], "Red");
+
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+/// Approve: the answer is the whole message. opencode itself injects the
+/// build message and switches the agent — the adapter sends nothing else.
+#[tokio::test]
+async fn an_approved_plan_gate_answers_yes_and_prompts_nothing() {
+    let fake = FakeOpencode::start().await;
+    let decision = PlanDecision::approve();
+    let (controls, _steer, _mode, gate) = plan_controls(true, decision);
+    let mut req = request("plan it");
+    req.plan_mode = true;
+    let mut stream = harness(&fake).run(req, controls).await.expect("run starts");
+    let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // PlanModeChanged
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_x", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "tool", "tool": "plan_exit", "callID": "call_exit",
+            "state": { "status": "running", "input": {} },
+        }},
+    }));
+    fake.emit(json!({
+        "type": "question.asked",
+        "properties": {
+            "id": "que_gate",
+            "sessionID": "ses_test",
+            "questions": [{
+                "question": "Plan is complete. Switch to the build agent?",
+                "header": "Build Agent",
+                "options": [{"label": "Yes"}, {"label": "No"}],
+            }],
+            "tool": { "messageID": "msg_1", "callID": "call_exit" },
+        },
+    }));
+
+    let replies = wait_posts(&fake, "/question/que_gate/reply", 1).await;
+    assert_eq!(replies[0]["answers"][0][0], "Yes");
+    assert_eq!(*gate.lock().unwrap(), 1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fake.posts_to("/session/ses_test/prompt_async").len(),
+        1,
+        "approval must not add a prompt of comet's own"
+    );
+
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
 }
 
 #[tokio::test]

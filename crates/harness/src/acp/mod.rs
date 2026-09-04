@@ -51,7 +51,10 @@ use comet_proto::{
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use normalize::{map_update, parse_commands, preferred_allow_option};
+use normalize::{
+    is_plan_exit_call, is_plan_gate_call, map_update, parse_commands, plan_events,
+    preferred_allow_option, preferred_reject_option,
+};
 use subagent::SubagentTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -114,7 +117,40 @@ struct AcpAgentSpec {
     /// Agent-specific advice appended to the stall error chip: what a wedge
     /// usually means for THIS agent and what the user can check.
     stall_hint: &'static str,
+    /// Native plan mode (ARCHITECTURE.md §11.2): the agent's own plan mode id
+    /// for `session/set_mode`, when the agent accepts one it does NOT
+    /// advertise (grok 1.0.13 answers `set_mode {"modeId":"plan"}` with `{}`
+    /// and reports `current_mode_update` although `session/new` carries no
+    /// `modes` — verified live). `None` means "discover it": the run reads
+    /// `session/new`/`session/load`'s `modes.availableModes` and uses the
+    /// advertised plan id, if any.
+    plan_mode_id: Option<&'static str>,
+    /// Server→client JSON-RPC method the agent raises its plan-exit gate on,
+    /// when it has an extension for it (grok: `_x.ai/exit_plan_mode`, params
+    /// `{sessionId, toolCallId, planContent}` — verified live). `None` leaves
+    /// only the generic `session/request_permission` path.
+    plan_exit_method: Option<&'static str>,
+    /// Tool names that identify the plan-exit gate inside a generic
+    /// `session/request_permission` (§11.2 "Permissions elsewhere
+    /// unchanged": only these stop auto-approving, and only in plan mode).
+    plan_exit_tools: &'static [&'static str],
+    /// Server→client JSON-RPC method the agent asks the USER a question on,
+    /// when it has an extension for it (grok: `_x.ai/ask_user_question`,
+    /// params `{sessionId, toolCallId, questions:[{question, options:[{label,
+    /// description}], multiSelect}], mode}` — verified live, 1.0.13). `None`
+    /// leaves only the generic `session/request_permission`-as-question path.
+    ask_user_method: Option<&'static str>,
 }
+
+/// The plan-exit tool as every ACP agent spells it: grok's `exit_plan_mode`
+/// and the CamelCase spelling adapters wrapping Claude's tool emit.
+const PLAN_EXIT_TOOLS: &[&str] = &["exit_plan_mode", "ExitPlanMode"];
+
+/// The mode id an agent that advertises no `modes` returns to when plan mode
+/// is switched off. Verified live against grok 1.0.13: `set_mode
+/// {"modeId":"default"}` is answered `{}` and reported back as
+/// `current_mode_update {"currentModeId":"default"}`.
+const DEFAULT_MODE_ID: &str = "default";
 
 fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String {
     text.to_owned()
@@ -255,6 +291,10 @@ fn grok_spec() -> AcpAgentSpec {
         stall_hint: "The agent process is likely wedged — a stale shared leader \
              process or a hung startup check; comet launches it with --no-leader \
              and --no-auto-update to avoid both.",
+        plan_mode_id: Some("plan"),
+        plan_exit_method: Some("_x.ai/exit_plan_mode"),
+        plan_exit_tools: PLAN_EXIT_TOOLS,
+        ask_user_method: Some("_x.ai/ask_user_question"),
     }
 }
 
@@ -320,6 +360,12 @@ fn hermes_spec() -> AcpAgentSpec {
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
+        // Generic ACP: plan mode exists only when the agent advertises a
+        // `plan` id in `session/new.modes` (ARCHITECTURE.md §11.2).
+        plan_mode_id: None,
+        plan_exit_method: None,
+        plan_exit_tools: PLAN_EXIT_TOOLS,
+        ask_user_method: None,
     }
 }
 
@@ -376,6 +422,12 @@ fn pi_spec() -> AcpAgentSpec {
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
+        // Generic ACP: plan mode exists only when the agent advertises a
+        // `plan` id in `session/new.modes` (ARCHITECTURE.md §11.2).
+        plan_mode_id: None,
+        plan_exit_method: None,
+        plan_exit_tools: PLAN_EXIT_TOOLS,
+        ask_user_method: None,
     }
 }
 
@@ -1076,6 +1128,17 @@ impl Harness for AcpHarness {
         self.spec.reasoning_levels
     }
 
+    /// True only for agents whose plan mode id is known WITHOUT a session
+    /// (grok): the composer gates its toggle by descriptor, and a descriptor
+    /// is built before any session exists. Discovery-only agents (hermes,
+    /// pi) answer false here and still honor `RunRequest.plan_mode` at run
+    /// time when `session/new` advertises a plan mode — the run path reads
+    /// `modes.availableModes` (ARCHITECTURE.md §11.2), so nothing is lost
+    /// once such an agent ships one; only the toggle waits for a static id.
+    fn plan_mode(&self) -> bool {
+        self.spec.plan_mode_id.is_some()
+    }
+
     /// The agent's own CLI, not the adapter: `claude` counts as installed even
     /// when `claude-agent-acp` would arrive via npx, and an npx-reachable
     /// adapter does NOT count when the CLI itself is missing. Explicit
@@ -1154,6 +1217,10 @@ impl Harness for AcpHarness {
             prompt_complete_extension: self.spec.prompt_complete_extension,
             prompt_stall: self.spec.prompt_stall,
             stall_hint: self.spec.stall_hint,
+            plan_mode_id: self.spec.plan_mode_id,
+            plan_exit_method: self.spec.plan_exit_method,
+            plan_exit_tools: self.spec.plan_exit_tools,
+            ask_user_method: self.spec.ask_user_method,
             sessions_root: self.sessions_root.clone(),
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
@@ -1188,6 +1255,10 @@ struct Session {
     sessions_root: Option<PathBuf>,
     prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
+    plan_mode_id: Option<&'static str>,
+    plan_exit_method: Option<&'static str>,
+    plan_exit_tools: &'static [&'static str],
+    ask_user_method: Option<&'static str>,
     interrupt_grace: Duration,
     kill_grace: Duration,
     handshake_timeout: Duration,
@@ -1388,6 +1459,7 @@ fn config_option_sets(
     model: Option<&str>,
     efforts: &[&'static str],
     model_options: &serde_json::Map<String, Value>,
+    plan_mode: bool,
 ) -> Vec<(String, Value)> {
     let Some(options) = session_response
         .get("configOptions")
@@ -1433,6 +1505,12 @@ fn config_option_sets(
                 .filter(|c| available.contains(c))
                 .map(|c| Value::String(c.to_owned()))
                 .or_else(|| {
+                    // A run that asked for plan mode keeps it: the
+                    // unattended no-prompts pick must never overwrite the
+                    // mode the user toggled on (ARCHITECTURE.md §11.4).
+                    if plan_mode {
+                        return None;
+                    }
                     [
                         "bypassPermissions",
                         "bypass_permissions",
@@ -1484,6 +1562,68 @@ fn config_option_sets(
     sets
 }
 
+/// The session's plan mode id (ARCHITECTURE.md §11.2). The spec's static id
+/// wins — grok accepts `plan` although `session/new` advertises no `modes`.
+/// Otherwise read the ACP `SessionModeState` the response carries
+/// (`{currentModeId, availableModes: [{id, name, description}]}`): an exact
+/// `plan` first, else the one id that contains it. An agent advertising modes
+/// without a plan among them has no plan mode, and no `set_mode` is ever sent.
+fn plan_mode_id(session_response: &Value, spec_id: Option<&'static str>) -> Option<String> {
+    if let Some(id) = spec_id {
+        return Some(id.to_owned());
+    }
+    let ids: Vec<&str> = session_response
+        .get("modes")
+        .and_then(|m| m.get("availableModes"))
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .collect();
+    ids.iter()
+        .find(|id| id.eq_ignore_ascii_case("plan"))
+        .or_else(|| ids.iter().find(|id| id.to_lowercase().contains("plan")))
+        .map(|id| (*id).to_owned())
+}
+
+/// The mode `session/set_mode` returns to when the user toggles plan mode
+/// off: the agent's current (non-plan) mode, else the first advertised
+/// non-plan mode, else [`DEFAULT_MODE_ID`] for agents that advertise none.
+fn non_plan_mode_id(session_response: &Value, plan_id: &str) -> String {
+    let modes = session_response.get("modes");
+    let current = modes
+        .and_then(|m| m.get("currentModeId"))
+        .and_then(Value::as_str)
+        .filter(|id| *id != plan_id);
+    let first = || {
+        modes
+            .and_then(|m| m.get("availableModes"))
+            .and_then(Value::as_array)
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str))
+            .find(|id| *id != plan_id)
+    };
+    current.or_else(first).unwrap_or(DEFAULT_MODE_ID).to_owned()
+}
+
+/// The plan-exit bridge handed to the live request handler: what identifies
+/// the gate on this agent's wire, whether plan mode is currently reported
+/// active, and the engine's decision bridge. "Keep planning" feedback is NOT
+/// the adapter's business: the engine delivers it as the user's next message
+/// through the ordinary steer path, so it splits the segment and shows up in
+/// the transcript as a user entry (§11.2 "Feedback delivery").
+struct PlanGate {
+    exit_method: Option<&'static str>,
+    exit_tools: &'static [&'static str],
+    request_exit: std::sync::Arc<RequestExitFn>,
+}
+
+type RequestExitFn =
+    Box<dyn Fn() -> tokio::sync::oneshot::Receiver<comet_proto::PlanDecision> + Send + Sync>;
+
 /// The subagent correlator: grok's spawn-tool + disk-tail tracker (inert
 /// for agents that never emit `subagent_*` updates). It observes the raw
 /// updates ahead of [`map_update`]; its tagged events flow from its own
@@ -1507,6 +1647,8 @@ fn session_update_events(
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
+    plan_mode_id: Option<&str>,
+    plan_exit_tools: &[&str],
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
@@ -1515,7 +1657,26 @@ fn session_update_events(
     match method {
         "session/update" => {
             subagents.observe(update);
-            map_update(update)
+            let mut events = map_update(update);
+            // Native plan mode rides alongside the normal mapping: the
+            // reported mode and the plan text (ARCHITECTURE.md §11.2). Only
+            // for sessions that HAVE a plan mode — no id, no plan events.
+            if let Some(plan_id) = plan_mode_id {
+                // The plan card IS the gate (§11.6): the enter/exit tool
+                // calls must not also fold into a tool chip, where a
+                // rejected exit reads as a stray failed tool. The plan
+                // events derived from the very same update stay.
+                if is_plan_gate_call(update, plan_exit_tools) {
+                    events.retain(|e| {
+                        !matches!(
+                            e,
+                            AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
+                        )
+                    });
+                }
+                events.extend(plan_events(update, plan_id));
+            }
+            events
         }
         "_x.ai/session_notification" => {
             subagents.observe(update);
@@ -1660,7 +1821,36 @@ fn handle_server_request_live(
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
     open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    plan: &PlanGate,
+    ask_user_method: Option<&'static str>,
 ) -> Vec<AgentEvent> {
+    // The agent's ask-the-user extension (grok's `_x.ai/ask_user_question`):
+    // the questions are the request's own, and the answer rides the input
+    // bridge exactly like Claude's AskUserQuestion.
+    if ask_user_method == Some(method) {
+        spawn_ask_user_question(client, id, params, request_input, open_questions);
+        return Vec::new();
+    }
+    // The agent's plan-exit extension (grok's `_x.ai/exit_plan_mode`): the
+    // gate is the request itself, and its `planContent` is the plan.
+    if plan.exit_method == Some(method) {
+        let events = params
+            .get("planContent")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(|text| {
+                vec![AgentEvent::PlanUpdated {
+                    text: normalize::cap_text(text, normalize::PLAN_TEXT_CAP),
+                    path: params
+                        .get("planFilePath")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                }]
+            })
+            .unwrap_or_default();
+        spawn_plan_exit(client, id, plan, open_questions, None);
+        return events;
+    }
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
     }
@@ -1669,6 +1859,20 @@ fn handle_server_request_live(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // The plan-exit gate as a plain permission request (§11.2, the shape a
+    // generic ACP agent raises). It is the ONE permission that stops
+    // auto-approving; every other approval keeps today's unattended
+    // behavior. The TOOL NAME is the whole gate — exactly as Claude keys off
+    // `ExitPlanMode` and grok off `_x.ai/exit_plan_mode`. Gating this on the
+    // reported mode bit instead would silently approve the exit whenever the
+    // agent's `current_mode_update` is absent or arrives after the request.
+    if params
+        .get("toolCall")
+        .is_some_and(|call| is_plan_exit_call(call, plan.exit_tools))
+    {
+        spawn_plan_exit(client, id, plan, open_questions, Some(options));
+        return Vec::new();
+    }
     if !is_user_question(&options) {
         return handle_server_request(client, id, method, params);
     }
@@ -1723,6 +1927,159 @@ fn handle_server_request_live(
         open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
     Vec::new()
+}
+
+/// The questions of grok's `_x.ai/ask_user_question` request: one
+/// `UserInputQuestion` per entry, headed by the tool's own `_meta` label
+/// where the agent sends one (verified live, 1.0.13: `_meta["x.ai/tool"]`
+/// carries `label: "Ask User"`, `kind: "ask_user"` on the matching
+/// `tool_call`).
+fn ask_user_questions(params: &Value) -> Vec<UserInputQuestion> {
+    let header = params
+        .get("_meta")
+        .and_then(|m| m.get("x.ai/tool"))
+        .and_then(|t| t.get("label"))
+        .and_then(Value::as_str)
+        .unwrap_or("Question")
+        .to_owned();
+    params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|q| {
+            let question = q.get("question").and_then(Value::as_str)?;
+            Some(UserInputQuestion {
+                id: new_message_id(),
+                header: header.clone(),
+                question: question.to_owned(),
+                options: q
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|a| a.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|o| o.get("label").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect(),
+                multi_select: q.get("multiSelect").and_then(Value::as_bool) == Some(true),
+            })
+        })
+        .collect()
+}
+
+/// Serve the ask-the-user extension: park the questions on the engine's
+/// input bridge (in a subtask, so the message loop keeps flowing) and answer
+/// with grok's `AskUserQuestionExtResponse` — an internally tagged enum whose
+/// `Accepted` variant is `{"outcome":"accepted","answers":{…}}`, answers keyed
+/// by the QUESTION TEXT with the picked label(s) as the value (an array when
+/// `multiSelect`, a string otherwise) — the same keying Claude's
+/// `AskUserQuestion` uses. A reply without `outcome` fails the tool ("missing
+/// field `outcome`"), and the other variant names are unknown, so a dropped
+/// resolver answers `accepted` with NO answers rather than guessing a cancel
+/// variant. Verified live against grok 1.0.13.
+fn spawn_ask_user_question(
+    client: &RpcClient,
+    id: Value,
+    params: &Value,
+    request_input: &std::sync::Arc<RequestInputFn>,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let questions = ask_user_questions(params);
+    let client = client.clone();
+    let request_input = std::sync::Arc::clone(request_input);
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tokio::spawn(async move {
+        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
+        let mut by_question = serde_json::Map::new();
+        for q in &questions {
+            let Some(labels) = answers
+                .iter()
+                .find(|a| a.question_id == q.id)
+                .map(|a| a.labels.clone())
+            else {
+                continue;
+            };
+            let value = if q.multi_select {
+                Value::Array(labels.into_iter().map(Value::String).collect())
+            } else {
+                Value::String(labels.into_iter().next().unwrap_or_default())
+            };
+            by_question.insert(q.question.clone(), value);
+        }
+        client.respond(
+            &id,
+            json!({ "outcome": "accepted", "answers": Value::Object(by_question) }),
+        );
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// Park the plan-exit gate on the engine's decision bridge and answer the
+/// agent's wire with the user's own answer — never a silent approval. The
+/// wait runs in a subtask so the message loop keeps flowing (the input
+/// bridge's discipline); the gate counts as an open question so the quiet
+/// settle can't read the blocked turn as finished.
+///
+/// `options` present = the gate arrived as a `session/request_permission`.
+/// Approve takes the allow option, keep-planning the reject option, and a
+/// REJECT takes `outcome: "cancelled"` — the spec's own "the user called this
+/// off", which the agent answers with `stopReason: "cancelled"` (mapped to
+/// `DoneStatus::Interrupted`). The engine ends the turn either way; taking
+/// the cancel outcome just lets the agent wind down on its own wire first.
+///
+/// Absent = the agent's own extension request, answered with grok's
+/// `ExitPlanModeExtResponse`: `{approved, abandoned}` — verified live against
+/// 1.0.13, where `approved:false` yields the tool result "The user wants to
+/// revise the plan…" and leaves plan mode active. `abandoned` stays false
+/// even for a reject: the field name is inferred from the binary's TUI
+/// branches and NOT live-verified (tests/fixtures/grok-plan-mode.json), so
+/// the engine's interrupt is the one mechanism that ends the turn here.
+///
+/// `PlanDecision::feedback` is IGNORED here on purpose: the engine delivers
+/// it as the user's next message through the ordinary steer path, on every
+/// harness (§11.2 "Feedback delivery"). The adapter only rejects the gate.
+fn spawn_plan_exit(
+    client: &RpcClient,
+    id: Value,
+    plan: &PlanGate,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    options: Option<Vec<Value>>,
+) {
+    let client = client.clone();
+    let request_exit = std::sync::Arc::clone(&plan.request_exit);
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tokio::spawn(async move {
+        // A dropped resolver (the engine went away) reads as "keep
+        // planning" — the PlanControls contract.
+        let decision = (request_exit)()
+            .await
+            .unwrap_or(comet_proto::PlanDecision::keep_planning(None));
+        match options {
+            Some(options) => {
+                let picked = match (decision.approved, decision.rejected) {
+                    (_, true) => None,
+                    (true, _) => preferred_allow_option(&options),
+                    (false, _) => preferred_reject_option(&options),
+                };
+                match picked {
+                    Some(option_id) => client.respond(
+                        &id,
+                        json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+                    ),
+                    None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
+                }
+            }
+            None => client.respond(
+                &id,
+                json!({ "approved": decision.approved, "abandoned": false }),
+            ),
+        }
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 /// Await a setup request while draining incoming messages, so a `session/load`
@@ -1826,6 +2183,10 @@ async fn run_session(session: Session) {
         sessions_root,
         prompt_transform,
         effort_values,
+        plan_mode_id: spec_plan_mode_id,
+        plan_exit_method,
+        plan_exit_tools,
+        ask_user_method,
         interrupt_grace,
         kill_grace,
         handshake_timeout,
@@ -1835,8 +2196,20 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        plan,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
+    let crate::PlanControls {
+        mode: mut plan_mode_watch,
+        request_exit,
+    } = plan;
+    // The requested mode at launch; `changed()` from here on is a live toggle.
+    let plan_requested = *plan_mode_watch.borrow_and_update();
+    let plan_gate = PlanGate {
+        exit_method: plan_exit_method,
+        exit_tools: plan_exit_tools,
+        request_exit: std::sync::Arc::new(request_exit),
+    };
 
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
@@ -1889,6 +2262,34 @@ async fn run_session(session: Session) {
                 "session/new returned no sessionId".into(),
             ));
         }
+        // Native plan mode (ARCHITECTURE.md §11.4 step 1): the session's own
+        // mode ids, and — when the run asked for plan mode — the switch,
+        // right after session/new/load and before the first prompt.
+        let plan_id = plan_mode_id(&session_response, spec_plan_mode_id);
+        let non_plan_id = plan_id
+            .as_deref()
+            .map(|id| non_plan_mode_id(&session_response, id));
+        let mut plan_entered = false;
+        if plan_requested && let Some(id) = plan_id.as_deref() {
+            match request_draining(
+                &client,
+                &mut incoming,
+                "session/set_mode",
+                json!({ "sessionId": session_id, "modeId": id }),
+            )
+            .await
+            {
+                // The accepted switch IS the agent's report: the
+                // `current_mode_update` it fires here rides the setup drain,
+                // which drops notifications (the doc already holds a load's
+                // history). Live updates map normally from here on.
+                Ok(_) => plan_entered = true,
+                Err(e) => tracing::debug!(
+                    target: "comet_harness::acp",
+                    "session/set_mode {id} rejected (the run stays in the agent's mode): {e}"
+                ),
+            }
+        }
         // ACP has had two model-selection surfaces. Newer config-option agents
         // use category=model below; Grok Build currently advertises only the
         // first-class `models` state and requires `session/set_model`. Paseo
@@ -1923,6 +2324,7 @@ async fn run_session(session: Session) {
             requested_model,
             &efforts,
             &request.model_options,
+            plan_requested,
         ) {
             let mut params = serde_json::Map::new();
             params.insert("sessionId".into(), session_id.clone().into());
@@ -1946,9 +2348,15 @@ async fn run_session(session: Session) {
                 );
             }
         }
-        Ok::<(String, bool), HarnessError>((session_id, steer_ext))
+        Ok::<(String, bool, Option<String>, Option<String>, bool), HarnessError>((
+            session_id,
+            steer_ext,
+            plan_id,
+            non_plan_id,
+            plan_entered,
+        ))
     };
-    let (session_id, steer_ext) = tokio::select! {
+    let (session_id, steer_ext, plan_id, non_plan_id, plan_entered) = tokio::select! {
         res = tokio::time::timeout(handshake_timeout, setup) => {
             let res = res.unwrap_or_else(|_| {
                 // A hung handshake (agent waiting on a login it can never
@@ -2032,6 +2440,17 @@ async fn run_session(session: Session) {
         return;
     }
 
+    // The accepted setup `set_mode` is the agent's own report of the mode it
+    // is in — its `current_mode_update` fired inside the setup drain, which
+    // drops notifications. Report it now, after SessionStarted so the event
+    // lands on a live segment (§11.4 step 1).
+    if plan_entered {
+        if !send(&event_tx, AgentEvent::PlanModeChanged { active: true }).await {
+            shutdown_child(&mut child, kill_grace).await;
+            return;
+        }
+    }
+
     // Subagent correlation + transcript tails: the grok tracker (inert for
     // agents that never emit the `subagent_*` extension updates).
     let mut subagents = SubagentObserver(SubagentTracker::new(
@@ -2081,6 +2500,8 @@ async fn run_session(session: Session) {
     let mut steering_call: Option<(String, BoxFuture<'static, Result<Value, HarnessError>>)> = None;
     let mut steer_backlog: VecDeque<String> = VecDeque::new();
     let mut steering_open = true;
+    // The plan toggle's watch, while its sender lives (see the branch below).
+    let mut plan_toggle_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut done_current = false;
@@ -2216,7 +2637,14 @@ async fn run_session(session: Session) {
                     match inc {
                         Incoming::Notification { method, params } => {
                             let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                                session_update_events(
+                                        &method,
+                                        &params,
+                                        &session_id,
+                                        &mut subagents,
+                                        plan_id.as_deref(),
+                                        plan_exit_tools,
+                                    );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2232,6 +2660,8 @@ async fn run_session(session: Session) {
                                 &params,
                                 &request_input,
                                 &open_questions,
+                                &plan_gate,
+                                ask_user_method,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2390,7 +2820,14 @@ async fn run_session(session: Session) {
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
                     let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                        session_update_events(
+                                        &method,
+                                        &params,
+                                        &session_id,
+                                        &mut subagents,
+                                        plan_id.as_deref(),
+                                        plan_exit_tools,
+                                    );
                     for ev in events {
                         track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -2407,6 +2844,8 @@ async fn run_session(session: Session) {
                         &params,
                         &request_input,
                         &open_questions,
+                        &plan_gate,
+                        ask_user_method,
                     ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -2502,7 +2941,14 @@ async fn run_session(session: Session) {
                             match inc {
                                 Incoming::Notification { method, params } => {
                                     let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                        session_update_events(
+                                        &method,
+                                        &params,
+                                        &session_id,
+                                        &mut subagents,
+                                        plan_id.as_deref(),
+                                        plan_exit_tools,
+                                    );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2518,6 +2964,8 @@ async fn run_session(session: Session) {
                                         &params,
                                         &request_input,
                                         &open_questions,
+                                        &plan_gate,
+                                        ask_user_method,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2855,6 +3303,44 @@ async fn run_session(session: Session) {
                 }
             },
 
+            // The composer's plan toggle, pushed into the live run through
+            // the watch (§11.4 step 2): apply the CLI's own live switch.
+            // The agent's `current_mode_update` reports the result, so
+            // nothing is emitted here. Best-effort and off the loop — a
+            // rejected switch leaves the agent in its mode rather than
+            // failing the run.
+            changed = plan_mode_watch.changed(), if plan_toggle_open && plan_id.is_some() => {
+                if changed.is_err() {
+                    // The toggle's sender is gone (a run carrying no plan
+                    // controls — titling, tests): the mode can never change
+                    // again, and a closed watch reports ready forever.
+                    plan_toggle_open = false;
+                } else {
+                    let want = *plan_mode_watch.borrow_and_update();
+                    let target = if want {
+                        plan_id.clone().unwrap_or_default()
+                    } else {
+                        non_plan_id.clone().unwrap_or_else(|| DEFAULT_MODE_ID.to_owned())
+                    };
+                    let client = client.clone();
+                    let session_id = session_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = client
+                            .request(
+                                "session/set_mode",
+                                json!({ "sessionId": session_id, "modeId": target }),
+                            )
+                            .await
+                        {
+                            tracing::debug!(
+                                target: "comet_harness::acp",
+                                "session/set_mode {target} rejected: {e}"
+                            );
+                        }
+                    });
+                }
+            },
+
             _ = interrupt.cancelled(), if !interrupt_sent => {
                 interrupt_sent = true;
                 interrupted = true;
@@ -3013,7 +3499,13 @@ mod tests {
         // Model switch + effort preference list; fastMode untouched without a
         // model-option selection.
         assert_eq!(
-            config_option_sets(&response, Some("claude-opus-5"), &["medium"], &no_opts),
+            config_option_sets(
+                &response,
+                Some("claude-opus-5"),
+                &["medium"],
+                &no_opts,
+                false
+            ),
             vec![
                 ("model".to_owned(), json!({ "value": "claude-opus-5" })),
                 ("effort".to_owned(), json!({ "value": "medium" })),
@@ -3021,7 +3513,7 @@ mod tests {
         );
         // Effort preference order: first ADVERTISED candidate wins.
         assert_eq!(
-            config_option_sets(&response, None, &["xhigh", "max"], &no_opts),
+            config_option_sets(&response, None, &["xhigh", "max"], &no_opts, false),
             vec![("effort".to_owned(), json!({ "value": "max" }))]
         );
         // contextWindow=1m composes the [1m] model id; fastMode=on matches the
@@ -3030,7 +3522,7 @@ mod tests {
         opts.insert("contextWindow".into(), json!("1m"));
         opts.insert("fastMode".into(), json!("on"));
         assert_eq!(
-            config_option_sets(&response, Some("claude-opus-5"), &["high"], &opts),
+            config_option_sets(&response, Some("claude-opus-5"), &["high"], &opts, false),
             vec![
                 ("model".to_owned(), json!({ "value": "claude-opus-5[1m]" })),
                 (
@@ -3041,16 +3533,28 @@ mod tests {
         );
         // Already-current values and unadvertised models set nothing.
         assert_eq!(
-            config_option_sets(&response, Some("claude-sonnet-5"), &["high"], &no_opts),
+            config_option_sets(
+                &response,
+                Some("claude-sonnet-5"),
+                &["high"],
+                &no_opts,
+                false
+            ),
             Vec::new()
         );
         assert_eq!(
-            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts),
+            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts, false),
             Vec::new()
         );
         // No configOptions advertised → nothing to set.
         assert_eq!(
-            config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts),
+            config_option_sets(
+                &json!({"sessionId": "s"}),
+                Some("x"),
+                &["high"],
+                &no_opts,
+                false
+            ),
             Vec::new()
         );
     }
@@ -3371,9 +3875,73 @@ mod tests {
         });
         let no_opts = serde_json::Map::new();
         assert_eq!(
-            config_option_sets(&codex, None, &[], &no_opts),
+            config_option_sets(&codex, None, &[], &no_opts, false),
             vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
         );
+        // A run that asked for plan mode keeps it: the unattended no-prompts
+        // pick must not overwrite the user's toggle (ARCHITECTURE.md §11.4).
+        assert_eq!(
+            config_option_sets(&codex, None, &[], &no_opts, true),
+            Vec::new()
+        );
+    }
+
+    /// ARCHITECTURE.md §11.2: grok's plan id is the spec's (accepted although
+    /// `session/new` advertises no `modes` — live-verified against 1.0.13);
+    /// generic agents are read off `modes.availableModes`.
+    #[test]
+    fn plan_mode_id_prefers_the_spec_then_the_advertisement() {
+        let bare = json!({ "sessionId": "s" });
+        assert_eq!(plan_mode_id(&bare, Some("plan")).as_deref(), Some("plan"));
+        assert_eq!(plan_mode_id(&bare, None), None);
+
+        let advertised = json!({
+            "sessionId": "s",
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [
+                    { "id": "default", "name": "Default" },
+                    { "id": "planning", "name": "Planning" },
+                ],
+            },
+        });
+        assert_eq!(plan_mode_id(&advertised, None).as_deref(), Some("planning"));
+        // An exact `plan` wins over a merely plan-ish id.
+        let both = json!({
+            "modes": { "availableModes": [{ "id": "planning" }, { "id": "plan" }] },
+        });
+        assert_eq!(plan_mode_id(&both, None).as_deref(), Some("plan"));
+        // Modes without a plan among them: the agent has no plan mode, and
+        // `session/set_mode` is never sent.
+        let no_plan = json!({
+            "modes": { "availableModes": [{ "id": "default" }, { "id": "ask" }] },
+        });
+        assert_eq!(plan_mode_id(&no_plan, None), None);
+    }
+
+    #[test]
+    fn non_plan_mode_id_falls_back_to_the_agents_default() {
+        // Grok advertises nothing; `default` is the id it reports back
+        // (live-verified — every other candidate is silently ignored).
+        assert_eq!(
+            non_plan_mode_id(&json!({ "sessionId": "s" }), "plan"),
+            "default"
+        );
+        let advertised = json!({
+            "modes": {
+                "currentModeId": "ask",
+                "availableModes": [{ "id": "ask" }, { "id": "plan" }],
+            },
+        });
+        assert_eq!(non_plan_mode_id(&advertised, "plan"), "ask");
+        // Already in plan mode: the first other advertised mode.
+        let in_plan = json!({
+            "modes": {
+                "currentModeId": "plan",
+                "availableModes": [{ "id": "plan" }, { "id": "code" }],
+            },
+        });
+        assert_eq!(non_plan_mode_id(&in_plan, "plan"), "code");
     }
 
     #[test]

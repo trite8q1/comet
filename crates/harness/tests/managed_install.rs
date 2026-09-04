@@ -9,11 +9,11 @@
 //!
 //! Single-test binary: it mutates COMET_ADAPTERS_DIR process-wide.
 
+use comet_harness::{AcpHarness, Harness, RunControls};
+use comet_proto::{AgentEvent, RunRequest};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use comet_harness::{AcpHarness, Harness, RunControls};
-use comet_proto::{AgentEvent, RunRequest};
 
 #[tokio::test]
 #[ignore = "network + npm + codex CLI; installs the pinned adapter for real"]
@@ -32,6 +32,7 @@ async fn managed_install_reaches_session_started() {
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
+        plan: comet_harness::PlanControls::off(),
     };
     let request = RunRequest {
         prompt: "say the word ok and stop".into(),
@@ -42,6 +43,7 @@ async fn managed_install_reaches_session_started() {
         cwd: std::env::temp_dir().display().to_string(),
         sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,

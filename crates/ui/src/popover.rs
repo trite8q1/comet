@@ -1021,6 +1021,39 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
     btn
 }
 
+/// Ghost button in the DANGER tone: the destructive choice where a filled
+/// [`btn_danger`] plate would shout — inside a transcript card, next to the
+/// action the user is more likely to want. Same wash and hover mechanics as
+/// [`btn_ghost`]; only the text tone differs, and it brightens on hover the
+/// way the neutral one does.
+pub fn btn_ghost_danger(
+    theme: &Theme,
+    label: &str,
+    fade_key: impl Into<SharedString>,
+) -> gpui::Div {
+    let fade_key = fade_key.into();
+    let mut btn = div()
+        .px(px(12.0))
+        .py(px(6.0))
+        .rounded(px(8.0))
+        .text_size(crate::typography::ui_rems(13.0))
+        .text_color(motion::hover_blend(
+            &fade_key,
+            theme.danger_muted,
+            theme.danger,
+        ))
+        .bg(motion::hover_blend(
+            &fade_key,
+            crate::theme::wash(0.0),
+            theme.danger.opacity(0.10),
+        ))
+        .cursor_pointer()
+        .child(SharedString::from(label.to_string()));
+    btn.interactivity()
+        .on_hover(motion::hover_listener(fade_key));
+    btn
+}
+
 /// Primary button (`btnPrimary`): white fill, near-black text.
 pub fn btn_primary(theme: &Theme, label: &str) -> gpui::Div {
     div()

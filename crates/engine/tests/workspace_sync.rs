@@ -153,6 +153,7 @@ fn run_request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -512,6 +513,7 @@ async fn chat_config_selects_the_run_harness() {
             Some("space-cfg"),
             None,
             Some(ChatConfig {
+                plan_mode: false,
                 harness: HarnessId::Cursor,
                 model: None,
                 reasoning: None,

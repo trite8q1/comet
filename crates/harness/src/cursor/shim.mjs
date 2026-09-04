@@ -11,9 +11,14 @@
 //
 // Protocol: JSONL, one frame per line.
 //   stdin  (engine → shim):
-//     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?}   start / first turn
-//     {"op":"user","prompt"}                            next turn (parked)
+//     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?,"mode"?}
+//                                                       start / first turn
+//     {"op":"user","prompt","mode"?}                    next turn (parked)
 //     {"op":"interrupt"}                                cancel the live run
+//   `mode` is the SDK's AgentModeOption ("plan" | "agent"): the initial
+//   conversation mode on Agent creation and the mode of every send. Cursor
+//   reports no mode of its own — the client owns it, so the engine restamps
+//   it on each turn.
 //   stdout (shim → engine):
 //     {"ev":"ready","agentId","model"?}
 //     {"ev":"text","text","parent"?}        parent = spawning task callId
@@ -227,10 +232,18 @@ function withAuthHint(message) {
   return text;
 }
 
-async function runTurn(prompt) {
+// The SDK's AgentModeOption, or undefined when the engine sent none (an
+// older engine, or a harness with no plan toggle) — the SDK then keeps the
+// agent's current mode.
+function agentMode(msg) {
+  return msg.mode === "plan" || msg.mode === "agent" ? msg.mode : undefined;
+}
+
+async function runTurn(prompt, mode) {
   interrupted = false;
   try {
     run = await agent.send(prompt, {
+      ...(mode ? { mode } : {}),
       onDelta: ({ update }) => {
         try {
           mapUpdate(update);
@@ -284,6 +297,7 @@ function modelSelection(msg) {
 
 async function start(msg) {
   const model = modelSelection(msg);
+  const mode = agentMode(msg);
   const local = { cwd: msg.cwd || process.cwd(), enableAgentRetries: true };
   // Isolated per-run store (see the header above). Resume looks the agent's
   // store up by marker; a markerless (pre-isolation) agent resumes from the
@@ -302,6 +316,7 @@ async function start(msg) {
   }
   const options = {
     model,
+    ...(mode ? { mode } : {}),
     // askQuestion has no public answer channel in this SDK (SDKRequestMessage
     // carries only a request id) — a question would block the run forever.
     // generateImage has nowhere to land in a comet session (ACP parity).
@@ -327,7 +342,7 @@ async function start(msg) {
   }
   if (runDir) rememberAgentDir(agent.agentId, runDir);
   out({ ev: "ready", agentId: agent.agentId, model: agent.model?.id ?? model.id });
-  await runTurn(msg.prompt ?? "");
+  await runTurn(msg.prompt ?? "", mode);
 }
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -347,7 +362,7 @@ rl.on("line", (line) => {
       break;
     case "user":
       chain = chain
-        .then(() => (agent ? runTurn(msg.prompt ?? "") : undefined))
+        .then(() => (agent ? runTurn(msg.prompt ?? "", agentMode(msg)) : undefined))
         .catch((e) => fatal(e));
       break;
     case "interrupt":
