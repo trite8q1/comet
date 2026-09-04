@@ -11,11 +11,6 @@ Don't suggest switching archived rows to archive age.
 Comet is unshipped. Don't require serde aliases or settings-file back-compat for renamed
 presets unless explicitly asked.
 
-### iOS
-NewSessionView's `spaceId` is a `let` baked into the navigation route; there's no in-place
-space picker (switching spaces opens a new screen with an empty draft). Don't request
-`.onChange(of: spaceId)` for the slash catalog.
-
 ### Concurrency
 CommandCache holding one mutex across `probe()` is a deliberate same-cwd coalesce.
 Don't require per-key in-flight futures speculatively.
