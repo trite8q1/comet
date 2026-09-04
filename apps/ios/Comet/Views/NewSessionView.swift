@@ -17,6 +17,7 @@ struct NewSessionView: View {
     @AppStorage("newSessionHarness") private var harness = "claude-code"
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
+    @AppStorage("newSessionPlanMode") private var storedPlanMode = false
 
     @State private var draft = ""
     @State private var selection: TextSelection?
@@ -64,6 +65,17 @@ struct NewSessionView: View {
         if selectedModel.reasoningLevels.isEmpty { return nil }
         if selectedModel.reasoningLevels.contains(storedReasoning) { return storedReasoning }
         return HarnessCatalog.defaultReasoning(for: selectedModel)
+    }
+
+    /// The sticky plan-mode pick, honored only where the picked harness has a
+    /// plan mode to enter (§11.6).
+    private var planMode: Bool {
+        planOffered && storedPlanMode
+    }
+
+    /// Whether `/plan` is on offer here at all — the chip's own gate (§11.9).
+    private var planOffered: Bool {
+        planModeAvailable(harness: harness, catalog: harnesses)
     }
 
     var body: some View {
@@ -199,6 +211,7 @@ struct NewSessionView: View {
         .onChange(of: draft) { syncSlashCommands() }
         .onChange(of: selection) { syncSlashCommands() }
         .onChange(of: harness) { syncSlashCommands() }
+        .onChange(of: liveHarnesses) { syncSlashCommands() }
         .onAppear {
             focused = true
             if model.launchAutosend {
@@ -254,6 +267,9 @@ struct NewSessionView: View {
                         showTraitPicker = true
                     }
                 }
+                if planOffered {
+                    PlanModeChip(active: storedPlanMode) { storedPlanMode.toggle() }
+                }
             }
         }
     }
@@ -266,7 +282,7 @@ struct NewSessionView: View {
                   key: space.map {
                       SlashCatalogKey(deviceId: $0.deviceId, harness: harness, cwd: $0.path)
                   },
-                  model: model)
+                  planOffered: planOffered, model: model)
     }
 
     /// Load picked photos into staged attachments (ComposerView.stage's twin —
@@ -393,10 +409,25 @@ struct NewSessionView: View {
     /// forever on a zombie link (the 2026-08-18 "Sending…" incident).
     private func send() {
         guard let space, canSend else { return }
-        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        var prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // `/plan` is the composer's own command — it IS the chip (§11.9). Here
+        // the chip is the sticky pick, so `/plan` alone just turns it on (no
+        // chat is minted); `/plan <description>` turns it on and sends the
+        // description as the first prompt, in plan mode.
+        var planned = planMode
+        if case .plan(let description) = composerBuiltin(text: prompt, planOffered: planOffered) {
+            storedPlanMode = true
+            planned = true
+            guard let description else {
+                draft = ""
+                return
+            }
+            prompt = description
+        }
         busy = true
         let config = ChatConfig(harness: harness, model: selectedModel.id,
-                                reasoning: reasoning, sandbox: "workspace-write")
+                                reasoning: reasoning, sandbox: "workspace-write",
+                                planMode: planned)
         Task { @MainActor in
             var cwd: String?
             let branch = selectedRef

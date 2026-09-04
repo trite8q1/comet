@@ -186,7 +186,7 @@ feature spec `docs/research/feature-inventory.md` §1.
 - **Composer**: hand-rolled gpui text input (start from Zed's `examples/input.rs`: IME, selection,
   clipboard, key actions), compact↔expanded auto-flip by measured text width, auto-grow 76–260px,
   Enter/Shift+Enter, Send→Steer→Stop morph, drafts + attachments per chat, drag-drop/paste
-  images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance) replacing the composer while input
+  images, QuestionPanel (paged, 1-9 keys, never self-advancing) replacing the composer while input
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade.
 - **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
@@ -469,3 +469,301 @@ and its rows in the tables above, and ships through §10.7:
 - **Claude Code + OpenCode** — verify skills in the handshake list and passthrough; add
   fixture skills and parity tests; aliases if the CLI's own popup matches on them.
 - **Phone composer** — the `/` popup over relayed `ListCommands`.
+
+## 11. Native plan mode (every harness, CLI parity)
+
+Goal: a user can enter and leave the active harness's **own** plan mode from every comet
+composer, watch the harness's current plan update live in a card in the chat thread, and
+answer the harness's own approval gate from that card — on macOS and iOS alike. Comet does
+not invent a planner, does not synthesize plan prompts, and does not approve a plan on the
+user's behalf. Adding a harness means adding an adapter (+ its icon); no plan machinery
+changes.
+
+### 11.1 Vocabulary
+
+- **Plan mode** — the harness's native "explore and propose, do not edit" mode: Claude Code's
+  `plan` permission mode, Codex's `plan` collaboration mode, Cursor's `plan` agent mode,
+  OpenCode's `plan` agent, an ACP agent's `plan` session mode. Comet carries one bit,
+  `plan_mode`, because that is the common denominator every CLI exposes as a toggle
+  (Shift+Tab in Claude/Grok/Codex, Tab in OpenCode, `--mode plan` in Cursor).
+- **Requested mode** — `ChatConfig.plan_mode` (LWW, any device): the mode the user asked for,
+  carried exactly like `model` and `reasoning`. It rides every `RunRequest.plan_mode`.
+- **Reported mode** — what the harness says it is in (`AgentEvent::PlanModeChanged`). The
+  host reconciles the requested mode to the reported mode on every report, so an agent that
+  exits plan mode itself (approved `ExitPlanMode`, OpenCode `plan_exit`, Grok
+  `current_mode_update`) flips the toggle on every device.
+- **Plan** — the harness's current plan text (markdown) as the harness produced it: the plan
+  file Claude/OpenCode write, the Codex `plan` item, Cursor's `createPlan` argument, Grok's
+  `exit_plan_mode` `plan_content`. Comet never edits it.
+- **Plan exit request** — the harness asking the user whether to leave plan mode with this
+  plan (Claude `ExitPlanMode` → `can_use_tool`; OpenCode `plan_exit` → its "Build Agent"
+  question; Grok `exit_plan_mode` → `session/request_permission`). Some CLIs have no
+  agent-initiated gate (Cursor, Codex): there the user leaves plan mode with the toggle, as
+  in the CLI.
+- **Decision** — `PlanDecision`: approve, keep planning with optional feedback, or REJECT.
+  A rejection is a denial that also ends the turn and leaves plan mode, so an adapter that
+  only knows `approved` still puts the right thing on its wire — the engine owns the stop.
+  Build one with `PlanDecision::{approve, keep_planning, reject}`; `approved` and `rejected`
+  are exclusive.
+
+### 11.2 Harness contracts — the CLI is the authority
+
+Verified on this machine (2026-09-02: Claude Code 2.1.258, Codex 0.151–0.152, Cursor SDK 1.0.28,
+OpenCode 1.18.10, Grok 1.0.13, Hermes 0.13.0). The adapter speaks the wire the CLI itself
+speaks; nothing below is emulated.
+
+| Harness | Enter / leave | Reported mode | Plan text | Exit gate |
+| --- | --- | --- | --- | --- |
+| Claude Code | launch `--permission-mode plan`; live `control_request {subtype:"set_permission_mode", mode:"plan"\|"default"}` | `system/init.permissionMode`; `EnterPlanMode` tool result | the plan file the CLI has the model write (`~/.claude/plans/<name>.md`, or `plansDirectory`); the adapter reads it after each Write/Edit on `**/plans/*.md` while in plan mode. `ExitPlanMode`'s `can_use_tool` input carries `plan` + `planFilePath`, injected from disk by the CLI | `can_use_tool` for `ExitPlanMode`: approve = `{"behavior":"allow","updatedInput":…,"updatedPermissions":[{"type":"setMode","mode":"default","destination":"session"}]}`; keep planning = `{"behavior":"deny","message":<feedback or the CLI's rejection sentence>}` and the model continues in plan mode within the same turn |
+| Codex (app-server) | **none**: 0.151–0.152 expose `collaborationMode {mode: plan\|default}` only read-only in `ThreadSettings`; `thread/start` / `turn/start` take no mode. `plan_mode() == false`, so the toggle is hidden | `thread/settings/updated.threadSettings.collaborationMode` | `plan` thread item: `item/plan/delta` streams, `item/completed` is authoritative | none on the wire (the TUI's own affordance). Tripwire: an ignored live test regenerates the schema (`codex app-server generate-json-schema`) and fails when `TurnStartParams`/`ThreadStartParams` gain `collaborationMode` — the §10.4 Cursor-skills precedent |
+| Cursor (SDK shim) | `mode: "agent"\|"plan"` on `Agent({…})` and on every `send(prompt, {mode})` | client-owned; the adapter echoes the mode it sent | `createPlan` tool call `{plan}` | none on the wire; the user leaves with the toggle |
+| OpenCode | `agent: "plan"\|"build"` on every `prompt_async` | `plan_enter` / `plan_exit` tool parts completing (what the TUI listens for) | the plan agent may only edit `.opencode/plans/*.md` (or `<data>/plans/*.md`); the adapter reads the file after each edit/write part on `**/plans/*.md` | `plan_exit` asks a `question` (header "Build Agent", Yes/No) → SSE `question.asked` whose `tool.callID` is the `plan_exit` part. Yes → the server injects its own synthetic build message and switches the agent; No → the tool is rejected and the model keeps planning |
+| Grok Build (ACP) | `session/set_mode {modeId:"plan"}` / `{modeId:"default"}` (both accepted although `session/new` advertises no `modes`; other ids are silently ignored) | `session/update current_mode_update {currentModeId}` (also replayed by `session/load`) | the agent writes `~/.grok/sessions/<cwd>/<session>/plan.md` through its `search_replace` edit tool (the adapter re-reads it after each edit); the `exit_plan_mode` tool call carries no text — the plan reaches the client on the gate request as `planContent` | `enter_plan_mode`/`exit_plan_mode` tools; the exit arrives as the extension reverse request `_x.ai/exit_plan_mode {sessionId, toolCallId, planContent}` (live-captured, `crates/harness/tests/fixtures/grok-plan-mode.json`), answered `{"approved": bool, "abandoned": false}`; a method-not-found reply cancels the turn |
+| Hermes, pi (ACP) | generic: supported only when `session/new.modes.availableModes` lists a `plan` id; `session/set_mode` | `current_mode_update` | ACP `plan` update (already the live todo chip) | generic `request_permission` when the agent raises one |
+| Mock | scripted | scripted | scripted | scripted |
+
+**Feedback delivery.** "Keep planning" feedback is the user's next MESSAGE on every harness,
+delivered by the engine through the ordinary steer path (`RespondPlanExit{feedback}` →
+reject the gate → `Steer{prompt: feedback}`): a visible user entry, a segment split, and the
+CLI's own boundary delivery. The adapter only rejects its gate — Claude's deny carries the
+CLI's generic rejection sentence, OpenCode answers "No", Grok answers `approved: false`. This
+is what each CLI does itself: Claude Code's dialog denies with that sentence and sends the
+typed feedback as a user message (`feedbackIsFromUser`); OpenCode's and Grok's users type it
+after answering No. Raw feedback inside a tool error read to the model as an injected
+instruction (2026-09-02).
+
+The composer takes typed feedback for a parked gate on every harness ("Describe what to
+change in the plan…"). Delivery follows the harness's steering: a step-boundary steerer
+(Claude) takes the message inside the turn, right after the rejected gate. A turn-boundary
+agent (Grok, OpenCode, Cursor, Hermes, pi) would queue it behind a turn that, after a
+rejection, asks its own follow-up question or raises the gate again — the feedback would wait
+behind the user forever — so the host cancels that turn first (the same abort Claude's TUI
+does) and the feedback opens the next turn on the resumed session. Grok's ACP gate reply
+carries no feedback field (live-probed: ~30 candidate names, none reached the "The user
+said:" branch), so this is the native path there. A message sent while a run is parked on a
+question or gate is queued and the session keeps reading AwaitingInput, never Working.
+That cancel is a *replacement*, not a Stop: the engine suppresses the cancelled run's terminal
+Idle (`interrupt_for_replacement`), so the Working→Idle edge — the "done" chime and the
+settled sidebar dot, on every device — never fires for a turn the user did not end. The same
+path covers a live run restarted for a changed run configuration.
+
+**Rejection delivery.** A REJECT is a denial the engine follows with a real stop, so no
+adapter had to learn a new wire: Claude's deny sentence already tells the model to stop and
+wait, OpenCode still answers "No", and the turn ends because the engine interrupts it. Two
+wires do carry a native abort and take it, because letting the agent wind itself down beats
+killing it mid-step: generic ACP answers `outcome: "cancelled"` (the spec's own "called off",
+returned as `stopReason: "cancelled"` ⇒ `DoneStatus::Interrupted`) instead of the reject
+OPTION, which means keep planning. Grok's `ExitPlanModeExtResponse` has an `abandoned` field
+that reads like the third TUI branch, but the NAME is inferred from the binary rather than
+live-verified (`crates/harness/tests/fixtures/grok-plan-mode.json` lists it as unverified), so
+comet keeps sending `abandoned: false` and lets the interrupt do the work. Cursor and Codex
+have no gate to reject at all.
+
+**Question panels never advance or submit on their own.** A pick lands and the page STAYS —
+between pages as well as on the last one; every step forward is Next, Submit or Skip (which
+resolves the request with no answers — the "declined" signal every adapter already carries).
+Comet used to page itself 220ms after a single-select pick, which spent the answer before the
+user could reconsider it and made Back the only way to look again. Next/Submit is now the one
+way forward, so it is also INERT until the page has an answer (a pick or typed text) — dimmed
+alone would let a press skip a question and send an empty answer for it.
+
+**Gate tools are the card, not chips.** The tool calls that ARE the gate (`ExitPlanMode` /
+`EnterPlanMode`, `exit_plan_mode` / `enter_plan_mode`, `plan_exit` / `plan_enter`,
+`createPlan`) never fold into tool chips: the plan card is their rendering, and a rejected
+gate would otherwise read as a failed tool. Adapters still derive `PlanUpdated` /
+`PlanModeChanged` from them.
+
+**Agent questions on extension channels.** Grok asks its user questions through the ACP
+extension request `_x.ai/ask_user_question {sessionId, toolCallId, questions[{question,
+options[{label, description}], multiSelect}], mode}`, answered `{"outcome":"accepted",
+"answers":{<question text>: <label | [labels]>}}` (live-captured; a reply without `outcome`
+fails the tool). It rides the same input bridge as Claude's `AskUserQuestion`.
+
+**Permissions elsewhere unchanged.** Every other `can_use_tool` / approval keeps today's
+unattended auto-approve. The one thing that stops being auto-approved is the plan exit gate.
+
+### 11.3 One architecture, per-harness adapters
+
+```
+composer toggle ──SetChatConfig{plan_mode}──▶ registry (LWW)            ┐ requested
+                └─QueueCommand SetPlanMode──▶ host ─watch──▶ adapter    │
+                                                                        ▼
+adapter ──PlanModeChanged / PlanUpdated / PlanExitRequested──▶ engine fold ──▶ session doc
+                                                                        │       MessagePart::Plan
+card Approve/Keep planning ──QueueCommand RespondPlanExit──▶ host ─oneshot──▶ adapter
+```
+
+- `comet-proto`: `RunRequest.plan_mode: bool`, `ChatConfig.plan_mode: bool` (both serde-default
+  false, additive); `AgentEvent::{PlanModeChanged{active}, PlanUpdated{text, path},
+  PlanExitRequested{request_id}, PlanExitResolved{request_id, approved, rejected}}`;
+  `PlanDecision`.
+  `HarnessDescriptor.plan_mode: bool` (engine registry) so composers gate the toggle by
+  descriptor, never by harness id.
+- `comet-harness`: `Harness::plan_mode() -> bool` (default false). `RunControls` gains
+  `plan_mode: watch::Receiver<bool>` (initial = `request.plan_mode`; the adapter applies each
+  change through the CLI's live switch) and `request_plan_exit: Fn(PlanExitRequest) ->
+  oneshot::Receiver<PlanDecision>` — the same shape as `request_input`, and like it the ENGINE
+  mints the request id and emits `PlanExitRequested`/`PlanExitResolved` (an adapter must never
+  emit its own copy; §10-era bug class). Plan-file reading lives in the adapter whose CLI
+  keeps a plan file; nothing outside `crates/harness` knows a plan path.
+- `comet-doc`: `MessagePart::Plan { id, plan, status, request_id, path }` with `status ∈
+  {drafting, awaitingApproval, approved, revising, rejected}`. A peer too old to know a
+  status string decodes it as `drafting` (pinned on both surfaces) — the card can read wrong
+  on that one device during a fleet skew, never unanswerable. The body field is `plan` (never `text`)
+  so a pre-plan desktop build renders an invisible part and iOS drops the unknown kind — the
+  `Reasoning` precedent. One plan part per segment, fixed id `plan`, refreshed in place by
+  every `PlanUpdated` (the `LIVE_PLAN_TOOL_ID` singleton trick). Text capped at 128 KB.
+  Ledger: `SessionCommandPayload::{RespondPlanExit{request_id, approved, rejected, feedback},
+  SetPlanMode{active}}`. No new RPC method. `rejected` is a FIELD, not a new payload kind,
+  deliberately: a phone writes commands straight into the doc, and a host too old to know a
+  new `kind` would drop the whole entry and leave the gate parked forever — an unknown field
+  is ignored instead, and the answer lands as the keep-planning half it can express.
+- `comet-engine`: `RunHandle` carries the `watch::Sender<bool>` and a `pending_plan_exits`
+  map mirroring `pending_inputs`; `respond_plan_exit()` mirrors `respond_input()`;
+  `set_plan_mode()` pushes into a live run and is a no-op `Applied` when idle (the next Run
+  carries the config value). `PlanExitRequested` sets `SessionStatus::AwaitingInput`; the
+  quiesce watchdog counts an `awaitingApproval` plan part as in flight. `RuntimeConfig`
+  excludes `plan_mode`: a mode change never replaces the process; routing a Run into a live
+  runtime first pushes the request's mode through the watch. On `PlanModeChanged` the host
+  writes `ChatConfig.plan_mode` (reconcile). `rpc.rs` stays harness-agnostic.
+
+### 11.4 Session lifecycle
+
+1. Toggle on (idle chat): `SetChatConfig{plan_mode:true}`; the next send's `RunRequest.plan_mode`
+   is true; the adapter launches in plan mode (Claude flag, Cursor `mode`, OpenCode `agent`,
+   ACP `set_mode` right after `session/new`). The adapter reports `PlanModeChanged(true)` from
+   the CLI's own signal where one exists.
+2. Toggle while a run is live: `SetChatConfig` + `QueueCommand SetPlanMode`; the host pushes the
+   watch; the adapter applies the CLI's live switch (`set_permission_mode`, `session/set_mode`,
+   next `send`/`prompt_async` mode). A later Run routed into the same runtime pushes its mode
+   first, then steers.
+3. Planning: every plan-text change → `PlanUpdated` → the segment's plan part refreshes →
+   both UIs repaint the card (STREAM_COMMIT_MS coalescing as for any part).
+4. Exit gate: adapter → `request_plan_exit` → engine `PlanExitRequested` → part `awaitingApproval`,
+   session `AwaitingInput`. The card shows Approve / Keep planning; the composer's placeholder
+   invites feedback and its send resolves the gate with `approved:false` + the text.
+   `RespondPlanExit` (ledger, host-executed, idempotent by request id) → resolver → the adapter
+   answers the wire → `PlanExitResolved` → part `approved`/`revising`/`rejected`. Approval also
+   yields `PlanModeChanged(false)` from the CLI's own signal, which reconciles the toggle.
+   REJECT is the third answer: the gate is answered on the harness's own wire FIRST (so the
+   interrupt's own drain finds no resolver to auto-decline), then the turn is ended with a
+   plain `interrupt` — not a replacement, because the user DID end this turn and its Idle edge
+   is theirs to hear — and plan mode is left with the same config write the toggle makes, since
+   a torn-down run can never report a mode itself. Ordering is load-bearing: `PlanExitResolved`
+   rides `engine_tx`, which the run loop's `biased` select drains ahead of the harness stream,
+   so the reject folds before the interrupt's `Done` stamps the part on its way out.
+5. No gate (Cursor, Codex, an ACP agent without one): the plan part stays `drafting` with the
+   final text; the user flips the toggle and sends the next message, as in the CLI.
+6. Recovery: a gate still parked when its run ends (Stop, an error, the turn finishing) is
+   answered "keep planning" as the run tears down, and its part settles `revising` with it —
+   never a silent approval, and never a card left actionable on a dead request id. Unlike an
+   unanswered question there is no orphan fallback: a later `RespondPlanExit` is rejected,
+   because re-asking the gate would be comet inventing an approval. A run revived after an
+   engine restart relaunches with the chat's requested mode.
+
+### 11.5 Plan state and sync
+
+The plan part is the plan state: host-written, replicated through the session doc's existing
+row protocol to every device and to the phone's `SessionStore` — no sidecar, no meta key, no
+second channel. Each plan-mode episode leaves its card in the transcript at the turn that
+produced it (as the CLIs' own transcripts do); within an episode the card updates in place.
+`ChatConfig.plan_mode` is the only other bit and it already syncs through the registry.
+
+### 11.6 Chat card (both surfaces)
+
+Comet chip card (radius 9, `hairline(0.07)` border, `ink(0.03)` wash; iOS `whiteAlpha` twins):
+
+- Header: the active harness's brand icon tile (`ChatConfig.harness` → `icons::harness_brand_icon`
+  / `BrandMark.forHarness`; never a language/file icon), "Plan" label, the plan's first `#`
+  heading MINUS a "Plan" genus it repeats (`# Plan` and `# Plan: port the veil` are the two
+  commonest shapes agents write, and the label already says the word — an empty title slot
+  beats saying it twice; only punctuation separates a genus from a name, so `# Plan for the
+  veil port` keeps every word), a right-aligned status pill (Drafting… / Awaiting approval / Approved /
+  Revising / Rejected — accent while waiting, danger when rejected, quiet otherwise), chevron.
+- Plan file: `MessagePart::Plan.path` on its own row under the header, ABOVE the fold, so a
+  collapsed card still says where the plan lives. Rendered through the one shared path
+  treatment (`ui::file_path` / the phone's twin), which is also what the diff file header
+  uses: monospace at the file-path tone, `$HOME` shortened to `~`, and the basename pinned so
+  truncation eats the directory and never the filename (a live plan path runs to 239 chars).
+  No row at all when the harness keeps no plan file (Cursor, Codex, generic ACP).
+  CLICK COPIES it (long-press on the phone, that surface's only copy idiom), and what lands on
+  the clipboard is the RAW path, never the `~`-shortened line — a path is copied to be used,
+  and `~` resolves against a home directory the path may not belong to. Desktop flashes a tick
+  after the basename for 1.2s (`file_path::PathCopy`, one latch for both path sites, so the
+  confirmation cannot drift the way this crate's four hand-rolled copy sites already have);
+  the phone shows none, matching its own two copy sites. Click-to-copy rather than text
+  selection: gpui has no selectable-text primitive, the crate's selection machinery is scoped
+  to the transcript's markdown registry, and a selectable path would have to give up the
+  two-part layout that keeps the filename on screen.
+- Body: the plan markdown through the shared markdown renderer (fenced code blocks styled as
+  in the diff card); expanded while drafting or awaiting approval, collapsed once approved,
+  toggled with the chip fold tween (`Motion.resize` on iOS); reduced motion honored.
+- Actions (only `awaitingApproval`): **Reject**, **Keep planning**, **Approve** →
+  `RespondPlanExit`. Weighted by what they cost: Reject is a ghost in the danger tone (quiet —
+  it is the destructive one, but the card lives mid-transcript where a red plate would shout),
+  Keep planning a neutral ghost, Approve the accent. Typing in the composer is always the
+  keep-planning answer; rejecting is a deliberate button press.
+- Composer: a "Plan" toggle chip beside model/traits, shown only when the resolved harness
+  descriptor has `plan_mode`. Same behavior on the phone (`ComposerChip`).
+
+### 11.7 macOS / iOS sharing
+
+Shared: proto types, doc part + fold, ledger payloads, engine (all Rust), and the phone's
+Swift mirrors of exactly those (`MessagePart.plan`, `ChatConfig.planMode`,
+`RunRequest.planMode`, `respondPlanExit`/`setPlanMode` commands). Platform-only: the card view
+and the toggle chip, each on its platform's existing chip/markdown primitives.
+
+### 11.8 Verification — the loop every workstream runs
+
+`scripts/verify-plan-mode.sh` (mirrors `verify-skills.sh`; `--live` adds ignored real-CLI tests,
+`--ios` the phone unit tests):
+
+1. Guards: no `HarnessId::` in the plan paths of `crates/ui/src/transcript.rs`,
+   `crates/ui/src/composer.rs`, `crates/engine/src/rpc.rs`, or the phone's plan files; no
+   plan-file path handling (`plans/`) and no plan/implement prompt text outside `crates/harness`.
+2. Proto/doc: old-wire JSON without `planMode` parses; `Plan` part round-trip; fold lifecycle
+   drafting → awaitingApproval → approved/revising; continuation split with a large plan.
+3. Engine: `RespondPlanExit` resolves the parked resolver and emits `PlanExitResolved`;
+   `SetPlanMode` reaches a live run's watch and is `Applied` when idle; `PlanExitRequested` →
+   `AwaitingInput`; reconcile writes `ChatConfig.plan_mode`.
+4. Adapters against fixture CLIs: fake-claude `plan` scenario (init `permissionMode`, plan-file
+   Write, `ExitPlanMode` `can_use_tool`; the recorded allow/deny payloads and the
+   `set_permission_mode` line); fake-acp (`set_mode`, `current_mode_update`, exit
+   `request_permission`); fake-cursor-shim (`mode` on run/steer, `createPlan`); opencode fake
+   server (`agent` on prompt, `plan_exit` question routing); codex schema tripwire.
+5. UI: row building from `Plan` parts; toggle hidden for a descriptor without `plan_mode`;
+   iOS `partFrom` decode + card row tests.
+6. fmt on changed files, clippy with no new diagnostics (`scripts/clippy-new-warnings.py`).
+
+Rule: no feature lands without a test in this loop that failed before the change and passes
+after it.
+
+### 11.9 `/plan` — the one composer-owned slash command
+
+Every CLI with a plan mode also offers it as a slash command: Claude Code's `/plan`
+("Enable plan mode or view the current session plan", hint `[open|share|<description>]`) is a
+TUI-local command (`local-jsx`) — it never reaches the model over stream-json, so passing the
+text through does nothing; Grok's `/plan [description]` ("Enter plan mode") is the same shape;
+Codex's `/plan` switches its collaboration mode; Cursor and OpenCode have none. §10 forbids
+comet inventing commands, and this is the deliberate exception, for the same reason plan mode
+itself is a comet toggle: the command IS the toggle, and the toggle already drives each
+harness's own mode switch natively.
+
+- `/plan` enters plan mode for the chat (exactly the composer chip); `/plan <description>`
+  enters plan mode and sends the description as the prompt. Leaving plan mode is the chip
+  (the CLIs' Shift+Tab); no `/plan off` exists anywhere natively, so none here.
+- Offered only where the resolved harness's descriptor has `plan_mode` (§11.6); elsewhere
+  `/plan …` is ordinary prompt text, exactly as §10.5 says for an unknown `/name`.
+- Listed first in the slash popup with comet's own description ("Enter plan mode",
+  hint `[description]`), and it SHADOWS a catalog entry of the same name (Claude and Grok both
+  list `plan`): one behavior, one report path (`ChatConfig.plan_mode` → `RunRequest.plan_mode`
+  / `SetPlanMode`, reconciled from the harness's reported mode), on every harness.
+- One grammar (`comet_harness::commands::split_invocation`), one resolver per surface
+  (`composer_builtin` on the desktop, `composerBuiltin` on the phone), pure and tested; neither
+  names a harness.
+
+### 11.10 Workstreams (parallel, isolated)
+
+Shared substrate first (proto, harness trait, doc, engine, mock, verify skeleton); then, each
+owning only its files and fixtures: **Claude**, **Codex** (decode + tripwire), **Cursor**,
+**OpenCode**, **ACP** (Grok live-verify), **desktop composer + card**, **phone composer + card**.

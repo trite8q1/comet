@@ -108,6 +108,7 @@ fn run_payload(message_id: &str) -> SessionCommandPayload {
             cwd: "~".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
+            plan_mode: false,
             attachments: Vec::new(),
             worktree: None,
             resume: None,

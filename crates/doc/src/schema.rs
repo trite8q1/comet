@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
 use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
-use crate::parts::{MessagePart, MessageStatus, SubagentStatus};
+use crate::parts::{MessagePart, MessageStatus, PlanStatus, SubagentStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocError {
@@ -78,6 +78,19 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Plan body for `kind: "plan"` (additive). On its own field for the same
+    /// reason as `reasoning`: old readers must not render a plan as prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<String>,
+    /// Plan lifecycle (`drafting`/`awaitingApproval`/`approved`/`revising`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_status: Option<String>,
+    /// The parked plan-exit request while awaiting approval (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    /// The plan file's path when the harness keeps one (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     /// Tool output summary (additive — absent on old rows and old writers;
     /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +187,26 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             resolved: Some(*resolved),
             ..Default::default()
         },
+        MessagePart::Plan {
+            id,
+            plan,
+            status,
+            request_id,
+            path,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "plan".into(),
+            plan: Some(plan.clone()),
+            plan_status: Some(
+                serde_json::to_value(status)?
+                    .as_str()
+                    .unwrap_or("drafting")
+                    .to_owned(),
+            ),
+            request_id: request_id.clone(),
+            path: path.clone(),
+            ..Default::default()
+        },
         MessagePart::Error { id, message } => DocPartJson {
             id: id.clone(),
             kind: "error".into(),
@@ -228,6 +261,16 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "reasoning" => MessagePart::Reasoning {
             id: p.id,
             text: p.reasoning.unwrap_or_default(),
+        },
+        "plan" => MessagePart::Plan {
+            id: p.id,
+            plan: p.plan.unwrap_or_default(),
+            status: p
+                .plan_status
+                .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                .unwrap_or(PlanStatus::Drafting),
+            request_id: p.request_id,
+            path: p.path,
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -657,6 +700,22 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
         let t = map.insert_container("reasoning", LoroText::new())?;
         t.insert(0, reasoning)?;
     }
+    if let Some(plan) = &doc_part.plan {
+        // LoroText too: a plan is rewritten whole on every draft (the
+        // adapter re-reads the file), and `LoroText::update` diffs the
+        // rewrite into edits instead of re-logging the whole body.
+        let t = map.insert_container("plan", LoroText::new())?;
+        t.insert(0, plan)?;
+    }
+    if let Some(plan_status) = &doc_part.plan_status {
+        map.insert("planStatus", plan_status.as_str())?;
+    }
+    if let Some(request_id) = &doc_part.request_id {
+        map.insert("requestId", request_id.as_str())?;
+    }
+    if let Some(path) = &doc_part.path {
+        map.insert("path", path.as_str())?;
+    }
     if let Some(call) = &doc_part.call {
         map.insert("call", loro_value_from_json(call))?;
     }
@@ -807,6 +866,21 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         return Some(MessagePart::Reasoning {
             id,
             text: reasoning.to_owned(),
+        });
+    }
+    if let Some(plan) = obj.get("plan").and_then(|x| x.as_str()) {
+        return Some(MessagePart::Plan {
+            id,
+            plan: plan.to_owned(),
+            status: obj
+                .get("planStatus")
+                .and_then(|s| serde_json::from_value(s.clone()).ok())
+                .unwrap_or(PlanStatus::Drafting),
+            request_id: obj
+                .get("requestId")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned),
+            path: obj.get("path").and_then(|x| x.as_str()).map(str::to_owned),
         });
     }
     if let Some(text) = obj.get("text").and_then(|x| x.as_str()) {
@@ -1111,6 +1185,23 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
                 .map_err(|e| DocError::Schema(e.to_string()))?;
         }
     }
+    if let Some(plan) = &doc_part.plan {
+        // The plan's normal path: every draft is a whole rewrite, diffed
+        // into the LoroText by `update`.
+        if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("plan") {
+            t.update(plan, Default::default())
+                .map_err(|e| DocError::Schema(e.to_string()))?;
+        }
+    }
+    if let Some(plan_status) = &doc_part.plan_status {
+        map.insert("planStatus", plan_status.as_str())?;
+    }
+    if let Some(request_id) = &doc_part.request_id {
+        map.insert("requestId", request_id.as_str())?;
+    }
+    if let Some(path) = &doc_part.path {
+        map.insert("path", path.as_str())?;
+    }
     Ok(())
 }
 
@@ -1170,6 +1261,84 @@ mod tests {
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         }
+    }
+
+    /// The plan part rides its own `plan` field (never `text`) with the
+    /// lifecycle fields, and reads back intact.
+    #[test]
+    fn plan_part_round_trips_on_its_own_field() {
+        let part = MessagePart::Plan {
+            id: "plan".into(),
+            plan: "# Do it\n\n1. step".into(),
+            status: PlanStatus::AwaitingApproval,
+            request_id: Some("req-1".into()),
+            path: Some("/x/notes/do-it.md".into()),
+        };
+        let json = to_doc_part(&part).expect("to doc part");
+        assert_eq!(json.kind, "plan");
+        assert_eq!(json.plan.as_deref(), Some("# Do it\n\n1. step"));
+        assert!(json.text.is_none(), "a plan must never ride `text`");
+        assert_eq!(json.plan_status.as_deref(), Some("awaitingApproval"));
+        assert_eq!(from_doc_part(json), part);
+        // Salvage path (strict parse failed elsewhere on the row).
+        let raw = serde_json::json!({
+            "id": "plan", "kind": "plan", "plan": "# P", "planStatus": "approved"
+        });
+        assert_eq!(
+            salvage_part(&raw, "e1", 0),
+            Some(MessagePart::Plan {
+                id: "plan".into(),
+                plan: "# P".into(),
+                status: PlanStatus::Approved,
+                request_id: None,
+                path: None,
+            })
+        );
+    }
+
+    /// Every lifecycle string round-trips, and a status this build does not
+    /// know degrades to `Drafting` instead of dropping the part. That is the
+    /// fleet-skew contract for adding a variant (the phone pins the same
+    /// rule in `PlanModeTests`): the card may read wrong on an older peer,
+    /// it is never unreadable.
+    #[test]
+    fn plan_status_round_trips_and_an_unknown_one_degrades() {
+        for (status, wire) in [
+            (PlanStatus::Drafting, "drafting"),
+            (PlanStatus::AwaitingApproval, "awaitingApproval"),
+            (PlanStatus::Approved, "approved"),
+            (PlanStatus::Revising, "revising"),
+            (PlanStatus::Rejected, "rejected"),
+        ] {
+            let part = MessagePart::Plan {
+                id: "plan".into(),
+                plan: "# P".into(),
+                status,
+                request_id: None,
+                path: None,
+            };
+            let json = to_doc_part(&part).expect("to doc part");
+            assert_eq!(json.plan_status.as_deref(), Some(wire), "{status:?}");
+            assert_eq!(from_doc_part(json), part, "{status:?}");
+        }
+        let future = serde_json::json!({
+            "id": "plan", "kind": "plan", "plan": "# P", "planStatus": "fromTheFuture"
+        });
+        let strict: DocPartJson = serde_json::from_value(future.clone()).expect("decodes");
+        assert!(matches!(
+            from_doc_part(strict),
+            MessagePart::Plan {
+                status: PlanStatus::Drafting,
+                ..
+            }
+        ));
+        assert!(matches!(
+            salvage_part(&future, "e1", 0),
+            Some(MessagePart::Plan {
+                status: PlanStatus::Drafting,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1467,7 +1636,12 @@ mod tests {
             },
         );
         writer.sync(&folded).unwrap();
-        fold_event_into_parts(&mut folded, &AgentEvent::TextDelta { text: "Done".into() });
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::TextDelta {
+                text: "Done".into(),
+            },
+        );
         writer.sync(&folded).unwrap();
         writer.finish(&folded, MessageStatus::Complete).unwrap();
 

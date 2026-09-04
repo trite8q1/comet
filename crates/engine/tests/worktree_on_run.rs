@@ -117,6 +117,7 @@ fn run_payload(message_id: &str, repo_path: &str) -> SessionCommandPayload {
             cwd: repo_path.into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
+            plan_mode: false,
             attachments: Vec::new(),
             resume: None,
             worktree: Some(WorktreeSpec {

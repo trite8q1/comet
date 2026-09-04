@@ -76,7 +76,7 @@ Transcript/
   Veil.swift            paint-only streaming fade (EMA-tracked duration,
                         1−(1−p)^1.6 curve)
 Composer/               glass pill, Send→Steer→Stop morph, QuestionPanel
-                        (paged, numbered options, 220ms auto-advance)
+                        (paged, numbered options, manual Next/Submit)
 Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
                         Geist/Geist Mono, motion timings + flavour words
 ```

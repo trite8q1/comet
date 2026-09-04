@@ -17,7 +17,10 @@ pub(crate) enum Frame {
     RateLimit(RateLimitFrame),
     Result(ResultFrame),
     ControlRequest(ControlRequestFrame),
-    /// control_response / control_cancel_request / anything unknown.
+    /// The CLI's answer to a control request WE sent (interrupt,
+    /// set_permission_mode).
+    ControlResponse(ControlResponseFrame),
+    /// control_cancel_request / anything unknown.
     Other,
 }
 
@@ -33,6 +36,11 @@ pub(crate) struct SystemFrame {
     pub cwd: String,
     #[serde(default)]
     pub session_id: String,
+    /// `init`: the permission mode the CLI actually started in
+    /// (`default`/`acceptEdits`/`bypassPermissions`/`plan`/…) — the reported
+    /// plan mode of ARCHITECTURE.md §11.1.
+    #[serde(default, alias = "permissionMode")]
+    pub permission_mode: String,
     /// `task_notification` (a background subagent settling): the spawning
     /// Agent tool's id — the only TAGGED terminal signal the 2.1.x wire has
     /// for a background subagent (its frames otherwise just stop).
@@ -180,6 +188,24 @@ pub(crate) struct ControlRequestBody {
     pub input: Value,
 }
 
+/// The CLI's answer to one of OUR control requests.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ControlResponseFrame {
+    #[serde(default)]
+    pub response: ControlResponseBody,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ControlResponseBody {
+    /// `success` or `error`.
+    #[serde(default)]
+    pub subtype: String,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// Parse one stdout JSONL line. `Err` = not JSON; unknown types = `Other`.
 pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
     let value: Value = serde_json::from_str(line)?;
@@ -192,6 +218,7 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
         "rate_limit_event" => Frame::RateLimit(serde_json::from_value(value)?),
         "result" => Frame::Result(serde_json::from_value(value)?),
         "control_request" => Frame::ControlRequest(serde_json::from_value(value)?),
+        "control_response" => Frame::ControlResponse(serde_json::from_value(value)?),
         _ => Frame::Other,
     };
     Ok(frame)
@@ -264,12 +291,47 @@ pub(crate) fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
 }
 
+/// `can_use_tool` allow payload for the plan-exit gate: the tool input rides
+/// back unchanged, plus the permission update that leaves plan mode for the
+/// rest of the session — what the CLI's own "Yes" writes (ARCHITECTURE.md
+/// §11.2).
+pub(crate) fn plan_exit_allow_response(updated_input: Value) -> Value {
+    json!({
+        "behavior": "allow",
+        "updatedInput": updated_input,
+        "updatedPermissions": [
+            { "type": "setMode", "mode": "default", "destination": "session" },
+        ],
+    })
+}
+
+/// `can_use_tool` deny payload. `message` is REQUIRED by the control-channel
+/// schema and becomes the tool result the model reads.
+pub(crate) fn deny_response(message: &str) -> Value {
+    json!({ "behavior": "deny", "message": message })
+}
+
 /// Client→CLI interrupt control request.
 pub(crate) fn interrupt_request_line(request_id: &str) -> String {
     json!({
         "type": "control_request",
         "request_id": request_id,
         "request": { "subtype": "interrupt" },
+    })
+    .to_string()
+}
+
+/// Client→CLI live permission-mode switch: the wire behind the composer's
+/// plan toggle mid-run. The CLI answers with a `control_response` carrying
+/// this `request_id`.
+pub(crate) fn set_permission_mode_line(request_id: &str, plan: bool) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "set_permission_mode",
+            "mode": if plan { "plan" } else { "default" },
+        },
     })
     .to_string()
 }

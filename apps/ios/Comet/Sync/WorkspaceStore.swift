@@ -339,7 +339,8 @@ final class WorkspaceStore {
                                         model: c["model"]?.stringValue,
                                         reasoning: c["reasoning"]?.stringValue,
                                         modelOptions: c["modelOptions"]?.objectValue ?? [:],
-                                        sandbox: c["sandbox"]?.stringValue)
+                                        sandbox: c["sandbox"]?.stringValue,
+                                        planMode: c["planMode"]?.boolValue ?? false)
             }
             return Chat(id: f["id"]?.stringValue ?? row.id, deviceId: deviceId,
                         title: f["title"]?.stringValue,
@@ -554,6 +555,9 @@ final class WorkspaceStore {
             var name: String
             var installed: Bool?
             var enabled: Bool?
+            /// registry.rs `HarnessDescriptor.plan_mode` — absent on catalogs
+            /// from engines predating native plan mode.
+            var planMode: Bool?
         }
         let wire: [WireHarness]? = try? await relay(for: deviceId)
             .call(method: "ListHarnesses", params: [:])
@@ -563,7 +567,9 @@ final class WorkspaceStore {
                     && (h.installed ?? true)
                     && (h.enabled ?? ["claude-code", "codex"].contains(h.id))
             }
-            .map { HarnessInfo(id: $0.id, label: $0.name) }
+            .map {
+                HarnessInfo(id: $0.id, label: $0.name, planMode: $0.planMode ?? false)
+            }
         }
     }
 

@@ -141,6 +141,22 @@ func slashAccept(text: String, token: SlashToken, command: SlashCommand) -> Slas
     return SlashAccept(text: updated, cursor: cursor)
 }
 
+// MARK: - Composer-owned rows
+
+/// `slash_rows_with_builtins`: the rows the popup renders and filters — the
+/// harness's catalog with the composer's own commands merged in. `/plan` is the
+/// only one (§11.9): listed first, and dropping a catalog entry that carries
+/// the same name (directly or as an alias) so the two can never both answer
+/// for it. Offered only where the resolved harness's descriptor has a plan
+/// mode; otherwise the catalog passes through untouched.
+func slashRowsWithBuiltins(catalog: [SlashCommand], planOffered: Bool) -> [SlashCommand] {
+    guard planOffered else { return catalog }
+    let shadowed = catalog.filter {
+        $0.name != planSlashCommand.name && !$0.aliases.contains(planSlashCommand.name)
+    }
+    return [planSlashCommand] + shadowed
+}
+
 // MARK: - Catalog cache + popup state
 
 /// One catalog per `(device, harness, cwd)` — §10.4/§10.6. Discovery is
@@ -186,13 +202,18 @@ struct SlashCommandsModel {
     private var key: SlashCatalogKey?
     /// Token text hidden by an explicit dismiss — until the token changes.
     private var dismissed: String?
+    /// Whether the resolved harness's descriptor has a plan mode, so `/plan`
+    /// is one of the rows (§11.9). Follows the harness, like the key does.
+    private var planOffered = false
 
     private(set) var token: SlashToken?
 
     /// Track the token on every edit / caret move / harness or folder switch.
     /// Returns the key needing a `ListCommands` (nil = no open to revalidate,
     /// a probe already in flight for it, or nothing open).
-    mutating func update(text: String, cursor: Int, key: SlashCatalogKey?) -> SlashCatalogKey? {
+    mutating func update(text: String, cursor: Int, key: SlashCatalogKey?,
+                         planOffered: Bool = false) -> SlashCatalogKey? {
+        self.planOffered = planOffered
         let token = slashToken(text, cursor: cursor)
         if let token, let dismissed, slashTokenText(text, token) == dismissed {
             self.token = nil
@@ -242,7 +263,12 @@ struct SlashCommandsModel {
 
     var popup: SlashPopup {
         guard let token else { return .hidden }
-        let commands = key.flatMap { catalogs[$0] } ?? []
+        // The composer's own rows merge in before anything else reads them, so
+        // prefix filtering, ranking and accept treat `/plan` like any row —
+        // and a key carrying one is never "no rows at all", so a loading or
+        // failed probe shows it instead of a spinner or an error line.
+        let commands = slashRowsWithBuiltins(catalog: key.flatMap { catalogs[$0] } ?? [],
+                                             planOffered: planOffered)
         if let key, inFlight.contains(key), commands.isEmpty { return .loading }
         // A failed revalidation never blanks a list that was fine a moment ago
         // (§10.4): the error shows only when the key has no rows at all.

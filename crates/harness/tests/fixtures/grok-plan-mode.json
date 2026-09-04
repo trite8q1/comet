@@ -1,0 +1,232 @@
+{
+  "_comment": [
+    "Grok Build 1.0.13 (5e9a58528b76) native plan mode, captured live on",
+    "2026-09-02 from `grok --no-auto-update agent --no-leader stdio` against a",
+    "temp cwd holding a README.md, with comet's own initialize (fs + terminal",
+    "capabilities declined). Every frame below is verbatim from that session.",
+    "The adapter (crates/harness/src/acp/mod.rs, acp/normalize.rs) is matched",
+    "to these shapes; the fake agent in fake-acp.sh replays them."
+  ],
+  "session_new_result": {
+    "_comment": "No `modes` key at all — plan mode is accepted but unadvertised. Trimmed to the keys the adapter reads.",
+    "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+    "models": { "currentModelId": "grok-4.6", "availableModels": ["…"] },
+    "_meta": {
+      "currentWorkingDirectory": "…",
+      "isGitRepo": false,
+      "x.ai/sessionDetail": {
+        "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+        "kind": "build",
+        "currentModelId": "grok-4.6"
+      }
+    }
+  },
+  "set_mode_plan": {
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 103,
+      "method": "session/set_mode",
+      "params": {
+        "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+        "modeId": "plan"
+      }
+    },
+    "response": { "jsonrpc": "2.0", "id": 103, "result": {} }
+  },
+  "current_mode_update_plan": {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+      "update": { "sessionUpdate": "current_mode_update", "currentModeId": "plan" },
+      "_meta": { "eventId": "…-3", "agentTimestampMs": 1788374676096 }
+    }
+  },
+  "current_mode_update_default": {
+    "_comment": "The non-plan mode id, live-verified: `set_mode {\"modeId\":\"default\"}` → `{}` and this report. Unknown ids (normal, build, code, auto, ask) are answered `{}` with NO current_mode_update — the mode does not change.",
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+      "update": { "sessionUpdate": "current_mode_update", "currentModeId": "default" },
+      "_meta": { "eventId": "…-103", "agentTimestampMs": 1788374684891 }
+    }
+  },
+  "plan_file_edit": {
+    "_comment": "The plan is a real file the agent edits with search_replace: ~/.grok/sessions/<percent-encoded-cwd>/<session-id>/plan.md. `session/load` later replays current_mode_update with the persisted mode, so plan mode survives a reconnect.",
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+      "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "call-9c668edf-d753-4aca-9943-a97d5320d3a5-0",
+        "kind": "edit",
+        "title": "Edit `/Users/x/.grok/sessions/%2Ftmp%2Fprobe/01a0636f-eb17-7272-bf6f-ed7e162234ed/plan.md`",
+        "content": [
+          {
+            "type": "diff",
+            "path": "/Users/x/.grok/sessions/%2Ftmp%2Fprobe/01a0636f-eb17-7272-bf6f-ed7e162234ed/plan.md",
+            "oldText": "",
+            "newText": "Rename README.md to README2.md in the workspace.\nUse a git mv or filesystem rename; do not change file contents.\n"
+          }
+        ],
+        "locations": [
+          { "path": "/Users/x/.grok/sessions/%2Ftmp%2Fprobe/01a0636f-eb17-7272-bf6f-ed7e162234ed/plan.md" }
+        ],
+        "rawInput": { "variant": "SearchReplace", "file_path": "…/plan.md", "old_string": "", "new_string": "…" },
+        "_meta": {
+          "x.ai/tool": {
+            "version": 1,
+            "name": "search_replace",
+            "kind": "edit",
+            "namespace": "grok_build",
+            "label": "Edit",
+            "read_only": false
+          }
+        }
+      }
+    }
+  },
+  "exit_tool_call": {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call-5e98510d-063a-4eb2-b81a-a65f575e53d5-1",
+        "title": "exit_plan_mode",
+        "rawInput": {},
+        "_meta": {
+          "x.ai/tool": {
+            "version": 1,
+            "name": "exit_plan_mode",
+            "kind": "exit_plan",
+            "namespace": "grok_build",
+            "label": "Exit Plan Mode",
+            "read_only": true
+          }
+        }
+      }
+    }
+  },
+  "exit_tool_call_update": {
+    "_comment": "The opening call and this update carry NO plan text — the plan reaches the client on the gate request below.",
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+      "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "call-5e98510d-063a-4eb2-b81a-a65f575e53d5-1",
+        "kind": "other",
+        "title": "Plan: Exit",
+        "locations": [],
+        "rawInput": { "variant": "ExitPlanMode" },
+        "_meta": { "x.ai/tool": { "version": 1, "name": "exit_plan_mode", "kind": "exit_plan" } }
+      }
+    }
+  },
+  "pending_interaction": {
+    "_comment": "grok's extension channel announces the gate just before raising it.",
+    "jsonrpc": "2.0",
+    "method": "_x.ai/session_notification",
+    "params": {
+      "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+      "update": {
+        "sessionUpdate": "pending_interaction",
+        "tool_call_id": "call-5e98510d-063a-4eb2-b81a-a65f575e53d5-1",
+        "kind": "plan_approval"
+      }
+    }
+  },
+  "exit_gate_request": {
+    "_comment": "THE EXIT GATE. Not `session/request_permission`: a grok extension reverse request (ExitPlanModeExtRequest, 3 fields). Answering it with a JSON-RPC error (-32601) yields the tool result \"Plan approval could not be completed because the client disconnected. Plan mode remains active…\" and cancels the turn (`stopReason: cancelled`, `cancellationCategory: PermissionCancelled`).",
+    "jsonrpc": "2.0",
+    "id": 0,
+    "method": "_x.ai/exit_plan_mode",
+    "params": {
+      "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+      "toolCallId": "call-5e98510d-063a-4eb2-b81a-a65f575e53d5-1",
+      "planContent": "Rename README.md to README2.md in the workspace.\nUse a git mv or filesystem rename; do not change file contents.\n"
+    }
+  },
+  "exit_gate_response_keep_planning": {
+    "_comment": "ExitPlanModeExtResponse has 2 fields; `approved` is one and `abandoned` is the other reading of the binary's TUI branches (approve / request changes / abandon). Unknown fields are IGNORED, so this superset is accepted verbatim — verified live. `feedback` is NOT the second field: sending it still selected the no-feedback branch, so the adapter only REJECTS the gate — the engine delivers the feedback as the user's next message through the ordinary steer path (ARCHITECTURE §11.2).",
+    "jsonrpc": "2.0",
+    "id": 0,
+    "result": { "approved": false, "abandoned": false, "feedback": "Add a rollback step." }
+  },
+  "exit_tool_result_keep_planning": {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "01a06374-9c4c-74d0-8a4a-1a7b0ac1c7ad",
+      "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "call-0de8d6ae-fc3a-492c-b959-e43eeaba1ac7-1",
+        "status": "completed",
+        "content": [
+          {
+            "type": "content",
+            "content": {
+              "type": "text",
+              "text": "The user wants to revise the plan. Ask the user what changes they would like to make."
+            }
+          }
+        ]
+      }
+    }
+  },
+  "ask_user_question_request": {
+    "_comment": [
+      "grok's ask-the-user extension, captured live on the same session. A",
+      "reverse request, not session/request_permission: options carry",
+      "{label, description} and `multiSelect` is null for a single pick. The",
+      "same tool also streams as tool_call/tool_call_update with",
+      "title \"ask_user_question\" and _meta[\"x.ai/tool\"].kind ==",
+      "\"ask_user\" (label \"Ask User\"), rawInput.questions[...]."
+    ],
+    "jsonrpc": "2.0",
+    "id": 0,
+    "method": "_x.ai/ask_user_question",
+    "params": {
+      "sessionId": "01a0636f-eb17-7272-bf6f-ed7e162234ed",
+      "toolCallId": "call-9b2f0d1e-1f2a-4f0c-9c2b-2e6f0a1b3c4d-0",
+      "questions": [
+        {
+          "question": "Which color do you prefer, red or blue?",
+          "options": [
+            { "label": "Red", "description": "Prefer red" },
+            { "label": "Blue", "description": "Prefer blue" }
+          ],
+          "multiSelect": null
+        }
+      ],
+      "mode": "default"
+    }
+  },
+  "ask_user_question_response_answered": {
+    "_comment": [
+      "The reply that makes the tool succeed (UserAnswered): answers are keyed",
+      "by the QUESTION TEXT, the value is the picked label — an array of labels",
+      "when multiSelect is true, a string otherwise (the keying Claude's",
+      "AskUserQuestion uses). AskUserQuestionExtResponse is internally tagged:",
+      "a reply without `outcome` fails the tool with \"missing field `outcome`\"."
+    ],
+    "jsonrpc": "2.0",
+    "id": 0,
+    "result": {
+      "outcome": "accepted",
+      "answers": { "Which color do you prefer, red or blue?": "Red" }
+    }
+  },
+  "unverified": [
+    "The APPROVE path (`approved: true`) was not exercised live — it would have let the agent edit the workspace. The response shape is the same object.",
+    "The exact name of ExitPlanModeExtResponse's second field: `abandoned` is inferred from the binary's TUI branches; `feedback` was ruled out live. Sending `{approved, abandoned}` works because unknown fields are ignored and `approved` is honored.",
+    "Whether grok will ever raise the gate as a plain `session/request_permission`. The adapter handles that shape too, gated on the reported plan mode.",
+    "The names of AskUserQuestionExtResponse's non-`Accepted` variants: only `accepted` was exercised, so a dropped resolver answers `{\"outcome\":\"accepted\",\"answers\":{}}` rather than guessing a cancel variant.",
+    "The multiSelect:true wire (an array of labels) is the mirror of Claude's AskUserQuestion answer shape; grok raised only single-select questions live."
+  ]
+}

@@ -112,6 +112,7 @@ fn prompt_body_carries_model_variant_and_attachments() {
         &Some(("anthropic".into(), "claude-opus-5".into())),
         Some("high"),
         &["/tmp/shot.png".to_owned()],
+        "build",
     );
     assert_eq!(body["model"]["providerID"], "anthropic");
     assert_eq!(body["model"]["modelID"], "claude-opus-5");
@@ -121,6 +122,119 @@ fn prompt_body_carries_model_variant_and_attachments() {
     assert_eq!(body["parts"][1]["type"], "file");
     assert_eq!(body["parts"][1]["mime"], "image/png");
     assert_eq!(body["parts"][1]["url"], "file:///tmp/shot.png");
+    assert_eq!(body["agent"], "build");
+}
+
+/// §11.2, OpenCode row: plan mode IS the `agent` field — the two built-in
+/// agents, nothing synthesized.
+#[test]
+fn the_requested_plan_mode_rides_the_prompt_as_the_agent() {
+    let plan = prompt_body("plan it", &None, None, &[], "plan");
+    assert_eq!(plan["agent"], "plan");
+    let build = prompt_body("build it", &None, None, &[], "build");
+    assert_eq!(build["agent"], "build");
+}
+
+#[test]
+fn only_a_plan_dir_markdown_file_is_a_plan() {
+    assert!(is_plan_file("/w/.opencode/plans/1-veil-port.md"));
+    assert!(is_plan_file(
+        "/home/u/.local/share/opencode/plans/2-thing.MD"
+    ));
+    assert!(!is_plan_file("/w/.opencode/plans/notes.txt"));
+    assert!(!is_plan_file("/w/plans/nested/deep.md"));
+    assert!(!is_plan_file("/w/src/main.md"));
+}
+
+#[test]
+fn plan_exit_parts_bind_their_question_by_call_id() {
+    let part = json!({
+        "id": "prt_x", "messageID": "msg_a", "sessionID": "ses_1",
+        "type": "tool", "tool": "plan_exit", "callID": "call-exit",
+        "state": {"status": "running", "input": {}},
+    });
+    assert_eq!(plan_exit_call(&part).as_deref(), Some("call-exit"));
+    let other = json!({
+        "id": "prt_y", "messageID": "msg_a", "sessionID": "ses_1",
+        "type": "tool", "tool": "bash", "callID": "call-bash",
+        "state": {"status": "running", "input": {}},
+    });
+    assert_eq!(plan_exit_call(&other), None);
+}
+
+/// The plan card is the gate: its tool parts must never also chip.
+#[test]
+fn plan_gate_parts_are_not_chip_tools() {
+    let gate = |tool: &str| {
+        json!({
+            "id": "prt_x", "messageID": "msg_a", "sessionID": "ses_1",
+            "type": "tool", "tool": tool, "callID": "call-1",
+            "state": {"status": "completed", "input": {}, "output": "ok"},
+        })
+    };
+    assert!(is_gate_tool(&gate("plan_exit")));
+    assert!(is_gate_tool(&gate("plan_enter")));
+    assert!(!is_gate_tool(&gate("bash")));
+    assert!(!is_gate_tool(&json!({
+        "id": "prt_t", "type": "text", "text": "plan_exit",
+    })));
+}
+
+#[tokio::test]
+async fn completed_plan_tools_report_the_mode_and_re_read_the_plan() {
+    let enter = json!({
+        "id": "prt_e", "messageID": "msg_a", "sessionID": "ses_1",
+        "type": "tool", "tool": "plan_enter", "callID": "call-enter",
+        "state": {"status": "completed", "input": {}, "output": "ok"},
+    });
+    assert!(matches!(
+        plan_signals(&enter, true).await.as_slice(),
+        [AgentEvent::PlanModeChanged { active: true }]
+    ));
+    // Only the snapshot that DECODED the completion signals (the TUI's own
+    // once-per-part rule); re-delivered snapshots are silent.
+    assert!(plan_signals(&enter, false).await.is_empty());
+
+    let exit = json!({
+        "id": "prt_x", "messageID": "msg_a", "sessionID": "ses_1",
+        "type": "tool", "tool": "plan_exit", "callID": "call-exit",
+        "state": {"status": "completed", "input": {}, "output": "ok"},
+    });
+    assert!(matches!(
+        plan_signals(&exit, true).await.as_slice(),
+        [AgentEvent::PlanModeChanged { active: false }]
+    ));
+    // "No" rejects the tool: an errored plan_exit never leaves plan mode.
+    let rejected = json!({
+        "id": "prt_x", "messageID": "msg_a", "sessionID": "ses_1",
+        "type": "tool", "tool": "plan_exit", "callID": "call-exit",
+        "state": {"status": "error", "input": {}, "error": "rejected"},
+    });
+    assert!(plan_signals(&rejected, true).await.is_empty());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plans = dir.path().join(".opencode").join("plans");
+    std::fs::create_dir_all(&plans).expect("plans dir");
+    let plan = plans.join("1-veil-port.md");
+    std::fs::write(&plan, "# Veil port\n").expect("plan file");
+    let edit = json!({
+        "id": "prt_w", "messageID": "msg_a", "sessionID": "ses_1",
+        "type": "tool", "tool": "write", "callID": "call-write",
+        "state": {"status": "completed", "input": {"filePath": plan.to_str().unwrap()}},
+    });
+    let events = plan_signals(&edit, true).await;
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::PlanUpdated { text, path }]
+            if text == "# Veil port\n" && path.as_deref() == plan.to_str()
+    ));
+    // An edit anywhere else is an ordinary edit.
+    let source = json!({
+        "id": "prt_s", "messageID": "msg_a", "sessionID": "ses_1",
+        "type": "tool", "tool": "edit", "callID": "call-edit",
+        "state": {"status": "completed", "input": {"filePath": "/w/src/main.rs"}},
+    });
+    assert!(plan_signals(&source, true).await.is_empty());
 }
 
 fn feed_with_assistant(message: &str) -> SessionFeed {

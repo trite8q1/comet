@@ -2,15 +2,17 @@
 //! `tests/fixtures/fake-acp.sh` (no real `grok` binary involved).
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use comet_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, SteeringMode, TodoItem, ToolCall,
-    UserInputAnswer,
+    AgentEvent, DoneStatus, HarnessId, PlanDecision, RunRequest, SandboxLevel, SteeringMode,
+    TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -40,6 +42,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
@@ -50,6 +53,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        plan: comet_harness::PlanControls::off(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -1018,6 +1022,614 @@ async fn live_commands_hermes() {
         "hermes' ACP surface exposes no skills: {commands:#?}"
     );
     report("hermes", &commands);
+}
+
+// ---------------------------------------------------------------------------
+// Native plan mode (ARCHITECTURE.md §11)
+// ---------------------------------------------------------------------------
+
+/// Plan controls with a driveable mode watch and a scripted exit decision.
+/// Returns the sender (the composer's toggle) and the recorded gate calls.
+fn plan_controls(
+    initial: bool,
+    decision: PlanDecision,
+) -> (
+    RunControls,
+    mpsc::Sender<SteerMessage>,
+    watch::Sender<bool>,
+    Arc<AtomicUsize>,
+) {
+    let (controls, steer_tx, _token) = controls();
+    let (mode_tx, mode_rx) = watch::channel(initial);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recorder = calls.clone();
+    let controls = RunControls {
+        plan: comet_harness::PlanControls {
+            mode: mode_rx,
+            request_exit: Box::new(move || {
+                recorder.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(decision.clone());
+                rx
+            }),
+        },
+        ..controls
+    };
+    (controls, steer_tx, mode_tx, calls)
+}
+
+/// The decision an unanswered gate degrades to, and the default this file's
+/// mode-only tests use.
+fn keep_planning() -> PlanDecision {
+    PlanDecision::keep_planning(None)
+}
+
+fn plan_request(prompt: &str, cwd: &str, plan_mode: bool) -> RunRequest {
+    RunRequest {
+        cwd: cwd.into(),
+        plan_mode,
+        ..request(prompt)
+    }
+}
+
+fn texts(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn plan_modes(events: &[AgentEvent]) -> Vec<bool> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PlanModeChanged { active } => Some(*active),
+            _ => None,
+        })
+        .collect()
+}
+
+fn plans(events: &[AgentEvent]) -> Vec<(String, Option<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PlanUpdated { text, path } => Some((text.clone(), path.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// §11.4 step 1: a run that asked for plan mode switches the session right
+/// after `session/new`, before the first prompt. Grok's id is the spec's
+/// (`plan`), accepted although `session/new` advertises no `modes` — verified
+/// live against 1.0.13 (tests/fixtures/grok-plan-mode.json).
+#[tokio::test]
+async fn plan_mode_sets_the_session_mode_after_session_new() {
+    let (controls, _steer, _mode, _calls) = plan_controls(true, keep_planning());
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-mode", "/tmp", true),
+        controls,
+    )
+    .await;
+    assert_eq!(texts(&events), "planning", "{events:?}");
+    // The accepted switch is the agent's own report; its current_mode_update
+    // fires inside the setup drain, which drops notifications.
+    assert!(plan_modes(&events).contains(&true), "{events:?}");
+    assert_eq!(
+        dones(&events).first().map(|d| d.0),
+        Some(DoneStatus::Completed)
+    );
+}
+
+/// A run that did NOT ask for plan mode never sends `session/set_mode` — the
+/// scenario refuses the turn when one arrived.
+#[tokio::test]
+async fn plan_mode_off_sends_no_set_mode() {
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-modes", "/tmp", false),
+        controls,
+    )
+    .await;
+    assert_eq!(texts(&events), "nosetmode", "{events:?}");
+    assert!(plan_modes(&events).is_empty(), "{events:?}");
+}
+
+/// §11.2 generic ACP: hermes/pi have no static id, so plan mode exists only
+/// when `session/new` advertises one. A `modes` state WITHOUT a plan id
+/// yields no `set_mode` at all; one WITH a plan id is discovered and used.
+#[tokio::test]
+async fn advertised_modes_without_a_plan_id_never_set_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("comet-acp-modes"),
+        r#"{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"ask","name":"Ask"}]}"#,
+    )
+    .unwrap();
+    let harness = AcpHarness::hermes().with_executable(fixture_path());
+    let (controls, _steer, _mode, _calls) = plan_controls(true, keep_planning());
+    let events = run_to_end(
+        &harness,
+        plan_request("scenario:plan-modes", dir.path().to_str().unwrap(), true),
+        controls,
+    )
+    .await;
+    assert_eq!(texts(&events), "nosetmode", "{events:?}");
+    assert!(plan_modes(&events).is_empty(), "{events:?}");
+}
+
+#[tokio::test]
+async fn advertised_plan_mode_is_discovered_by_a_generic_agent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("comet-acp-modes"),
+        r#"{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"}]}"#,
+    )
+    .unwrap();
+    let harness = AcpHarness::hermes().with_executable(fixture_path());
+    let (controls, _steer, _mode, _calls) = plan_controls(true, keep_planning());
+    let events = run_to_end(
+        &harness,
+        plan_request("scenario:plan-modes", dir.path().to_str().unwrap(), true),
+        controls,
+    )
+    .await;
+    assert_eq!(texts(&events), "setmode:plan", "{events:?}");
+    assert_eq!(plan_modes(&events), vec![true], "{events:?}");
+}
+
+/// §11.4 step 2: the toggle flipped mid-run reaches the CLI's live switch,
+/// and the agent's `current_mode_update` reports the result. `default` is
+/// grok's non-plan mode id (live-verified).
+#[tokio::test]
+async fn toggling_plan_mode_mid_run_sets_the_agents_non_plan_mode() {
+    let (controls, _steer, mode_tx, _calls) = plan_controls(true, keep_planning());
+    let stream = harness()
+        .run(plan_request("scenario:plan-toggle", "/tmp", true), controls)
+        .await
+        .expect("run starts");
+    let mut stream = stream;
+    let mut events = Vec::new();
+    let collected = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            // Flip once the turn is visibly live, so the toggle can't be
+            // consumed as the watch's initial value.
+            if matches!(&ev, AgentEvent::TextDelta { text } if text == "planning") {
+                mode_tx.send(false).expect("toggle");
+            }
+            events.push(ev);
+        }
+    })
+    .await;
+    assert!(collected.is_ok(), "run finished in time: {events:?}");
+    assert_eq!(texts(&events), "planningswitched:default", "{events:?}");
+    assert_eq!(plan_modes(&events), vec![true, true, false], "{events:?}");
+}
+
+/// §11.4 step 4, the exit gate: grok raises it as `_x.ai/exit_plan_mode`
+/// (NOT a permission request — verified live). The adapter emits nothing of
+/// its own, parks on the engine's bridge and answers `{approved, abandoned}`.
+/// The decision's feedback is the ENGINE's to deliver, as the user's next
+/// message through the ordinary steer path (§11.2 "Feedback delivery"): the
+/// adapter sends NO follow-up prompt of its own.
+#[tokio::test]
+async fn plan_exit_gate_rejects_without_sending_the_feedback_itself() {
+    let (controls, steer, _mode, calls) = plan_controls(
+        true,
+        PlanDecision::keep_planning(Some("Add a rollback step.".into())),
+    );
+    // No steer sender: the loop may end the run the moment the turn settles,
+    // UNLESS something queued a follow-up — which is exactly the regression
+    // this pins. The fixture answers any such prompt with "unexpected-prompt".
+    drop(steer);
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-exit", "/tmp", true),
+        controls,
+    )
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the gate reached the bridge"
+    );
+    // The adapter never mints PlanExitRequested/Resolved — the engine does.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanExitRequested { .. } | AgentEvent::PlanExitResolved { .. }
+        )),
+        "{events:?}"
+    );
+    assert_eq!(
+        plans(&events),
+        vec![(
+            "# Plan\n\n1. Rename README.md to README2.md.\n".to_owned(),
+            None
+        )],
+        "{events:?}"
+    );
+    // The fixture answers any prompt that arrives after the rejected gate
+    // with "unexpected-prompt" — the adapter must send none.
+    assert_eq!(texts(&events), "", "{events:?}");
+}
+
+/// Approving answers the same gate with `approved: true`; the agent's own
+/// `current_mode_update` then flips the reported mode off.
+#[tokio::test]
+async fn approving_the_plan_exit_gate_leaves_plan_mode() {
+    let (controls, _steer, _mode, calls) = plan_controls(true, PlanDecision::approve());
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-approve", "/tmp", true),
+        controls,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(texts(&events), "building", "{events:?}");
+    assert_eq!(plan_modes(&events), vec![true, true, false], "{events:?}");
+}
+
+/// The generic shape (§11.2 hermes/pi row): a `session/request_permission`
+/// naming the plan-exit tool stops auto-approving and takes the reject
+/// option on "keep planning" — while every OTHER permission in the same
+/// plan-mode turn still auto-accepts. The plan text rides the exit tool's
+/// own `rawOutput` (`ExitPlanModeOutput::PlanReady`).
+#[tokio::test]
+async fn plan_exit_permission_is_the_only_one_that_stops_auto_approving() {
+    let (controls, _steer, _mode, calls) = plan_controls(false, PlanDecision::keep_planning(None));
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-permission", "/tmp", false),
+        controls,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{events:?}");
+    assert_eq!(texts(&events), "still planning", "{events:?}");
+    assert_eq!(
+        plans(&events),
+        vec![(
+            "# Plan\n\n1. Ship it.\n".to_owned(),
+            Some("/w/plans/ship.md".to_owned())
+        )],
+        "{events:?}"
+    );
+}
+
+/// §11.4 the third answer on a generic ACP wire: a REJECT is not the reject
+/// OPTION (that one means "keep planning") — it is the spec's own
+/// `outcome: "cancelled"`, which the agent winds down with
+/// `stopReason: "cancelled"` ⇒ `DoneStatus::Interrupted`. The adapter still
+/// sends no follow-up prompt of its own; ending the turn is the engine's job.
+#[tokio::test]
+async fn rejecting_the_plan_takes_the_acp_cancel_outcome() {
+    let (controls, _steer, _mode, calls) = plan_controls(false, PlanDecision::reject());
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-reject", "/tmp", false),
+        controls,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{events:?}");
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert_eq!(texts(&events), "", "a rejected plan builds nothing");
+}
+
+/// The gate is the TOOL NAME, not the reported mode bit: an agent that never
+/// sends `current_mode_update` (or sends it after the request) must still stop
+/// the auto-approve, or §11.2's one non-auto-approving permission silently
+/// approves the exit and the agent starts executing the plan.
+#[tokio::test]
+async fn an_unreported_plan_mode_still_stops_the_exit_auto_approve() {
+    let (controls, _steer, _mode, calls) = plan_controls(false, PlanDecision::keep_planning(None));
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-gate-unreported", "/tmp", false),
+        controls,
+    )
+    .await;
+    assert!(plan_modes(&events).is_empty(), "{events:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{events:?}");
+    assert_eq!(texts(&events), "still planning", "{events:?}");
+}
+
+/// §11.6: the plan card represents the gate, so the `enter_plan_mode` /
+/// `exit_plan_mode` tool calls must NOT also fold into a tool chip (a
+/// rejected exit otherwise reads as a stray failed tool). The plan events
+/// derived from the same updates survive, and an ordinary tool in the same
+/// turn still renders.
+#[tokio::test]
+async fn plan_gate_tool_calls_render_no_chip_but_still_yield_the_plan_events() {
+    let (controls, _steer, _mode, _calls) = plan_controls(true, keep_planning());
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-chips", "/tmp", true),
+        controls,
+    )
+    .await;
+    let chips: Vec<(String, ToolCall)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCall { id, call } => Some((id.clone(), call.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        chips,
+        vec![(
+            "r1".to_owned(),
+            ToolCall::ReadFile {
+                path: "/w/a.rs".into()
+            }
+        )],
+        "{events:?}"
+    );
+    let results: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, vec!["r1".to_owned()], "{events:?}");
+    assert_eq!(plan_modes(&events), vec![true, true], "{events:?}");
+}
+
+/// An edit-kind call on a plan file publishes the FILE, not the hunk: the
+/// adapter re-reads it from disk (grok's plan.md, Claude/opencode's
+/// `**/plans/*.md`).
+#[tokio::test]
+async fn editing_a_plan_file_republishes_it_from_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("plans")).unwrap();
+    // The agent reports the path it saw from its own cwd; on macOS the temp
+    // root is a symlink, so compare against the resolved path.
+    let root = dir.path().canonicalize().expect("canonical tempdir");
+    let plan = root.join("plans").join("build.md");
+    std::fs::write(&plan, "# Build plan\n\n1. Read.\n2. Write.\n").unwrap();
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:plan-file", dir.path().to_str().unwrap(), false),
+        controls,
+    )
+    .await;
+    assert_eq!(
+        plans(&events),
+        vec![(
+            "# Build plan\n\n1. Read.\n2. Write.\n".to_owned(),
+            Some(plan.to_string_lossy().into_owned())
+        )],
+        "{events:?}"
+    );
+}
+
+// grok's ask-the-user extension (_x.ai/ask_user_question)
+// ---------------------------------------------------------------------------
+
+/// The questions the adapter put on the input bridge.
+type AskLog = Arc<std::sync::Mutex<Vec<UserInputQuestion>>>;
+
+/// Controls that record every question and answer it with `labels` — or, when
+/// `labels` is `None`, DROP the resolver (the engine went away).
+fn ask_controls(labels: Option<Vec<String>>) -> (RunControls, mpsc::Sender<SteerMessage>, AskLog) {
+    let (controls, steer_tx, _token) = controls();
+    let log: AskLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let controls = RunControls {
+        request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
+            seen.lock().unwrap().extend(questions.iter().cloned());
+            let (tx, rx) = oneshot::channel();
+            if let Some(labels) = labels.clone() {
+                let answers: Vec<UserInputAnswer> = questions
+                    .iter()
+                    .map(|q| UserInputAnswer {
+                        question_id: q.id.clone(),
+                        labels: labels.clone(),
+                    })
+                    .collect();
+                let _ = tx.send(answers);
+            }
+            rx
+        }),
+        ..controls
+    };
+    (controls, steer_tx, log)
+}
+
+/// The reply the fixture recorded, parsed.
+fn ask_reply(dir: &std::path::Path) -> serde_json::Value {
+    let raw = std::fs::read_to_string(dir.join("ask-reply.txt")).expect("the agent got a reply");
+    serde_json::from_str(&raw).expect("valid JSON-RPC")
+}
+
+/// grok's `_x.ai/ask_user_question` reverse request rides the ENGINE's input
+/// bridge (the adapter never mints an `InputRequested` of its own), and is
+/// answered with the `AskUserQuestionExtResponse::Accepted` shape: answers
+/// keyed by the QUESTION TEXT, the picked label as the value. Captured live
+/// against grok 1.0.13 (tests/fixtures/grok-plan-mode.json); a reply without
+/// `outcome` fails the tool.
+#[tokio::test]
+async fn ask_user_question_extension_asks_through_the_input_bridge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, _steer, log) = ask_controls(Some(vec!["Red".into()]));
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:ask-user", dir.path().to_str().unwrap(), false),
+        controls,
+    )
+    .await;
+    assert_eq!(texts(&events), "answered", "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::InputRequested { .. })),
+        "the engine mints the request, not the adapter: {events:?}"
+    );
+    let asked = log.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].header, "Question");
+    assert_eq!(asked[0].question, "Which color do you prefer, red or blue?");
+    assert_eq!(asked[0].options, vec!["Red".to_owned(), "Blue".to_owned()]);
+    assert!(!asked[0].multi_select);
+    assert_eq!(
+        ask_reply(dir.path()),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "outcome": "accepted",
+                "answers": { "Which color do you prefer, red or blue?": "Red" },
+            },
+        })
+    );
+}
+
+/// `multiSelect: true` → the answer is an ARRAY of labels, and the tool's own
+/// `_meta` label heads the question card.
+#[tokio::test]
+async fn ask_user_question_multi_select_answers_with_an_array() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, _steer, log) = ask_controls(Some(vec!["Red".into(), "Blue".into()]));
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:ask-multi", dir.path().to_str().unwrap(), false),
+        controls,
+    )
+    .await;
+    assert_eq!(texts(&events), "answered", "{events:?}");
+    let asked = log.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].header, "Ask User");
+    assert!(asked[0].multi_select);
+    assert_eq!(
+        ask_reply(dir.path()),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "outcome": "accepted",
+                "answers": { "Which colors do you like?": ["Red", "Blue"] },
+            },
+        })
+    );
+}
+
+/// A dropped resolver still answers `accepted` — with NO answers. The other
+/// `AskUserQuestionExtResponse` variant names are unknown, and a reply
+/// without `outcome` fails the tool ("missing field `outcome`").
+#[tokio::test]
+async fn a_dropped_ask_resolver_answers_accepted_with_no_answers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, _steer, _log) = ask_controls(None);
+    let events = run_to_end(
+        &harness(),
+        plan_request("scenario:ask-user", dir.path().to_str().unwrap(), false),
+        controls,
+    )
+    .await;
+    assert_eq!(texts(&events), "answered", "{events:?}");
+    assert_eq!(
+        ask_reply(dir.path()),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": { "outcome": "accepted", "answers": {} },
+        })
+    );
+}
+
+/// LIVE (§11.8 `--live`): drive the real `grok agent stdio` through one plan
+/// turn and answer its exit gate "keep planning". Everything the run sees is
+/// logged, so the wire shapes in tests/fixtures/grok-plan-mode.json can be
+/// re-pinned when grok changes them.
+///
+/// `cargo test -q -p comet-harness --test acp live_plan_grok -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn live_plan_grok_exit_gate() {
+    let harness = AcpHarness::grok();
+    if !harness.installed() {
+        eprintln!("skipping live grok plan test: grok is not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Probe\n\nHello.\n").unwrap();
+
+    let (controls, _steer, _mode, calls) = plan_controls(true, PlanDecision::keep_planning(None));
+    let request = plan_request(
+        "Plan mode is already active. Write a two-line plan to rename \
+         README.md to README2.md, then call exit_plan_mode.",
+        dir.path().to_str().unwrap(),
+        true,
+    );
+    let request = RunRequest {
+        model: None,
+        ..request
+    };
+    let mut stream = harness.run(request, controls).await.expect("run starts");
+    // A real agent stays parked for the steering mailbox after a turn: read
+    // until the turn's own Done rather than to stream end.
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let collected = tokio::time::timeout(Duration::from_secs(300), async {
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            eprintln!("LIVE EVENT {ev:?}");
+            let done = matches!(ev, AgentEvent::Done { .. });
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        collected.is_ok(),
+        "live grok run finished in time: {events:?}"
+    );
+    // At least once: a live model may re-present the plan after a reject
+    // (each retry is a fresh gate, and each one must reach the bridge).
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "grok's exit gate reached the decision bridge: {events:?}"
+    );
+    assert!(
+        plan_modes(&events).contains(&true),
+        "grok reported plan mode: {events:?}"
+    );
+    let plans = plans(&events);
+    assert!(!plans.is_empty(), "grok published a plan: {events:?}");
+    eprintln!("LIVE PLAN {:?}", plans.last());
+    // "Keep planning" leaves the session in plan mode: grok answers the tool
+    // with "The user wants to revise the plan…" and never reports `default`.
+    assert!(
+        !plan_modes(&events).contains(&false),
+        "a rejected exit stays in plan mode: {events:?}"
+    );
+}
+
+/// The descriptor gate (§11.3): grok drives plan mode end to end, the
+/// discovery-only agents do not advertise a toggle.
+#[test]
+fn plan_mode_is_advertised_only_where_the_id_is_known_without_a_session() {
+    assert!(AcpHarness::grok().plan_mode());
+    assert!(!AcpHarness::hermes().plan_mode());
+    assert!(!AcpHarness::pi().plan_mode());
 }
 
 /// §10.4 evidence for pi: pi-acp advertises pi's own `get_commands` list,

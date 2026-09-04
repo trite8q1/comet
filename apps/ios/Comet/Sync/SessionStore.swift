@@ -60,6 +60,12 @@ final class SessionStore {
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [PendingSend] = []
+    /// Plan-exit request ids answered from THIS device, held until the doc
+    /// frame flips the part's status. Store-owned because the card's buttons
+    /// and the composer's send answer the SAME gate: a latch private to the
+    /// card would let a send right after an Approve take the gate again as
+    /// "keep planning".
+    private(set) var answeredPlanGates: Set<String> = []
 
     let doc = LoroDoc()
     /// The chat2 room cursor — the last server row seq folded into `doc`.
@@ -473,6 +479,14 @@ final class SessionStore {
             }
             return .input(id: id, requestId: id, questions: questions,
                           resolved: m["resolved"]?.boolValue ?? false)
+        case "plan":
+            // The body rides `plan` (a LoroText, deep-valued to a string),
+            // never `text` — schema.rs to_doc_part.
+            return .plan(id: id, plan: m["plan"]?.stringValue ?? "",
+                         status: m["planStatus"]?.stringValue
+                             .flatMap(PlanStatus.init(rawValue:)) ?? .drafting,
+                         requestId: m["requestId"]?.stringValue,
+                         path: m["path"]?.stringValue)
         case "error":
             return .error(id: id, message: m["message"]?.stringValue ?? "")
         default:
@@ -519,10 +533,39 @@ final class SessionStore {
         return nil
     }
 
+    /// The parked plan-exit gate to answer (ARCHITECTURE.md §11.4): while one
+    /// stands, the card shows Approve / Keep planning and the composer's send
+    /// carries feedback instead of a run. Minus the gates already answered
+    /// from here, which stand in the doc until the frame flips them.
+    var pendingPlanExit: (entryId: String, requestId: String)? {
+        guard let gate = Self.pendingPlanExit(in: entries),
+              !answeredPlanGates.contains(gate.requestId) else { return nil }
+        return gate
+    }
+
+    /// Pure half of `pendingPlanExit` — the gate on the LAST assistant entry,
+    /// matching the desktop rule (`composer.rs pending_plan_gate`): a newer
+    /// assistant entry supersedes an unanswered gate, so the composer never
+    /// binds its send to a stale card.
+    nonisolated static func pendingPlanExit(in entries: [MessageEntry])
+        -> (entryId: String, requestId: String)? {
+        guard let entry = entries.last(where: { $0.role == .assistant }) else { return nil }
+        for part in entry.parts.reversed() {
+            guard case .plan(_, _, let status, let requestId, _) = part else { continue }
+            guard status == .awaitingApproval, let requestId else { continue }
+            return (entry.id, requestId)
+        }
+        return nil
+    }
+
     // MARK: Command plane (ledger rule 1: append-only, own entries only)
 
+    /// `planMode` overrides the chat config's requested mode for this one
+    /// request: `/plan <description>` enters the mode and sends in the same
+    /// gesture (§11.9), and the config write has not round-tripped through the
+    /// doc by then. Everything else reads the config, as before.
     func sendRun(prompt: String, chat: Chat, attachments: [String] = [],
-                 worktree: WorktreeSpec? = nil) {
+                 worktree: WorktreeSpec? = nil, planMode: Bool? = nil) {
         if offline {
             demoResponder?(prompt)
             return
@@ -536,7 +579,8 @@ final class SessionStore {
                                  cwd: chat.cwd ?? "",
                                  sandbox: chat.config?.sandbox ?? "workspace-write",
                                  attachments: attachments,
-                                 worktree: worktree)
+                                 worktree: worktree,
+                                 planMode: planMode ?? chat.config?.planMode ?? false)
         queueCommand(kind: "run", payload: [
             "kind": "run",
             "request": encodableJSON(request),
@@ -596,6 +640,42 @@ final class SessionStore {
             "kind": "respondInput",
             "requestId": requestId,
             "answers": answers.map(encodableJSON),
+        ])
+    }
+
+    /// Answer the harness's plan-exit gate (commands.rs RespondPlanExit).
+    /// `feedback` rides the "keep planning" answer wherever the CLI's gate has
+    /// a message channel; an empty one is omitted, like the host's shape.
+    /// `rejected` is the third answer: deny the gate, end the turn, leave plan
+    /// mode. It is written only when true, mirroring the payload's
+    /// `skip_serializing_if` — the two older answers stay byte-identical on
+    /// the wire, so a host too old to know the field still reads them.
+    func respondPlanExit(requestId: String, approved: Bool, rejected: Bool = false,
+                         feedback: String? = nil) {
+        var payload: [String: Any] = [
+            "kind": "respondPlanExit",
+            "requestId": requestId,
+            "approved": approved,
+        ]
+        if rejected {
+            payload["rejected"] = true
+        }
+        if let feedback, !feedback.isEmpty {
+            payload["feedback"] = feedback
+        }
+        // Latched before the append: the ledger write is local and always
+        // lands, so nothing else on this device answers the same gate while
+        // the host's frame is on its way back.
+        answeredPlanGates.insert(requestId)
+        queueCommand(kind: "respondPlanExit", payload: payload)
+    }
+
+    /// Push the requested plan mode into a live run (commands.rs SetPlanMode);
+    /// an idle chat applies nothing — the next run carries the config value.
+    func setPlanMode(active: Bool) {
+        queueCommand(kind: "setPlanMode", payload: [
+            "kind": "setPlanMode",
+            "active": active,
         ])
     }
 

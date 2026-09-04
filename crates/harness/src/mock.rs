@@ -9,6 +9,20 @@ use comet_proto::{
     UserInputQuestion,
 };
 
+/// The scripted plan for the `COMET_MOCK_PLAN` variant — three drafts, so the
+/// card's in-place refresh is observable, then the exit gate.
+const PLAN_DRAFTS: [&str; 3] = [
+    "# Veil port plan\n\n1. Port the fade veil to the row painter.\n",
+    "# Veil port plan\n\n1. Port the fade veil to the row painter.\n2. Key the veil on the streamed byte offset.\n",
+    concat!(
+        "# Veil port plan\n\n",
+        "1. Port the fade veil to the row painter.\n",
+        "2. Key the veil on the streamed byte offset.\n",
+        "3. Gate the veil behind `prefers-reduced-motion`.\n\n",
+        "```rust\nfn veil(t: f32) -> f32 { 1.0 - (1.0 - t).powi(3) }\n```\n",
+    ),
+];
+
 use crate::{Harness, HarnessError, RunControls};
 
 pub struct MockHarness {
@@ -60,6 +74,11 @@ impl Harness for MockHarness {
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[ReasoningLevel::Medium]
+    }
+    /// The mock drives the whole plan-mode cycle (`COMET_MOCK_PLAN`), so the
+    /// composer toggle shows for it — the data-side way to exercise the card.
+    fn plan_mode(&self) -> bool {
+        true
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![
@@ -141,6 +160,80 @@ impl Harness for MockHarness {
                         }
                     ),
                 });
+                let _ = tx.send(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                });
+            });
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (Ok(event), rx))
+            });
+            return Ok(stream.boxed());
+        }
+
+        // Dev/testing knob: `COMET_MOCK_PLAN=1` (or a run requested in plan
+        // mode) plays the native plan-mode cycle end to end: the reported
+        // mode, three in-place plan drafts, the exit gate through
+        // `controls.plan.request_exit` (the engine mints the id and resolves
+        // it from the `RespondPlanExit` doc command), then either the
+        // "approved" tail — mode off, execution text — or a "keep planning"
+        // revision that echoes the feedback. The only data-side way to put
+        // the plan card on screen with the mock harness.
+        let plan_mode = _request.plan_mode
+            || std::env::var("COMET_MOCK_PLAN")
+                .ok()
+                .is_some_and(|v| !v.is_empty() && v != "0");
+        if plan_mode {
+            let request_exit = controls.plan.request_exit;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+            tokio::spawn(async move {
+                // Slow enough that each draft lands in its own doc commit
+                // (STREAM_COMMIT_MS coalescing), so the card's "Drafting…"
+                // state is observable in the demo.
+                let pause = if delay_ms == 0 {
+                    std::time::Duration::from_millis(400)
+                } else {
+                    delay
+                };
+                let _ = tx.send(AgentEvent::PlanModeChanged { active: true });
+                let _ = tx.send(AgentEvent::TextDelta {
+                    text: "Exploring the veil code paths before I commit to a plan.\n\n".into(),
+                });
+                for draft in PLAN_DRAFTS {
+                    tokio::time::sleep(pause).await;
+                    let _ = tx.send(AgentEvent::PlanUpdated {
+                        text: draft.to_owned(),
+                        path: Some("~/.mock/plans/veil-port.md".into()),
+                    });
+                }
+                tokio::time::sleep(pause).await;
+                let decision = request_exit()
+                    .await
+                    .unwrap_or(comet_proto::PlanDecision::keep_planning(None));
+                tokio::time::sleep(pause).await;
+                if decision.approved {
+                    let _ = tx.send(AgentEvent::PlanModeChanged { active: false });
+                    let _ = tx.send(AgentEvent::TextDelta {
+                        text: "Plan approved — porting the veil now.".into(),
+                    });
+                } else if decision.rejected {
+                    // The engine ends the turn; the demo just says so.
+                    let _ = tx.send(AgentEvent::TextDelta {
+                        text: "Plan rejected — stopping here.".into(),
+                    });
+                } else {
+                    let _ = tx.send(AgentEvent::TextDelta {
+                        text: format!(
+                            "Staying in plan mode. {}",
+                            decision
+                                .feedback
+                                .map(|f| format!("Revising for: _{f}_"))
+                                .unwrap_or_else(|| "Tell me what to change.".into())
+                        ),
+                    });
+                }
                 let _ = tx.send(AgentEvent::Done {
                     status: DoneStatus::Completed,
                     result: None,

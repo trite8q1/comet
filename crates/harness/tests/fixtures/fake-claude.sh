@@ -85,6 +85,47 @@ case "$first" in
   esac
   ;;
 
+*scenario:plan*)
+  # Native plan mode (ARCHITECTURE.md §11.2). The run's cwd is a tempdir the
+  # test owns: argv lands there (so `--permission-mode plan` is observable),
+  # the plan file is pre-created under `plans/`, and the control_response to
+  # the ExitPlanMode gate is echoed back for byte-level assertions.
+  printf '%s\n' "$@" >argv.txt
+  plan_file="$(pwd)/plans/x.md"
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Write"],"cwd":"/tmp","session_id":"sess-plan","permissionMode":"plan"}'
+  # The model writes the plan file; the adapter re-reads it from disk.
+  emit "{\"type\":\"assistant\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"plan-write\",\"name\":\"Write\",\"input\":{\"file_path\":\"$plan_file\",\"content\":\"not the source of truth\"}}]}}"
+  emit '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"plan-write","is_error":false}]}}'
+  # The exit gate: the CLI injects the plan text and path into the input.
+  emit "{\"type\":\"control_request\",\"request_id\":\"cr-plan\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"ExitPlanMode\",\"input\":{\"plan\":\"# Gate plan\",\"planFilePath\":\"$plan_file\"}}}"
+  read -r resp || exit 1
+  printf '%s\n' "$resp" >plan-exit-response.json
+  emit '{"type":"result","subtype":"success","result":"planned","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-plan"}'
+  ;;
+
+*scenario:enterplan*)
+  # The CLI's other reported-mode signal: an `EnterPlanMode` tool that
+  # SUCCEEDS. A failed one reports nothing.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-enterplan","permissionMode":"default"}'
+  emit '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"enter-ok","name":"EnterPlanMode","input":{}}]}}'
+  emit '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"enter-ok","is_error":false}]}}'
+  emit '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"enter-fail","name":"EnterPlanMode","input":{}}]}}'
+  emit '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"enter-fail","is_error":true}]}}'
+  emit '{"type":"result","subtype":"success","result":"entered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-enterplan"}'
+  ;;
+
+*scenario:switchplan*)
+  # The live switch: the toggle mid-run arrives as a client→CLI control
+  # request on stdin. Echo it for the test, then acknowledge it the way the
+  # CLI's own control handler does.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-switchplan","permissionMode":"default"}'
+  read -r mode || exit 1
+  printf '%s\n' "$mode" >set-permission-mode.jsonl
+  rid=$(printf '%s\n' "$mode" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\"}}"
+  emit '{"type":"result","subtype":"success","result":"switched","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-switchplan"}'
+  ;;
+
 *scenario:steer*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer"}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'

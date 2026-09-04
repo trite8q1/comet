@@ -119,6 +119,32 @@ pub enum SubagentStatus {
     Failed,
 }
 
+/// Lifecycle of the harness's plan within one segment (ARCHITECTURE.md §11.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanStatus {
+    /// The harness is still writing the plan.
+    Drafting,
+    /// The harness asked to leave plan mode with this plan; the card's
+    /// Approve / Keep planning / Reject answer the parked `request_id`.
+    AwaitingApproval,
+    Approved,
+    /// The user chose to keep planning; the harness continues in plan mode.
+    Revising,
+    /// The user rejected the plan: the turn ended with it (§11.4). A peer
+    /// too old to know this string decodes it as `Drafting` — the card reads
+    /// wrong for that one device, never unanswerable.
+    Rejected,
+}
+
+/// The fixed id of a segment's single plan part: every `PlanUpdated` refreshes
+/// it in place (the `LIVE_PLAN_TOOL_ID` singleton trick).
+pub const PLAN_PART_ID: &str = "plan";
+
+/// Plan text cap — a plan is prose, not a transcript; this keeps a runaway
+/// plan file from splitting the entry into continuations.
+pub const PLAN_TEXT_MAX_BYTES: usize = 128 * 1024;
+
 /// One rendered part of an assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -193,6 +219,22 @@ pub enum MessagePart {
         #[serde(default)]
         resolved: bool,
     },
+    /// The harness's current plan (ARCHITECTURE.md §11.5): the doc's plan
+    /// state, rendered as the plan card. The body rides `plan`, never
+    /// `text`, so pre-plan desktop builds degrade to an invisible part and
+    /// iOS drops the unknown kind (the `Reasoning` precedent above).
+    #[serde(rename_all = "camelCase")]
+    Plan {
+        id: String,
+        plan: String,
+        status: PlanStatus,
+        /// The parked exit request while `AwaitingApproval`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// Where the harness keeps the plan, when it is a file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     Error {
         id: String,
         message: String,
@@ -206,6 +248,7 @@ impl MessagePart {
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
+            | MessagePart::Plan { id, .. }
             | MessagePart::Error { id, .. } => id,
         }
     }
@@ -232,6 +275,7 @@ impl MessagePart {
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
+            MessagePart::Plan { plan, .. } => plan.len(),
             MessagePart::Error { message, .. } => message.len(),
         }
     }
@@ -249,6 +293,8 @@ impl MessagePart {
 /// - `ToolCall` appends, or refreshes in place when the id already exists (SDK retry idempotence).
 /// - `ToolResult` marks the matching tool part resolved / errored in place.
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
+/// - `PlanUpdated` appends the segment's single plan part or refreshes it in place;
+///   `PlanExitRequested` / `PlanExitResolved` move its status (ARCHITECTURE.md §11.4).
 /// - `Error` and `Done{error}` become visible error parts.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
@@ -371,6 +417,89 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
+        AgentEvent::PlanUpdated { text, path } => {
+            let mut text = text.clone();
+            if text.len() > PLAN_TEXT_MAX_BYTES {
+                let mut cut = PLAN_TEXT_MAX_BYTES;
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+            }
+            if let Some(MessagePart::Plan {
+                plan,
+                path: slot,
+                status,
+                ..
+            }) = out.iter_mut().find(|p| p.id() == PLAN_PART_ID)
+            {
+                *plan = text;
+                if path.is_some() {
+                    *slot = path.clone();
+                }
+                // A rewrite after a decision is a new draft of the same plan.
+                if matches!(
+                    status,
+                    PlanStatus::Approved | PlanStatus::Revising | PlanStatus::Rejected
+                ) {
+                    *status = PlanStatus::Drafting;
+                }
+            } else {
+                out.push(MessagePart::Plan {
+                    id: PLAN_PART_ID.into(),
+                    plan: text,
+                    status: PlanStatus::Drafting,
+                    request_id: None,
+                    path: path.clone(),
+                });
+            }
+        }
+        AgentEvent::PlanExitRequested { request_id } => {
+            // A gate with no plan text seen yet (an adapter whose wire carries
+            // the plan only on the exit request emits PlanUpdated first; this
+            // is the tolerant path) still needs a card to answer from.
+            if !out.iter().any(|p| p.id() == PLAN_PART_ID) {
+                out.push(MessagePart::Plan {
+                    id: PLAN_PART_ID.into(),
+                    plan: String::new(),
+                    status: PlanStatus::Drafting,
+                    request_id: None,
+                    path: None,
+                });
+            }
+            for p in out.iter_mut() {
+                if let MessagePart::Plan {
+                    status,
+                    request_id: rid,
+                    ..
+                } = p
+                {
+                    *status = PlanStatus::AwaitingApproval;
+                    *rid = Some(request_id.clone());
+                }
+            }
+        }
+        AgentEvent::PlanExitResolved {
+            request_id,
+            approved,
+            rejected,
+        } => {
+            for p in out.iter_mut() {
+                if let MessagePart::Plan {
+                    status,
+                    request_id: rid,
+                    ..
+                } = p
+                    && rid.as_deref() == Some(request_id.as_str())
+                {
+                    *status = match (*approved, *rejected) {
+                        (true, _) => PlanStatus::Approved,
+                        (false, true) => PlanStatus::Rejected,
+                        (false, false) => PlanStatus::Revising,
+                    };
+                }
+            }
+        }
         AgentEvent::Error { message } => {
             let id = format!("e{}", out.len());
             out.push(MessagePart::Error {
@@ -446,6 +575,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::AvailableCommands { .. }
+        // Mode reports are session state (the host reconciles ChatConfig);
+        // the card reads the plan part's own status.
+        | AgentEvent::PlanModeChanged { .. }
         | AgentEvent::UserMessage { .. } => {}
     }
 }
@@ -987,6 +1119,189 @@ mod tests {
             new_text: "one\ntwo\n".into(),
         });
         assert_eq!((stat.additions, stat.deletions), (2, 0));
+    }
+
+    /// ARCHITECTURE.md §11.4: one plan part per segment, refreshed in place
+    /// through the gate's lifecycle.
+    #[test]
+    fn fold_plan_lifecycle_refreshes_one_part_in_place() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::TextDelta {
+                text: "thinking".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanUpdated {
+                text: "# v1".into(),
+                path: Some("/p/plans/a.md".into()),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanUpdated {
+                text: "# v2".into(),
+                path: None,
+            },
+        );
+        assert_eq!(parts.len(), 2, "text + one plan part");
+        assert_eq!(
+            parts[1],
+            MessagePart::Plan {
+                id: PLAN_PART_ID.into(),
+                plan: "# v2".into(),
+                status: PlanStatus::Drafting,
+                request_id: None,
+                path: Some("/p/plans/a.md".into()),
+            }
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitRequested {
+                request_id: "req-1".into(),
+            },
+        );
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Plan { status: PlanStatus::AwaitingApproval, request_id: Some(r), .. } if r == "req-1"
+        ));
+        // A foreign id resolves nothing.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitResolved {
+                request_id: "other".into(),
+                approved: true,
+                rejected: false,
+            },
+        );
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Plan {
+                status: PlanStatus::AwaitingApproval,
+                ..
+            }
+        ));
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitResolved {
+                request_id: "req-1".into(),
+                approved: false,
+                rejected: false,
+            },
+        );
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Plan {
+                status: PlanStatus::Revising,
+                ..
+            }
+        ));
+        // Keep planning → the next draft is a draft again, same part.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanUpdated {
+                text: "# v3".into(),
+                path: None,
+            },
+        );
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Plan { status: PlanStatus::Drafting, plan, .. } if plan == "# v3"
+        ));
+        assert_eq!(parts.len(), 2);
+    }
+
+    /// §11.4: a REJECT settles the card `rejected` — distinct from the
+    /// keep-planning `revising`, because the turn ended with it. A later
+    /// draft in the same segment is still a fresh draft of the same part.
+    #[test]
+    fn fold_plan_reject_settles_the_part_and_redrafts() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanUpdated {
+                text: "# v1".into(),
+                path: None,
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitRequested {
+                request_id: "req-9".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitResolved {
+                request_id: "req-9".into(),
+                approved: false,
+                rejected: true,
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Plan {
+                status: PlanStatus::Rejected,
+                ..
+            }
+        ));
+        // An approval still wins over the reject flag (exclusive states).
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitResolved {
+                request_id: "req-9".into(),
+                approved: true,
+                rejected: true,
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Plan {
+                status: PlanStatus::Approved,
+                ..
+            }
+        ));
+    }
+
+    /// A gate that arrives before any plan text still yields a card to
+    /// answer from; oversized plans are cut at a char boundary.
+    #[test]
+    fn fold_plan_gate_without_text_and_size_cap() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanExitRequested {
+                request_id: "req-9".into(),
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Plan { status: PlanStatus::AwaitingApproval, plan, .. } if plan.is_empty()
+        ));
+        let big = "é".repeat(PLAN_TEXT_MAX_BYTES);
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::PlanUpdated {
+                text: big,
+                path: None,
+            },
+        );
+        let MessagePart::Plan { plan, .. } = &parts[0] else {
+            panic!("plan part");
+        };
+        assert!(plan.len() <= PLAN_TEXT_MAX_BYTES);
+        assert!(plan.chars().all(|c| c == 'é'));
+    }
+
+    /// The mode report is session state, not a part.
+    #[test]
+    fn fold_ignores_plan_mode_reports() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &AgentEvent::PlanModeChanged { active: true });
+        assert!(parts.is_empty());
     }
 
     #[test]

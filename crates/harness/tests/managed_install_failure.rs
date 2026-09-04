@@ -11,10 +11,10 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use comet_harness::{AcpHarness, Harness, HarnessError, RunControls};
 use comet_proto::{RunRequest, SandboxLevel};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn silent_npm_enoent_death_surfaces_decoded_error() {
@@ -41,6 +41,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        plan: comet_harness::PlanControls::off(),
     };
     let request = RunRequest {
         prompt: "hi".into(),
@@ -51,6 +52,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        plan_mode: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
