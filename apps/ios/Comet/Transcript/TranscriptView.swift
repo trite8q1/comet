@@ -566,30 +566,71 @@ struct UserBubble: View {
         // transport); split them out and render thumbnails above the bubble,
         // exactly like the desktop's user rows.
         let parsed = parseUserMessageImages(text)
+        // File mentions render as chips here too, not just in the composer
+        // (transcript.rs `user_bubble_text`, §6.1); the projection runs after
+        // the attachment split, and ordinary prompts return nil — the plain
+        // `Text` below is then exactly what it always was.
+        let projected = sentMentionDisplay(parsed.text)
+        let display = projected?.display ?? parsed.text
         VStack(alignment: .trailing, spacing: 8) {
             if !parsed.attachments.isEmpty, !deviceId.isEmpty {
                 UserAttachmentsStrip(deviceId: deviceId, attachments: parsed.attachments)
             }
-            if !parsed.text.isEmpty {
-                Text(parsed.text)
-                    .font(Theme.sans(MD.textSize))
-                    .lineSpacing(MD.lineHeight - MD.textSize - 4)
-                    .foregroundStyle(Theme.text)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
-                    .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
-                    .contextMenu {
-                        Button {
-                            UIPasteboard.general.string = parsed.text
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                        }
+            if !display.isEmpty {
+                Group {
+                    if let spans = projected?.spans {
+                        chipText(display, spans: spans)
+                            .textRenderer(InlineCodeRenderer())
+                    } else {
+                        Text(display)
                     }
+                }
+                .font(Theme.sans(MD.textSize))
+                .lineSpacing(MD.lineHeight - MD.textSize - 4)
+                .foregroundStyle(Theme.text)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
+                .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = display
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                }
             }
         }
         .opacity(pending ? 0.65 : 1)
         .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    /// Chip spans shape in mono at the inline-code text colour while the body
+    /// keeps the bubble's sans (§5.2, desktop `user_bubble_text`); the rounded
+    /// wash is painted beneath by `InlineCodeRenderer`. Runs are concatenated
+    /// rather than built as one AttributedString because custom TextAttributes
+    /// only attach through `Text.customAttribute` (see markdown `styled()`).
+    private func chipText(_ display: String, spans: [SentMentionSpan]) -> Text {
+        let chars = Array(display)
+        var result = Text(verbatim: "")
+        var at = 0
+        for span in spans {
+            if at < span.range.lowerBound {
+                let body = Text(String(chars[at..<span.range.lowerBound]))
+                result = Text("\(result)\(body)")
+            }
+            var piece = AttributedString(String(chars[span.range]))
+            piece.font = Theme.mono(MD.textSize)
+            piece.foregroundColor = Theme.inlineCodeText
+            let chip = Text(piece).customAttribute(InlineCodeAttribute())
+            result = Text("\(result)\(chip)")
+            at = span.range.upperBound
+        }
+        if at < chars.count {
+            let tail = Text(String(chars[at...]))
+            result = Text("\(result)\(tail)")
+        }
+        return result
     }
 }
 

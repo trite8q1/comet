@@ -18,10 +18,14 @@ struct NewSessionView: View {
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
 
-    @State private var draft = ""
-    @State private var selection: TextSelection?
+    @State private var draft = MentionDraft()
+    @State private var selection = AttributedTextSelection()
     /// `/` completion, fed by ListCommands on the picked space's device (§10.2).
     @State private var slash = SlashCommandsModel()
+    /// `@` completion, fed by SearchFiles over the picked space's folder (§4.1).
+    @State private var mentions = FileMentionsModel()
+    /// The in-flight search, held so the 80 ms debounce can cancel it (§4.2).
+    @State private var mentionSearch: Task<Void, Never>?
     @State private var showPicker = false
     @State private var showTraitPicker = false
     @State private var showRefPicker = false
@@ -67,47 +71,59 @@ struct NewSessionView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Canvas — tap dismisses the keyboard, like the old app.
-            ZStack {
-                Theme.bg
-                VStack(spacing: 24) {
-                    CometMark()
-                        .frame(width: 84, height: 84)
-                        .opacity(0.22)
-                    Text("What are we building?")
-                        .font(Theme.sans(15))
-                        .foregroundStyle(Theme.textFaint)
+        // Canvas — tap dismisses the keyboard, like the old app.
+        ZStack {
+            Theme.bg
+            VStack(spacing: 24) {
+                CometMark()
+                    .frame(width: 84, height: 84)
+                    .opacity(0.22)
+                Text("What are we building?")
+                    .font(Theme.sans(15))
+                    .foregroundStyle(Theme.textFaint)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { focused = false }
+        // The composer stack is a bottom SAFE-AREA INSET on the canvas, not a
+        // VStack sibling — SessionView.content's rule, for the same reason it
+        // is spelled out there. As siblings the canvas and the composer stack
+        // SHARE the height, and with the keyboard up there is not enough of it:
+        // the stack shrinks whatever can shrink, which is the completion
+        // popup's row list (`ScrollView.frame(maxHeight: 220)` has no floor).
+        // The card then rendered as a bare ✕ strip — "the list opens but shows
+        // nothing" (docs/composer-completions.md §4.3 states never gets to
+        // draw). An inset is sized to its own content, so the rows always get
+        // their height and the canvas absorbs the squeeze.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                if let space, !model.deviceOnline(space.deviceId), model.demo == nil {
+                    offlineNotice(space: space)
                 }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { focused = false }
 
-            if let space, !model.deviceOnline(space.deviceId), model.demo == nil {
-                offlineNotice(space: space)
-            }
-
-            // Where-it-runs scope row (checkout + base ref), left-aligned
-            // above the composer — the composer pill keeps only the agent chip.
-            if space?.gitDetected == true {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        chip(icon: checkoutIcon, label: checkoutLabel) {
-                            focused = false
-                            showCheckoutPicker = true
+                // Where-it-runs scope row (checkout + base ref), left-aligned
+                // above the composer — the composer pill keeps only the agent chip.
+                if space?.gitDetected == true {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            chip(icon: checkoutIcon, label: checkoutLabel) {
+                                focused = false
+                                showCheckoutPicker = true
+                            }
+                            chip(icon: .gitBranch, label: refLabel) {
+                                focused = false
+                                showRefPicker = true
+                            }
                         }
-                        chip(icon: .gitBranch, label: refLabel) {
-                            focused = false
-                            showRefPicker = true
-                        }
+                        .padding(.horizontal, 16)
                     }
-                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
                 }
-                .padding(.bottom, 8)
-            }
 
-            composer
-                .padding(.bottom, 8)
+                composer
+                    .padding(.bottom, 8)
+            }
         }
         .background(Theme.bg.ignoresSafeArea())
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
@@ -196,14 +212,35 @@ struct NewSessionView: View {
             guard !items.isEmpty else { return }
             stage(items)
         }
-        .onChange(of: draft) { syncSlashCommands() }
-        .onChange(of: selection) { syncSlashCommands() }
+        .onChange(of: draft.text) {
+            // §5.3: a run an edit broke is removed whole before anything reads
+            // the draft. The write re-fires this hook, which then settles.
+            if draft.reconcile() { return }
+            syncSlashCommands()
+            syncMentions()
+        }
+        .onChange(of: selection) {
+            // Chip atomicity first (§5.3): the snap re-fires this hook.
+            if let snapped = draft.snapped(selection) {
+                selection = snapped
+                return
+            }
+            syncSlashCommands()
+            syncMentions()
+        }
         .onChange(of: harness) { syncSlashCommands() }
+        // The search root moves with the space and the checkout plan (§4.1).
+        .onChange(of: space?.deviceId) {
+            syncSlashCommands()
+            syncMentions()
+        }
+        .onChange(of: checkoutKind) { syncMentions() }
+        .onChange(of: selectedRef) { syncMentions() }
         .onAppear {
             focused = true
             if model.launchAutosend {
                 model.launchAutosend = false
-                draft = "Sketch the plan for porting the diff pane."
+                draft = MentionDraft(plain: "Sketch the plan for porting the diff pane.")
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 800_000_000)
                     send()
@@ -224,13 +261,21 @@ struct NewSessionView: View {
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            SlashCommandPopup(
-                state: slash.popup,
-                accept: { acceptSlash($slash, $0, text: $draft, selection: $selection) },
-                dismiss: { slash.dismiss(in: draft) }
-            )
+            // One popup slot: slash wins when both tokens could match, exactly
+            // as the desktop event router does (§2.1).
+            if slash.popup != .hidden {
+                SlashCommandPopup(
+                    state: slash.popup,
+                    accept: { acceptSlash($slash, $0, draft: $draft, selection: $selection) }
+                )
+            } else {
+                FileMentionPopup(
+                    state: mentions.popup,
+                    accept: { acceptMention($mentions, $0, draft: $draft, selection: $selection) }
+                )
+            }
             ComposerShell(
-                draft: $draft,
+                draft: $draft.text,
                 placeholder: "Do anything…",
                 sendEnabled: space != nil,
                 showStop: false,
@@ -240,7 +285,11 @@ struct NewSessionView: View {
                 onSend: send,
                 attachments: attachments,
                 onAttach: { showPhotoPicker = true },
-                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
+                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } },
+                // Screenshot rig (-focuscomposer), as ComposerView passes it:
+                // the keyboard-up canvas is the state the completion popups
+                // have to be checked in, and nothing else raises it headless.
+                autoFocus: model.launchFocusComposer
             ) {
                 // Model + trait chips, split like the desktop's footer pickers
                 // (they ride right of the shell's attach button).
@@ -262,11 +311,25 @@ struct NewSessionView: View {
     /// in the picked space's folder; until a space resolves there is no key to
     /// ask with, so the popup stays empty.
     private func syncSlashCommands() {
-        syncSlash($slash, text: draft, selection: selection,
+        syncSlash($slash, text: draft.display, cursor: draft.caret(of: selection),
                   key: space.map {
                       SlashCatalogKey(deviceId: $0.deviceId, harness: harness, cwd: $0.path)
                   },
                   model: model)
+    }
+
+    /// Mentions search the picked space's folder — the worktree the chat will
+    /// reuse when one is picked, the space repository otherwise (§4.1). With no
+    /// space there is nothing to walk, so no `SearchFiles` goes out.
+    private func syncMentions() {
+        syncMentionSearch($mentions, task: $mentionSearch, text: draft.display,
+                          cursor: draft.caret(of: selection),
+                          search: space.map {
+                              ($0.deviceId, .space(spaceId: $0.id,
+                                                   path: checkoutKind == .local
+                                                       ? selectedRefRow?.worktreePath : nil))
+                          },
+                          model: model)
     }
 
     /// Load picked photos into staged attachments (ComposerView.stage's twin —
@@ -367,7 +430,7 @@ struct NewSessionView: View {
 
     private var canSend: Bool {
         guard !busy, space != nil else { return false }
-        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !draft.display.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !attachments.isEmpty
     }
 
@@ -393,7 +456,8 @@ struct NewSessionView: View {
     /// forever on a zombie link (the 2026-08-18 "Sending…" incident).
     private func send() {
         guard let space, canSend else { return }
-        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Chips become their Markdown links here and nowhere else (§6).
+        let prompt = draft.serialized().trimmingCharacters(in: .whitespacesAndNewlines)
         busy = true
         let config = ChatConfig(harness: harness, model: selectedModel.id,
                                 reasoning: reasoning, sandbox: "workspace-write")
@@ -473,7 +537,7 @@ struct NewSessionView: View {
                               chat: chat, attachments: legacyPaths, worktree: worktree)
             }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            draft = ""
+            draft = MentionDraft()
             attachments = []
             busy = false
             // Replace the canvas with the live session (in-place swap, no

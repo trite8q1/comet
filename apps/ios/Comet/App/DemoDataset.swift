@@ -124,6 +124,29 @@ final class DemoDataset {
                      inputHint: "range"),
     ]
 
+    /// Stand-in for a device's `SearchFiles` reply — checkout-relative paths
+    /// in the demo comet repo. The engine owns ranking; the demo only filters
+    /// by substring so the `@` popup looks alive.
+    static let mentionFiles: [FileSearchMatch] = [
+        FileSearchMatch(path: "ARCHITECTURE.md", isDir: false),
+        FileSearchMatch(path: "docs", isDir: true),
+        FileSearchMatch(path: "docs/composer-completions.md", isDir: false),
+        FileSearchMatch(path: "crates/ui/src/composer.rs", isDir: false),
+        FileSearchMatch(path: "crates/ui/src/transcript.rs", isDir: false),
+        FileSearchMatch(path: "crates/engine/src/rpc.rs", isDir: false),
+        FileSearchMatch(path: "crates/harness/src/commands.rs", isDir: false),
+        FileSearchMatch(path: "apps/ios/Comet/Composer", isDir: true),
+        FileSearchMatch(path: "apps/ios/Comet/Composer/ComposerView.swift", isDir: false),
+        FileSearchMatch(path: "apps/ios/Comet/App/AppModel.swift", isDir: false),
+    ]
+
+    static func searchFiles(query: String) -> [FileSearchMatch] {
+        let hits = query.isEmpty
+            ? mentionFiles
+            : mentionFiles.filter { $0.path.localizedCaseInsensitiveContains(query) }
+        return Array(hits.prefix(8))
+    }
+
     // MARK: Fake filesystem (folder browser demo)
 
     static let fileTree: [String: [String]] = [

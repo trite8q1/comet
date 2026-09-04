@@ -299,6 +299,10 @@ arguments, discovered the same way, and activated the same way (explicit vs. mod
 Nothing more: comet does not invent a skills catalog, does not read `SKILL.md` itself, and
 does not offer a skill on a harness whose CLI would not offer it either.
 
+The composer side of this feature — token grammars, popup states, accept/dismiss rules —
+and the `@` file-mention feature that shares them are specified in
+`docs/composer-completions.md`; both surfaces implement that one design.
+
 ### 10.1 Vocabulary
 
 - **Invocable** — one entry the harness lets the user invoke by name from the prompt. Wire

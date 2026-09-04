@@ -597,7 +597,24 @@ final class WorkspaceStore {
             return .commands(commands)
         } catch {
             lastRelayError = error.localizedDescription
-            return .failure(error.localizedDescription)
+            return .failure(completionErrorMessage(error, action: .listCommands))
+        }
+    }
+
+    /// SearchFiles — a ranked walk of the checkout the scope names, at most 8
+    /// hits, for the composer's `@` popup (docs/composer-completions.md §4.1).
+    /// The engine owns ranking, `.gitignore` and the root check; the scope is
+    /// an input. The default 10s deadline outlasts the engine's own 6s cap.
+    func searchFiles(deviceId: String, scope: FileSearchScope,
+                     query: String) async -> FileSearchResult {
+        do {
+            let matches: [FileSearchMatch] = try await relay(for: deviceId)
+                .call(method: "SearchFiles",
+                      params: fileSearchParams(query: query, scope: scope))
+            return .matches(matches)
+        } catch {
+            lastRelayError = error.localizedDescription
+            return .failure(completionErrorMessage(error, action: .searchFiles))
         }
     }
 

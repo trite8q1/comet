@@ -385,6 +385,19 @@ final class AppModel {
         return await workspace.listCommands(deviceId: deviceId, harness: harness, cwd: cwd)
     }
 
+    /// The checkout the scope names, searched on its owning device (§4.1) —
+    /// what the composer's `@` popup lists. The engine ranks and caps the
+    /// hits; a failure is the popup's error row.
+    func searchFiles(deviceId: String, scope: FileSearchScope,
+                     query: String) async -> FileSearchResult {
+        if demo != nil {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            return .matches(DemoDataset.searchFiles(query: query))
+        }
+        guard let workspace else { return .failure("Not connected") }
+        return await workspace.searchFiles(deviceId: deviceId, scope: scope, query: query)
+    }
+
     /// Refs of the space's repo (git spaces only).
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {
