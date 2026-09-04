@@ -32,9 +32,6 @@ struct PlanCardView: View {
     let status: PlanStatus
     /// The parked gate, present only while `awaitingApproval`.
     let requestId: String?
-    /// The harness's plan file, where its CLI keeps one — nil on the three
-    /// harnesses that never write the plan to disk (§11.2).
-    let path: String?
     /// `ChatConfig.harness` — the mark in the header tile.
     let harness: String?
     /// Row id; seeds the markdown highlight cache.
@@ -51,9 +48,6 @@ struct PlanCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            if let path, !path.isEmpty {
-                pathRow(path)
-            }
             if open {
                 VStack(alignment: .leading, spacing: MD.blockGap) {
                     ForEach(Array(blocks.enumerated()), id: \.offset) { ix, top in
@@ -172,51 +166,6 @@ struct PlanCardView: View {
         }
         .opacity(answered ? 0.4 : 1)
         .disabled(answered)
-    }
-
-    /// The plan file, on its own row between the header and the fold so it
-    /// reads whether the card is open or closed — the desktop's `path_line`,
-    /// at the header's 8pt gutter because the line belongs to the header
-    /// block, not to the plan text. Mono 11, one notch under the header's 12pt
-    /// title: the path is what the card is ABOUT, never a second heading. No
-    /// file icon (§11.6: the card's one tile is the harness brand).
-    private func pathRow(_ path: String) -> some View {
-        let (directory, name) = splitDisplayPath(planPathDisplay(path))
-        return HStack(spacing: 0) {
-            // The directory yields first and truncates from its HEAD; the
-            // basename is the only useful part of a 239-char plan path, so it
-            // keeps its ideal width no matter how narrow the card gets.
-            Text(directory)
-                .lineLimit(1)
-                .truncationMode(.head)
-                .layoutPriority(0)
-            Text(name)
-                .fixedSize(horizontal: true, vertical: false)
-                .layoutPriority(1)
-            Spacer(minLength: 0)
-        }
-        .font(Theme.mono(11))
-        .foregroundStyle(Theme.textMuted)
-        .padding(.horizontal, 8)
-        .padding(.bottom, 6)
-        // The whole row, padding included, is the press target — the glyph
-        // runs alone are an 11pt line and a poor one.
-        .contentShape(Rectangle())
-        // Long-press to copy: the app's one copy idiom (the code block and the
-        // user bubble say it the same way), and the row is outside the
-        // header's fold Button, so nothing competes for the press.
-        //
-        // The ABSOLUTE path is what lands on the pasteboard, never the
-        // `~`-collapsed line above it: this is copied to be USED — pasted
-        // into a terminal, a message, another device — and `~` only resolves
-        // against a home directory this path may not even belong to.
-        .contextMenu {
-            Button {
-                UIPasteboard.general.string = path
-            } label: {
-                Label("Copy path", systemImage: "doc.on.doc")
-            }
-        }
     }
 
     private func answer(_ answer: PlanAnswer) {

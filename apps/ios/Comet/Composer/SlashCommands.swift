@@ -119,6 +119,41 @@ func slashFilterIndices(query: String, commands: [SlashCommand]) -> [Int] {
 
 // MARK: - Accept
 
+/// One token replacement (§2.2 of docs/composer-completions.md): the character
+/// range to replace, the text that goes in (the separator included when one is
+/// appended), and where the caret lands afterwards.
+struct TokenReplacement: Equatable {
+    let range: Range<Int>
+    let inserted: String
+    let cursor: Int
+
+    /// The plain-text draft after this replacement. The attributed draft goes
+    /// through `MentionDraft.apply` / `insertMention` instead.
+    func applied(to text: String) -> String {
+        let chars = Array(text)
+        return String(chars[..<range.lowerBound]) + inserted + String(chars[range.upperBound...])
+    }
+}
+
+/// `replace_plain_token` / `replace_mention`'s shared separator rule: if the
+/// character after the token is whitespace other than `\n`/`\r` it stays and
+/// the caret lands past it, otherwise a single space is appended and the caret
+/// lands after that. Arguments (slash) or prose (mention) follow.
+func tokenReplacement(text: String, range: Range<Int>, inserted: String) -> TokenReplacement {
+    let chars = Array(text)
+    let next = range.upperBound < chars.count ? chars[range.upperBound] : nil
+    let existingSeparator = next.map { $0.isWhitespace && $0 != "\n" && $0 != "\r" } ?? false
+    let inserted = existingSeparator ? inserted : inserted + " "
+    let cursor = range.lowerBound + inserted.count + (existingSeparator ? 1 : 0)
+    return TokenReplacement(range: range, inserted: inserted, cursor: cursor)
+}
+
+/// `accept_slash`: the token becomes `/name` plus the separator (§2.2).
+func slashReplacement(text: String, token: SlashToken,
+                      command: SlashCommand) -> TokenReplacement {
+    tokenReplacement(text: text, range: token.range, inserted: "/\(command.name)")
+}
+
 /// The draft after accepting a command, and where the caret lands in it
 /// (character offsets).
 struct SlashAccept: Equatable {
@@ -126,19 +161,11 @@ struct SlashAccept: Equatable {
     let cursor: Int
 }
 
-/// `accept_slash` + `replace_plain_token`: the token becomes `/name` followed
-/// by a space (unless a separator already sits there), and the caret lands
-/// after that separator so arguments follow.
+/// `slashReplacement` applied to a plain-text draft — the surfaces that hold
+/// their draft as a `String` rather than as a `MentionDraft`.
 func slashAccept(text: String, token: SlashToken, command: SlashCommand) -> SlashAccept {
-    let chars = Array(text)
-    let next = token.range.upperBound < chars.count ? chars[token.range.upperBound] : nil
-    let existingSeparator = next.map { $0.isWhitespace && $0 != "\n" && $0 != "\r" } ?? false
-    let inserted = existingSeparator ? "/\(command.name)" : "/\(command.name) "
-    let updated = String(chars[..<token.range.lowerBound])
-        + inserted
-        + String(chars[token.range.upperBound...])
-    let cursor = token.range.lowerBound + inserted.count + (existingSeparator ? 1 : 0)
-    return SlashAccept(text: updated, cursor: cursor)
+    let replacement = slashReplacement(text: text, token: token, command: command)
+    return SlashAccept(text: replacement.applied(to: text), cursor: replacement.cursor)
 }
 
 // MARK: - Composer-owned rows
@@ -255,24 +282,35 @@ struct SlashCommandsModel {
 
     /// Replace the token with `/name `, closing the popup.
     mutating func accept(_ command: SlashCommand, in text: String) -> SlashAccept? {
+        guard let replacement = acceptReplacement(command, in: text) else { return nil }
+        return SlashAccept(text: replacement.applied(to: text), cursor: replacement.cursor)
+    }
+
+    /// The same accept as a `TokenReplacement`, for the attributed draft.
+    mutating func acceptReplacement(_ command: SlashCommand,
+                                    in text: String) -> TokenReplacement? {
         guard let token else { return nil }
         self.token = nil
         dismissed = nil
-        return slashAccept(text: text, token: token, command: command)
+        return slashReplacement(text: text, token: token, command: command)
     }
 
     var popup: SlashPopup {
         guard let token else { return .hidden }
         // The composer's own rows merge in before anything else reads them, so
-        // prefix filtering, ranking and accept treat `/plan` like any row —
-        // and a key carrying one is never "no rows at all", so a loading or
-        // failed probe shows it instead of a spinner or an error line.
+        // prefix filtering, ranking and accept treat `/plan` like any row. The
+        // desktop's two gates read different things and so do these: the
+        // skeleton yields to ANY row including `/plan`
+        // (`self.slash.loading && commands.is_empty()`), while a failure is
+        // latched on the key having no CACHED CATALOG
+        // (`slash_failure_error`'s `slash_cache.contains_key`), so its message
+        // always shows — `/plan` alone is never an answer to a failed probe.
         let commands = slashRowsWithBuiltins(catalog: key.flatMap { catalogs[$0] } ?? [],
                                              planOffered: planOffered)
         if let key, inFlight.contains(key), commands.isEmpty { return .loading }
         // A failed revalidation never blanks a list that was fine a moment ago
-        // (§10.4): the error shows only when the key has no rows at all.
-        if let key, let message = errors[key], commands.isEmpty { return .failed(message) }
+        // (§10.4): the error shows only when the key has no catalog at all.
+        if let key, let message = errors[key], catalogs[key] == nil { return .failed(message) }
         let filtered = slashFilterIndices(query: token.query, commands: commands)
         if filtered.isEmpty { return commands.isEmpty ? .noCommands : .noMatches }
         return .commands(filtered.map { commands[$0] })

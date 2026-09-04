@@ -594,16 +594,35 @@ final class WorkspaceStore {
     /// custom commands, built-ins; ARCHITECTURE.md §10.2). The harness is an
     /// input, never derived here, and the reply is that harness's catalog only.
     /// `cwd` scopes discovery to the directory the run would execute in (§10.4).
-    /// The failure text feeds the composer's error row.
+    /// The failure text feeds the composer's error row. The 15s deadline
+    /// outlasts the engine's own 10s discovery cap plus the CLI spawn.
     func listCommands(deviceId: String, harness: String, cwd: String?) async -> SlashCatalog {
         do {
             let commands: [SlashCommand] = try await relay(for: deviceId)
                 .call(method: "ListCommands",
-                      params: slashListCommandsParams(harness: harness, cwd: cwd))
+                      params: slashListCommandsParams(harness: harness, cwd: cwd),
+                      timeoutSeconds: 15)
             return .commands(commands)
         } catch {
             lastRelayError = error.localizedDescription
-            return .failure(error.localizedDescription)
+            return .failure(completionErrorMessage(error, action: .listCommands))
+        }
+    }
+
+    /// SearchFiles — a ranked walk of the checkout the scope names, at most 8
+    /// hits, for the composer's `@` popup (docs/composer-completions.md §4.1).
+    /// The engine owns ranking, `.gitignore` and the root check; the scope is
+    /// an input. The default 10s deadline outlasts the engine's own 6s cap.
+    func searchFiles(deviceId: String, scope: FileSearchScope,
+                     query: String) async -> FileSearchResult {
+        do {
+            let matches: [FileSearchMatch] = try await relay(for: deviceId)
+                .call(method: "SearchFiles",
+                      params: fileSearchParams(query: query, scope: scope))
+            return .matches(matches)
+        } catch {
+            lastRelayError = error.localizedDescription
+            return .failure(completionErrorMessage(error, action: .searchFiles))
         }
     }
 

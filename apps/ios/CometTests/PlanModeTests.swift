@@ -460,50 +460,6 @@ final class PlanModeTests: XCTestCase {
         XCTAssertEqual(path, "/tmp/x/notes/a.md")
     }
 
-    /// The card's path line, semantics for semantics with the desktop's
-    /// `file_path::home_relative` (its unit tests pin the same cases).
-    func testThePlanPathIsShownHomeRelative() {
-        let home = "/Users/nico"
-        XCTAssertEqual(planPathDisplay("/Users/nico/notes/a.md", home: home), "~/notes/a.md")
-        XCTAssertEqual(planPathDisplay("/Users/nico", home: home), "~")
-        // Idempotent: an already-shortened path is handed straight back.
-        XCTAssertEqual(planPathDisplay("~/notes/a.md", home: home), "~/notes/a.md")
-        XCTAssertEqual(planPathDisplay("~", home: home), "~")
-        // Outside HOME, and a sibling that only shares the prefix.
-        XCTAssertEqual(planPathDisplay("/tmp/x/a.md", home: home), "/tmp/x/a.md")
-        XCTAssertEqual(planPathDisplay("/Users/nicolas/a.md", home: home), "/Users/nicolas/a.md")
-        // A trailing-slash HOME must not leave a doubled separator.
-        XCTAssertEqual(planPathDisplay("/Users/nico/notes/a.md", home: "/Users/nico/"),
-                       "~/notes/a.md")
-        // No home to speak of shortens nothing.
-        XCTAssertEqual(planPathDisplay("/Users/nico/a.md", home: ""), "/Users/nico/a.md")
-        // Nothing is percent-decoded: the encoded segment IS the name on disk.
-        XCTAssertEqual(planPathDisplay("/Users/nico/.state/%2FUsers%2Fnico%2Frepo/a.md",
-                                       home: home),
-                       "~/.state/%2FUsers%2Fnico%2Frepo/a.md")
-    }
-
-    /// Truncation may eat the directory; it may never eat the filename, so the
-    /// two halves are split before they reach the view.
-    func testThePlanPathSplitKeepsTheBasenameWhole() {
-        var split = splitDisplayPath("/tmp/x/notes/a.md")
-        XCTAssertEqual(split.directory, "/tmp/x/notes/")
-        XCTAssertEqual(split.name, "a.md")
-        // A bare filename has no directory half.
-        split = splitDisplayPath("plan.md")
-        XCTAssertEqual(split.directory, "")
-        XCTAssertEqual(split.name, "plan.md")
-        // A trailing slash is all directory — a folder renders as itself.
-        split = splitDisplayPath("/tmp/x/")
-        XCTAssertEqual(split.directory, "/tmp/x/")
-        XCTAssertEqual(split.name, "")
-        // The shape that motivates the whole helper: everything identifying
-        // the file is at the END of a 200-plus-character path.
-        split = splitDisplayPath("/var/sessions/\(String(repeating: "e", count: 200))/notes.md")
-        XCTAssertEqual(split.name, "notes.md")
-        XCTAssertGreaterThan(split.directory.count, 200)
-    }
-
     // MARK: Helpers
 
     private func rowsFor(plan: String, status: PlanStatus, requestId: String?,

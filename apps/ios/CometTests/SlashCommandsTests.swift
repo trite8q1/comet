@@ -305,4 +305,43 @@ final class SlashCommandsTests: XCTestCase {
         // Nothing open: accept is a no-op.
         XCTAssertNil(model.accept(command("compact"), in: "/compact "))
     }
+
+    /// The composer's own `/plan` row is a row for the LOADING state only
+    /// (`self.slash.loading && commands.is_empty()` on the desktop): a probe
+    /// that failed with no cached catalog for the key still shows its message,
+    /// because `slash_failure_error` latches on `slash_cache.contains_key`,
+    /// never on the merged rows.
+    func testThePlanRowHidesTheSkeletonButNeverTheFailure() {
+        // (a) No catalog for the key: the error row, not `/plan` alone.
+        var cold = SlashCommandsModel()
+        XCTAssertEqual(cold.update(text: "/", cursor: 1, key: claudeKey, planOffered: true),
+                       claudeKey)
+        cold.failed("The session's device is unreachable", for: claudeKey)
+        XCTAssertEqual(cold.popup, .failed("The session's device is unreachable"))
+
+        // (b) A failed revalidation over a cached catalog keeps the rows,
+        // `/plan` first (§10.4).
+        var warm = SlashCommandsModel()
+        XCTAssertEqual(warm.update(text: "/", cursor: 1, key: claudeKey, planOffered: true),
+                       claudeKey)
+        warm.received([command("compact")], for: claudeKey)
+        XCTAssertNil(warm.update(text: "", cursor: 0, key: claudeKey, planOffered: true))
+        XCTAssertEqual(warm.update(text: "/", cursor: 1, key: claudeKey, planOffered: true),
+                       claudeKey)
+        warm.failed("The session's device is unreachable", for: claudeKey)
+        XCTAssertEqual(warm.popup, .commands([planSlashCommand, command("compact")]))
+
+        // (c) In flight with no catalog: `/plan` shows instead of the skeleton.
+        var probing = SlashCommandsModel()
+        XCTAssertEqual(probing.update(text: "/", cursor: 1, key: claudeKey, planOffered: true),
+                       claudeKey)
+        XCTAssertEqual(probing.popup, .commands([planSlashCommand]))
+
+        // (d) No plan mode on this harness: both states read as before.
+        var plain = SlashCommandsModel()
+        XCTAssertEqual(plain.update(text: "/", cursor: 1, key: claudeKey), claudeKey)
+        XCTAssertEqual(plain.popup, .loading)
+        plain.failed("The session's device is unreachable", for: claudeKey)
+        XCTAssertEqual(plain.popup, .failed("The session's device is unreachable"))
+    }
 }

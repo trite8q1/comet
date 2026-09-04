@@ -31,8 +31,9 @@ pub struct HarnessDescriptor {
     #[serde(default = "default_installed")]
     pub installed: bool,
     /// Whether the agent's own wire has a plan mode comet drives natively
-    /// (ARCHITECTURE.md §11.2); gates the composer toggle. Defaults false so
-    /// catalogs from older engines never offer a toggle they cannot honor.
+    /// (ARCHITECTURE.md §11.2); gates the composer toggle. Static per adapter,
+    /// so a lazy slot reports it before any resolve. Defaults false so catalogs
+    /// from older engines never offer a toggle they cannot honor.
     #[serde(default)]
     pub plan_mode: bool,
     /// Whether the listing device offers this harness (Settings → Agents).
@@ -313,7 +314,10 @@ impl HarnessRegistry {
                         installed,
                         ..
                     }) => HarnessDescriptor {
-                        plan_mode: false,
+                        // Only `installed` is re-probed: the static descriptor
+                        // already mirrors the adapter, `plan_mode` included
+                        // (descriptor-stability rule, §11.6), so a catalog read
+                        // before any resolve gates the composer correctly.
                         installed: installed(),
                         ..descriptor.clone()
                     },
@@ -380,7 +384,9 @@ pub fn default_registry() -> HarnessRegistry {
     }));
     registry.register_lazy(
         HarnessDescriptor {
-            plan_mode: false,
+            // Read off the adapter, never restated (construction spawns
+            // nothing) — the flag must survive the first resolve unchanged.
+            plan_mode: comet_harness::ClaudeHarness::new().plan_mode(),
             id: HarnessId::ClaudeCode,
             name: "Claude Code".into(),
             supports_steering: true,
@@ -408,7 +414,7 @@ pub fn default_registry() -> HarnessRegistry {
     // run/model call actually resolves the slot.
     registry.register_lazy(
         HarnessDescriptor {
-            plan_mode: false,
+            plan_mode: comet_harness::CodexHarness::new().plan_mode(),
             id: HarnessId::Codex,
             name: "Codex".into(),
             supports_steering: true,
@@ -433,7 +439,7 @@ pub fn default_registry() -> HarnessRegistry {
     // CursorHarness exactly. Turn-boundary steering; no effort ladder.
     registry.register_lazy(
         HarnessDescriptor {
-            plan_mode: false,
+            plan_mode: comet_harness::CursorHarness::new().plan_mode(),
             id: HarnessId::Cursor,
             name: "Cursor".into(),
             supports_steering: true,
@@ -451,7 +457,7 @@ pub fn default_registry() -> HarnessRegistry {
     // session via the `thought_level` config option.
     registry.register_lazy(
         HarnessDescriptor {
-            plan_mode: false,
+            plan_mode: comet_harness::AcpHarness::grok().plan_mode(),
             id: HarnessId::Grok,
             name: "Grok".into(),
             supports_steering: true,
@@ -473,7 +479,7 @@ pub fn default_registry() -> HarnessRegistry {
     // config over ACP today (hybrid reasoning is model-internal).
     registry.register_lazy(
         HarnessDescriptor {
-            plan_mode: false,
+            plan_mode: comet_harness::AcpHarness::hermes().plan_mode(),
             id: HarnessId::Hermes,
             name: "Hermes".into(),
             supports_steering: true,
@@ -490,7 +496,7 @@ pub fn default_registry() -> HarnessRegistry {
     // pi's thinking ladder minus its "off" tier.
     registry.register_lazy(
         HarnessDescriptor {
-            plan_mode: false,
+            plan_mode: comet_harness::AcpHarness::pi().plan_mode(),
             id: HarnessId::Pi,
             name: "Pi".into(),
             supports_steering: true,
@@ -516,7 +522,7 @@ pub fn default_registry() -> HarnessRegistry {
     // run sends the first advertised variant id for the picked level).
     registry.register_lazy(
         HarnessDescriptor {
-            plan_mode: false,
+            plan_mode: comet_harness::OpencodeHarness::new().plan_mode(),
             id: HarnessId::Opencode,
             name: "OpenCode".into(),
             supports_steering: true,
@@ -901,5 +907,41 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    /// The descriptor-stability rule applied to `plan_mode` (§11.6, §11.9):
+    /// both composers gate the Plan chip and the `/plan` row on the catalog
+    /// entry, and the phone reads that catalog once, before anything resolves
+    /// a slot — so a lazy entry must already carry the adapter's flag.
+    #[test]
+    fn lazy_descriptors_report_plan_mode_before_resolving() {
+        let registry = default_registry();
+        let plan_modes = |registry: &HarnessRegistry| -> Vec<(HarnessId, bool)> {
+            registry
+                .descriptors()
+                .into_iter()
+                .map(|d| (d.id, d.plan_mode))
+                .collect()
+        };
+        let before = plan_modes(&registry);
+        // The agents whose own wire comet drives natively (§11.2): codex has
+        // no mode on its wire, hermes and pi none known without a session.
+        assert_eq!(
+            before,
+            vec![
+                (HarnessId::Mock, true),
+                (HarnessId::ClaudeCode, true),
+                (HarnessId::Codex, false),
+                (HarnessId::Cursor, true),
+                (HarnessId::Grok, true),
+                (HarnessId::Hermes, false),
+                (HarnessId::Pi, false),
+                (HarnessId::Opencode, true),
+            ]
+        );
+        for (id, _) in &before {
+            registry.resolve(*id).unwrap();
+        }
+        assert_eq!(before, plan_modes(&registry), "listing must not lie");
     }
 }

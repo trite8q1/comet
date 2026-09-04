@@ -58,16 +58,41 @@ else
   ok "engine rpc layer is harness-agnostic"
 fi
 
-# Phone: the slash popup lives in its own file and knows no harness names.
-IOS_SLASH="apps/ios/Comet/Composer/SlashCommands.swift"
-if [[ -f "$IOS_SLASH" ]]; then
-  if grep -nE '"(claude-code|codex|cursor|grok|hermes|pi|opencode|mock)"' "$IOS_SLASH" >/dev/null; then
-    fail "$IOS_SLASH hardcodes harness ids"
+# Phone: the completion rules live in their own files and know no harness
+# names (docs/composer-completions.md §1). The views may still carry the
+# model picker's default harness; the completion path never does.
+IOS_RULE_FILES=""
+for name in SlashCommands.swift FileSearch.swift FileMentions.swift MentionDraft.swift; do
+  if [[ ! -f "apps/ios/Comet/Composer/$name" ]]; then
+    fail "apps/ios/Comet/Composer/$name missing — the phone surface has not landed"
   else
-    ok "phone slash popup is harness-agnostic"
+    IOS_RULE_FILES="$IOS_RULE_FILES apps/ios/Comet/Composer/$name"
   fi
+done
+IOS_HARNESS_HITS="$(grep -lE '"(claude-code|codex|cursor|grok|hermes|pi|opencode|mock)"' \
+  $IOS_RULE_FILES || true)"
+if [[ -n "$IOS_HARNESS_HITS" ]]; then
+  fail "phone composer hardcodes harness ids: $(echo "$IOS_HARNESS_HITS" | tr '\n' ' ')"
 else
-  fail "$IOS_SLASH missing — the phone surface has not landed"
+  ok "phone composer is harness-agnostic"
+fi
+
+# The mention link scheme is written down once per surface (§6): the desktop
+# composer's rules and the phone's. Spellings inside a test module are
+# vectors, not definitions.
+RUST_MENTION_FILES=""
+for f in $(find crates/ui/src -name '*.rs' | sort); do
+  if awk '/^#\[cfg\(test\)\]/{exit} /comet-file:/{found=1} END{exit !found}' "$f"; then
+    RUST_MENTION_FILES="$RUST_MENTION_FILES $f"
+  fi
+done
+SWIFT_MENTION_FILES="$(grep -rl 'comet-file:' apps/ios/Comet --include='*.swift' || true)"
+RUST_MENTION="$(echo $RUST_MENTION_FILES | wc -w | tr -d ' ')"
+SWIFT_MENTION="$(echo $SWIFT_MENTION_FILES | wc -w | tr -d ' ')"
+if [[ "$RUST_MENTION" == 1 && "$SWIFT_MENTION" == 1 ]]; then
+  ok "comet-file: link format defined once per surface"
+else
+  fail "comet-file: defined in$RUST_MENTION_FILES (expected crates/ui/src/composer.rs) and $SWIFT_MENTION_FILES (expected apps/ios/Comet/Composer/FileMentions.swift)"
 fi
 
 # comet never parses SKILL.md itself outside the harness crate (and there only
@@ -172,10 +197,12 @@ if [[ $IOS -eq 1 ]]; then
     fail "no available iPhone simulator (set VERIFY_IOS_DEVICE)"
   elif (cd apps/ios && xcodebuild -quiet -project Comet.xcodeproj -scheme Comet \
         -destination "platform=iOS Simulator,name=$IOS_DEVICE" \
-        -only-testing:CometTests/SlashCommandsTests test >/tmp/verify-skills-ios.log 2>&1); then
-    ok "ios SlashCommandsTests"
+        -only-testing:CometTests/SlashCommandsTests \
+        -only-testing:CometTests/FileMentionsTests \
+        -only-testing:CometTests/MentionDraftTests test >/tmp/verify-skills-ios.log 2>&1); then
+    ok "ios composer tests"
   else
-    fail "ios SlashCommandsTests (see /tmp/verify-skills-ios.log)"
+    fail "ios composer tests (see /tmp/verify-skills-ios.log)"
   fi
 fi
 
