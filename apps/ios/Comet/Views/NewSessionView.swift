@@ -325,8 +325,12 @@ struct NewSessionView: View {
                 // have to be checked in, and nothing else raises it headless.
                 autoFocus: model.launchFocusComposer
             ) {
-                // Model + trait chips, split like the desktop's footer pickers
-                // (they ride right of the shell's attach button).
+                // Plan · model + trait chips, split like the desktop's footer
+                // pickers (they ride right of the shell's attach button); the
+                // plan toggle leads, as it does in the desktop's right cluster.
+                if planOffered {
+                    PlanModeChip(active: storedPlanMode) { storedPlanMode.toggle() }
+                }
                 ComposerChip(label: selectedModel.label, badgeHarness: harness) {
                     focused = false
                     showPicker = true
@@ -336,9 +340,6 @@ struct NewSessionView: View {
                         focused = false
                         showTraitPicker = true
                     }
-                }
-                if planOffered {
-                    PlanModeChip(active: storedPlanMode) { storedPlanMode.toggle() }
                 }
             }
         }

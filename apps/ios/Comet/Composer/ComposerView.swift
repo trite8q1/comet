@@ -705,6 +705,13 @@ struct ComposerView: View {
                    !branch.isEmpty {
                     BranchContextChip(branch: branch)
                 }
+                // Beside the run-identity chip it qualifies, and BEFORE it —
+                // the desktop's right cluster order (`plan_chip` then
+                // `model_chip`). Trailing, it fell off the end of the chip
+                // scroller behind the pinned send button.
+                if planOffered {
+                    PlanModeChip(active: chat.config?.planMode ?? false, toggle: togglePlanMode)
+                }
                 ComposerChip(label: currentModel.label, badgeHarness: harness) {
                     showModelPicker = true
                 }
@@ -712,9 +719,6 @@ struct ComposerView: View {
                     ComposerChip(label: HarnessCatalog.reasoningLabel(currentReasoning)) {
                         showTraitPicker = true
                     }
-                }
-                if planOffered {
-                    PlanModeChip(active: chat.config?.planMode ?? false, toggle: togglePlanMode)
                 }
             }
         }
