@@ -187,6 +187,10 @@ already addresses one device per connection, so it sends none (same as `ListComm
 A failure never renders as "No matching files" (desktop user report: cross-device
 failures are actionable and the empty state hid them).
 
+Every state (rows, loading, error, empty) sits under the card's caption — "COMMANDS" on
+the `/` card, "FILES" on the `@` one — and the row list hugs its measured height, capped
+at 180pt.
+
 ### 4.4 Row rendering
 
 `path.rsplitOnce("/")` → (directory, name); name in the body size, directory muted and
@@ -363,9 +367,12 @@ and by manual review on a device.
 Layout rule for the popup slot, on both phone surfaces: the popup + composer stack is a
 bottom **safe-area inset**, never a sibling in a stack that also holds a greedy view. A
 sibling stack SHARES its height, and with the keyboard up there is not enough of it — the
-stack then shrinks the one child that can shrink, the popup's `ScrollView(maxHeight: 220)`,
+stack then shrinks the one child that can shrink, the popup's row list (`maxHeight: 180`),
 to zero, and the card renders as a bare ✕ strip (the §4.3 states never get to draw). An
-inset is sized to its own content, so the rows keep their height.
+inset is sized to its own content, so the rows keep their height. On the new-session
+canvas the inset still has to take that height from somewhere, and the mark + "What are
+we building?" hold a ~126pt floor under the canvas: while a popup is open the decoration
+is hidden, so the card gets its full height instead of two rows.
 
 ## 10. Verification
 

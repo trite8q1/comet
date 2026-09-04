@@ -300,7 +300,7 @@ struct SlashCommandPopup: View {
             if case .hidden = state {
                 EmptyView()
             } else {
-                CompletionPopupCard { content }
+                CompletionPopupCard(header: "Commands") { content }
             }
         }
         .motionAnimation(Motion.menuIn, value: state)
@@ -324,13 +324,9 @@ struct SlashCommandPopup: View {
         case .noMatches:
             completionNotice("No matching commands")
         case .commands(let commands):
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(commands) { row($0) }
-                }
+            CompletionRows {
+                ForEach(commands) { row($0) }
             }
-            .frame(maxHeight: 220)
-            .scrollBounceBehavior(.basedOnSize)
         }
     }
 
@@ -339,10 +335,19 @@ struct SlashCommandPopup: View {
             accept(command)
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
+                // lineLimit + layoutPriority, never fixedSize: a fixed-size
+                // label reports the width it WANTS, and a long command name
+                // ("/plugin:some-long-skill") then pushed the row — and with
+                // it the card and the whole composer column — past the screen
+                // (user report: typing `/` widened the composer). The priority
+                // spends the row's width on the title first, so the detail is
+                // what truncates.
                 Text(command.title)
                     .font(Theme.sans(13.5, weight: .medium))
                     .foregroundStyle(Theme.text)
-                    .fixedSize()
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
                 Text(command.detail)
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textMuted)
@@ -350,6 +355,7 @@ struct SlashCommandPopup: View {
                     .truncationMode(.tail)
                 Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
             .contentShape(Rectangle())
@@ -372,7 +378,7 @@ struct FileMentionPopup: View {
             if case .hidden = state {
                 EmptyView()
             } else {
-                CompletionPopupCard { content }
+                CompletionPopupCard(header: "Files") { content }
             }
         }
         .motionAnimation(Motion.menuIn, value: state)
@@ -396,13 +402,9 @@ struct FileMentionPopup: View {
         case .noMatches:
             completionNotice("No matching files")
         case .matches(let matches):
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(matches) { row($0) }
-                }
+            CompletionRows {
+                ForEach(matches) { row($0) }
             }
-            .frame(maxHeight: 220)
-            .scrollBounceBehavior(.basedOnSize)
         }
     }
 
@@ -414,10 +416,14 @@ struct FileMentionPopup: View {
                 Image(systemName: match.isDir ? "folder" : "doc")
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.textMuted)
+                // Same rule as the `/` row: the name truncates rather than
+                // widening the card, and it outranks the directory for width.
                 Text(match.name)
                     .font(Theme.sans(13.5, weight: .medium))
                     .foregroundStyle(Theme.text)
-                    .fixedSize()
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
                 if !match.directory.isEmpty {
                     Text(match.directory)
                         .font(Theme.sans(12))
@@ -427,6 +433,7 @@ struct FileMentionPopup: View {
                 }
                 Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
             .contentShape(Rectangle())
@@ -437,22 +444,66 @@ struct FileMentionPopup: View {
 
 // MARK: - Shared popup chrome
 
-/// The chrome both completion cards wear: a glass panel above the pill whose
-/// rows start at the top edge. There is no dismiss control: the card closes
-/// when its token does (§2.3), the way the desktop's closes on click-away.
+/// The chrome both completion cards wear: a glass panel above the pill with a
+/// caption ("COMMANDS" / "FILES", the upstream iOS panel's) over whatever the
+/// card shows — rows, loading, error or empty notice. There is no dismiss
+/// control: the card closes when its token does (§2.3), the way the desktop's
+/// closes on click-away.
 struct CompletionPopupCard<Content: View>: View {
+    let header: String
     @ViewBuilder var content: Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            Text(header.uppercased())
+                .font(Theme.sans(10, weight: .bold))
+                .kerning(0.8)
+                .foregroundStyle(Theme.textMuted)
+                .padding(.horizontal, 14)
+                .padding(.top, 10)
+                .padding(.bottom, 4)
             content
         }
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Clip to the shape the glass draws, so a row the card had to compress
+        // away cannot bleed past the rounded bottom edge.
+        .clipShape(RoundedRectangle(cornerRadius: 20))
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
         .padding(.horizontal, 16)
         .transition(.opacity)
+    }
+}
+
+/// The scrolling row list both completion cards use: it hugs its rows and stops
+/// growing at 180pt. A `ScrollView` is greedy — it takes every point offered up
+/// to its maximum — so a bare cap left a single result floating in a tall panel;
+/// measuring the rows and capping at that measurement makes the list hug them.
+struct CompletionRows<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    /// Height of the rows, measured.
+    @State private var contentHeight: CGFloat = 0
+
+    private static var maxListHeight: CGFloat { 180 }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                content
+            }
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                contentHeight = height
+            }
+        }
+        // maxHeight, NOT height: an exact height cannot compress, so on a
+        // surface whose keyboard already claims the space above the pill the
+        // card would keep its full 180pt and push the column past its bounds. A
+        // maximum is the same hug, and it yields when the parent has less to give.
+        .frame(maxHeight: min(contentHeight, Self.maxListHeight))
+        .scrollDisabled(contentHeight <= Self.maxListHeight)
+        .scrollBounceBehavior(.basedOnSize)
     }
 }
 

@@ -52,6 +52,12 @@ struct NewSessionView: View {
         model.spaces.first { $0.id == spaceId }
     }
 
+    /// True while either completion card is up — the slot the composer renders
+    /// is the same one-popup-wins slot the composer body picks (§2.1).
+    private var popupOpen: Bool {
+        slash.popup != .hidden || mentions.popup != .hidden
+    }
+
     private var harnesses: [HarnessInfo] {
         liveHarnesses ?? HarnessCatalog.harnesses
     }
@@ -72,18 +78,33 @@ struct NewSessionView: View {
 
     var body: some View {
         // Canvas — tap dismisses the keyboard, like the old app.
+        //
+        // The mark and the line under it are decoration, and they hold a ~126pt
+        // floor under the canvas. A completion popup is the one thing on this
+        // page tall enough to need that floor back: with the keyboard up there
+        // is not enough room for both, and the inset's row list was the only
+        // child that could shrink, so the card came up two rows tall. While a
+        // popup is open the decoration gives way; empty, the canvas is a plain
+        // colour and compresses to nothing.
         ZStack {
             Theme.bg
-            VStack(spacing: 24) {
-                CometMark()
-                    .frame(width: 84, height: 84)
-                    .opacity(0.22)
-                Text("What are we building?")
-                    .font(Theme.sans(15))
-                    .foregroundStyle(Theme.textFaint)
+            if !popupOpen {
+                VStack(spacing: 24) {
+                    CometMark()
+                        .frame(width: 84, height: 84)
+                        .opacity(0.22)
+                    Text("What are we building?")
+                        .font(Theme.sans(15))
+                        .foregroundStyle(Theme.textFaint)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Belt and braces for the frame the decoration is mid-fade on: a ZStack
+        // centres its content and lets it spill both ways, and this row's
+        // neighbour is the navigation bar.
+        .clipped()
+        .motionAnimation(Motion.menuIn, value: popupOpen)
         .contentShape(Rectangle())
         .onTapGesture { focused = false }
         // The composer stack is a bottom SAFE-AREA INSET on the canvas, not a
