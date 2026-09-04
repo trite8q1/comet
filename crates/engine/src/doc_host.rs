@@ -501,6 +501,14 @@ impl ChatDocHandle {
                 if let Err(err) = self.doc.append_error_part(&entry.id, &part_id, note) {
                     tracing::warn!(chat = %self.chat_id, error = %err, "recovery note append failed");
                 }
+                // Settle a plan gate the dead run left open. The live fold turns
+                // an `awaitingApproval` plan into `revising` on a
+                // `Done{interrupted}` (sessions.rs); a crashed run has no fold to
+                // run that, so without this the card stays actionable on a dead
+                // request id and the next send is swallowed as plan feedback.
+                if let Err(err) = self.doc.settle_plan_gate(&entry.id) {
+                    tracing::warn!(chat = %self.chat_id, error = %err, "recovery plan-gate settle failed");
+                }
                 stamped.push((entry.id.clone(), entry.created_at));
             }
         }
